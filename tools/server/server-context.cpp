@@ -256,7 +256,8 @@ struct server_batch {
 static const uint32_t SLOT_AUX_MAGIC   = 0x58554153; // "SAUX"
 static const uint32_t SLOT_AUX_VERSION = 1;
 
-static void slot_aux_write_vec(std::ofstream & f, const std::vector<uint8_t> & v) {
+template <typename V>
+static void slot_aux_write_vec(std::ofstream & f, const V & v) {
     const uint64_t n = v.size();
     f.write(reinterpret_cast<const char *>(&n), sizeof(n));
     if (n > 0) {
@@ -264,7 +265,8 @@ static void slot_aux_write_vec(std::ofstream & f, const std::vector<uint8_t> & v
     }
 }
 
-static bool slot_aux_read_vec(std::ifstream & f, std::vector<uint8_t> & v) {
+template <typename V>
+static bool slot_aux_read_vec(std::ifstream & f, V & v) {
     uint64_t n = 0;
     if (!f.read(reinterpret_cast<char *>(&n), sizeof(n))) {
         return false;

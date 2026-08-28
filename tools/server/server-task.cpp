@@ -1712,7 +1712,8 @@ json server_task_result_apply_lora::to_json() {
 static const uint32_t L2_SPILL_MAGIC   = 0x4C325350; // "L2SP"
 static const uint32_t L2_SPILL_VERSION = 1;
 
-static void l2_write_vec(std::ofstream & f, const std::vector<uint8_t> & v) {
+template <typename V>
+static void l2_write_vec(std::ofstream & f, const V & v) {
     const uint64_t n = v.size();
     f.write(reinterpret_cast<const char *>(&n), sizeof(n));
     if (n > 0) {
@@ -1720,7 +1721,8 @@ static void l2_write_vec(std::ofstream & f, const std::vector<uint8_t> & v) {
     }
 }
 
-static bool l2_read_vec(std::ifstream & f, std::vector<uint8_t> & v) {
+template <typename V>
+static bool l2_read_vec(std::ifstream & f, V & v) {
     uint64_t n = 0;
     if (!f.read(reinterpret_cast<char *>(&n), sizeof(n))) {
         return false;
@@ -1802,7 +1804,7 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
     }
     f.close();
 
-    // release the RAM
+    // release the RAM - the mapping goes back to common_state_buf's pool
     state.data.main.clear(); state.data.main.shrink_to_fit();
     state.data.drft.clear(); state.data.drft.shrink_to_fit();
     for (auto & c : state.prompt.checkpoints) {
@@ -2013,8 +2015,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    server_state_buf state_data_tgt;
+    server_state_buf state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {

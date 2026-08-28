@@ -2,6 +2,9 @@
 
 #pragma once
 
+#include <cstring>   // [state-buf] memcpy
+#include <type_traits>   // [no-init] allocator
+#include <memory>   // [no-init] allocator
 #include "llama-cpp.h"
 
 #include "ggml-opt.h"
@@ -1162,6 +1165,68 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// [state-buf] Byte buffer for KV/state payloads: preallocated, prefaulted,
+// PINNED and pooled. Replaces std::vector<uint8_t>, whose resize() zero-fills
+// pages that the state copy immediately overwrites, and whose fresh pages then
+// fault during DMA.
+//
+// Measured on gfx1201, 1299 MiB device->host in 128 chunks:
+//     cold pageable (what vector gives)        6.17 GiB/s
+//     mmap + MAP_POPULATE (prefaulted)        11.06
+//     mmap + POPULATE + mlock (pinned)        24.94   <- 4.0x
+//     hipHostMalloc (reference)               24.78
+// Hardware ceiling is ~26 GiB/s per card, ~45 aggregate across both.
+//
+// mlock is what buys the 4x: the driver can DMA straight into locked pages
+// instead of staging through a bounce buffer. Buffers are recycled through a
+// free list so the mmap/populate/mlock cost is paid once, not per checkpoint.
+class common_state_buf {
+public:
+    common_state_buf() = default;
+    ~common_state_buf() { release(); }
+
+    // Copying deep-copies, matching the std::vector semantics this replaced -
+    // server_prompt_cache::alloc() copies a prompt's checkpoints wholesale.
+    // That copy is itself worth eliminating (refcount the payload), but changing
+    // ownership here would be a separate, riskier change.
+    common_state_buf(const common_state_buf & o) {
+        if (o.size_) { resize(o.size_); memcpy(ptr_, o.ptr_, o.size_); }
+    }
+    common_state_buf & operator=(const common_state_buf & o) {
+        if (this != &o) {
+            size_ = 0;
+            if (o.size_) { resize(o.size_); memcpy(ptr_, o.ptr_, o.size_); }
+        }
+        return *this;
+    }
+
+    common_state_buf(common_state_buf && o) noexcept { swap(o); }
+    common_state_buf & operator=(common_state_buf && o) noexcept {
+        if (this != &o) { release(); swap(o); }
+        return *this;
+    }
+
+    uint8_t *       data()       { return ptr_; }
+    const uint8_t * data() const { return ptr_; }
+    size_t          size()  const { return size_; }
+    bool            empty() const { return size_ == 0; }
+
+    void clear() { size_ = 0; }              // keeps the mapping
+    void shrink_to_fit() {}                  // deliberately a no-op: keep the pages
+
+    void resize(size_t n);
+
+private:
+    void release();
+    void swap(common_state_buf & o) noexcept {
+        std::swap(ptr_, o.ptr_); std::swap(size_, o.size_); std::swap(cap_, o.cap_);
+    }
+
+    uint8_t * ptr_  = nullptr;
+    size_t    size_ = 0;
+    size_t    cap_  = 0;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1171,12 +1236,12 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_state_buf data_tgt;
+    common_state_buf data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
-    std::vector<uint8_t> data_spec;
+    common_state_buf data_spec;
 
     size_t size() const;
 
