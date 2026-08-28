@@ -1,3 +1,4 @@
+#include <algorithm>   // [async-state] std::find over the backend list
 #include "llama-context.h"
 
 #include "ggml.h"
@@ -2571,16 +2572,62 @@ private:
     size_t size_written = 0;
 };
 
+
+// [async-state] Map a tensor to the backend that owns its buffer, so state
+// save/restore can use the ASYNC copy entry points instead of the blocking ones.
+static ggml_backend_t llama_io_backend_for(
+        const std::vector<ggml_backend_ptr> & backends, const ggml_tensor * t) {
+    if (!t || !t->buffer) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+    for (const auto & b : backends) {
+        if (ggml_backend_supports_buft(b.get(), buft)) {
+            return b.get();
+        }
+    }
+    return nullptr;
+}
+
 class llama_io_write_host : public llama_io_write_i {
 public:
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len,
+            const std::vector<ggml_backend_ptr> * backends = nullptr)
+        : ptr(p), buf_size(len), backends(backends) {}
 
     ~llama_io_write_host() {
-        // TODO: add backend support to batch tensor_get? or some other way to speed this up
+        // [async-state] The writes were already batched into winfos; the cost was
+        // flushing each with the BLOCKING ggml_backend_tensor_get - one full device
+        // synchronisation per tensor. A 27B model has 65 layers x K and V, so a
+        // single slot save paid well over a hundred round trips and measured
+        // ~5.5 GiB/s on a link capable of ~55. Enqueue them all on the owning
+        // backend, then synchronise ONCE. Any tensor whose backend cannot be
+        // identified falls back to the blocking path, so behaviour is unchanged
+        // wherever the mapping fails.
+        std::vector<ggml_backend_t> used;
+
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            ggml_backend_t backend = backends
+                ? llama_io_backend_for(*backends, winfo.tensor) : nullptr;
+
+
+            if (backend) {
+                ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+                if (std::find(used.begin(), used.end(), backend) == used.end()) {
+                    used.push_back(backend);
+                }
+            } else {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
         }
+
+
+        for (ggml_backend_t backend : used) {
+            ggml_backend_synchronize(backend);
+        }
+
+
     }
 
     void write(const void * src, size_t size) override {
@@ -2614,6 +2661,7 @@ private:
     uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_written = 0;
+    const std::vector<ggml_backend_ptr> * backends = nullptr;
 
     struct write_info {
         ggml_tensor * tensor;
@@ -2626,12 +2674,34 @@ private:
 
 class llama_io_read_host : public llama_io_read_i {
 public:
-    llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+    llama_io_read_host(const uint8_t * p, size_t len,
+                       const std::vector<ggml_backend_ptr> * backends = nullptr)
+        : ptr(p), buf_size(len), backends(backends) {}
 
     ~llama_io_read_host() {
-        // flush the reads
+        // [async-state] Same as the write path: the reads are already batched,
+        // but ggml_backend_tensor_set blocks per tensor. Enqueue, then one
+        // synchronise per backend. This is the RESTORE half of a slot swap.
+        std::vector<ggml_backend_t> used;
+
         for (const auto & rinfo : rinfos) {
-            ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            ggml_backend_t backend = backends
+                ? llama_io_backend_for(*backends, rinfo.tensor) : nullptr;
+
+            if (backend) {
+                ggml_backend_tensor_set_async(backend, rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+                if (std::find(used.begin(), used.end(), backend) == used.end()) {
+                    used.push_back(backend);
+                }
+            } else {
+                ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
+            }
+        }
+
+        // The source buffer is the caller's and may go away as soon as this
+        // returns, so the synchronise is not optional here.
+        for (ggml_backend_t backend : used) {
+            ggml_backend_synchronize(backend);
         }
     }
 
@@ -2663,6 +2733,7 @@ public:
     }
 
 private:
+    const std::vector<ggml_backend_ptr> * backends = nullptr;
     const uint8_t * ptr;
     size_t buf_size = 0;
     size_t size_read = 0;
@@ -3028,7 +3099,7 @@ size_t llama_context::state_get_size() {
 }
 
 size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
-    llama_io_write_host io(dst, size);
+    llama_io_write_host io(dst, size, &backends);
     try {
         return state_write_data(io);
     } catch (const std::exception & err) {
@@ -3038,7 +3109,7 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
-    llama_io_read_host io(src, size);
+    llama_io_read_host io(src, size, &backends);
     try {
         return state_read_data(io);
     } catch (const std::exception & err) {
@@ -3067,7 +3138,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io = std::make_unique<llama_io_write_host>(dst, size, &backends);
     }
 
     try {
@@ -3085,7 +3156,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io = std::make_unique<llama_io_read_host>(src, size, &backends);
 
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
@@ -3100,7 +3171,7 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         io = std::make_unique<llama_io_read_device>(src, size, mem_storage[seq_id_read]);
     } else {
-        io = std::make_unique<llama_io_read_host>(src, size);
+        io = std::make_unique<llama_io_read_host>(src, size, &backends);
     }
 
     try {
