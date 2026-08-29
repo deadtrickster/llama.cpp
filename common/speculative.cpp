@@ -170,8 +170,8 @@ struct common_speculative_impl {
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
-    virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual bool get_state(llama_seq_id /*seq_id*/, common_state_buf & /*data*/) const { return false; }
+    virtual void set_state(llama_seq_id /*seq_id*/, const common_state_buf & /*data*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -867,7 +867,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
     }
 
-    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+    bool get_state(llama_seq_id seq_id, common_state_buf & data) const override {
         if (!need_boundary_stash()) {
             return false;
         }
@@ -884,7 +884,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    void set_state(llama_seq_id seq_id, const common_state_buf & data) override {
         if (!need_boundary_stash()) {
             return;
         }
@@ -2742,7 +2742,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 }
 
 // TODO: support the case of more than one speculative implementations having a state
-bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, common_state_buf & data) {
     if (spec == nullptr) {
         return false;
     }
@@ -2756,7 +2756,7 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const common_state_buf & data) {
     if (spec == nullptr) {
         return;
     }
