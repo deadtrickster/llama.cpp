@@ -2089,7 +2089,7 @@ server_prompt_cache_load_result server_prompt_cache::load(server_prompt &       
             std::remove(it_best->spill_path.c_str());
             states.erase(it_best);
 
-            return true; // nothing restored, but the slot is untouched
+            return SERVER_PROMPT_CACHE_LOAD_RESULT_NO_MATCH; // slot untouched
         }
 
         {
