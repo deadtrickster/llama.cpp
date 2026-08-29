@@ -1170,50 +1170,39 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // and its pages fault during DMA. Locked pages let the driver DMA straight in:
 // 6.17 -> 24.94 GiB/s on gfx1201.
 class common_state_buf {
+    // Shared payload with copy-on-write. Checkpoints are immutable once
+    // captured, so the cache and the slot can share one instead of copying
+    // 2.33 GiB per conversation; a writer detaches first.
+    struct payload {
+        uint8_t * ptr = nullptr;
+        size_t    cap = 0;
+        ~payload();
+    };
+
 public:
     common_state_buf() = default;
-    ~common_state_buf() { release(); }
 
-    // Copying deep-copies, matching the std::vector semantics this replaced -
-    // server_prompt_cache::alloc() copies a prompt's checkpoints wholesale.
-    // That copy is itself worth eliminating (refcount the payload), but changing
-    // ownership here would be a separate, riskier change.
-    common_state_buf(const common_state_buf & o) {
-        if (o.size_) { resize(o.size_); memcpy(ptr_, o.ptr_, o.size_); }
-    }
-    common_state_buf & operator=(const common_state_buf & o) {
-        if (this != &o) {
-            size_ = 0;
-            if (o.size_) { resize(o.size_); memcpy(ptr_, o.ptr_, o.size_); }
-        }
-        return *this;
-    }
+    common_state_buf(const common_state_buf & o) = default;              // shares
+    common_state_buf & operator=(const common_state_buf & o) = default;  // shares
+    common_state_buf(common_state_buf &&) noexcept = default;
+    common_state_buf & operator=(common_state_buf &&) noexcept = default;
 
-    common_state_buf(common_state_buf && o) noexcept { swap(o); }
-    common_state_buf & operator=(common_state_buf && o) noexcept {
-        if (this != &o) { release(); swap(o); }
-        return *this;
-    }
+    const uint8_t * data() const { return buf_ ? buf_->ptr : nullptr; }
+    uint8_t *       data()       { detach(); return buf_ ? buf_->ptr : nullptr; }
 
-    uint8_t *       data()       { return ptr_; }
-    const uint8_t * data() const { return ptr_; }
-    size_t          size()  const { return size_; }
-    bool            empty() const { return size_ == 0; }
+    size_t size()  const { return size_; }
+    bool   empty() const { return size_ == 0; }
 
-    void clear() { size_ = 0; }              // keeps the mapping
-    void shrink_to_fit() {}                  // deliberately a no-op: keep the pages
+    void clear() { size_ = 0; }     // keeps the mapping for reuse
+    void shrink_to_fit() {}         // deliberately a no-op: keep the pages
 
     void resize(size_t n);
 
 private:
-    void release();
-    void swap(common_state_buf & o) noexcept {
-        std::swap(ptr_, o.ptr_); std::swap(size_, o.size_); std::swap(cap_, o.cap_);
-    }
+    void detach();                  // make the payload uniquely owned
 
-    uint8_t * ptr_  = nullptr;
-    size_t    size_ = 0;
-    size_t    cap_  = 0;
+    std::shared_ptr<payload> buf_;
+    size_t                   size_ = 0;
 };
 
 struct common_prompt_checkpoint {
