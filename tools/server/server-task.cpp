@@ -1,3 +1,4 @@
+#include <limits>
 #include "server-task.h"
 
 #include "build-info.h"
@@ -2177,7 +2178,14 @@ void server_prompt_cache::update() {
     const float size_per_token = std::max<float>(1.0f, float(bytes_total) / (std::max<size_t>(1, n_tokens())));
 
     // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+    // limit_size == 0 here means "no memory limit": --cache-ram 0 disables the
+    // cache before it is ever constructed (server-context.cpp), so the only way
+    // to reach this with 0 is --cache-ram -1. Treating that as "no budget to
+    // grow into" left the token limit at its base value, which made -1 ("no
+    // limit") evict MORE aggressively than any large finite value.
+    const size_t limit_tokens_cur = limit_size > 0
+        ? std::max<size_t>(limit_tokens, limit_size/size_per_token)
+        : std::numeric_limits<size_t>::max();
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
