@@ -2426,26 +2426,55 @@ state_buf_pool & pool() { static state_buf_pool p; return p; }
 
 } // namespace
 
+common_state_buf::payload::~payload() {
+    if (ptr) pool().give(ptr, cap);
+}
+
+void common_state_buf::detach() {
+    if (!buf_ || buf_.use_count() == 1) {
+        return;                       // already unique
+    }
+    // Someone else shares this payload: take a private copy of the live bytes.
+    // Only reached when a shared checkpoint is written to, which in practice
+    // does not happen - captures write to freshly created checkpoints.
+    auto old = buf_;
+    buf_.reset();
+    const size_t n = size_;
+    size_ = 0;
+    resize(n);
+    if (n && old->ptr) memcpy(buf_->ptr, old->ptr, n);
+}
+
 void common_state_buf::resize(size_t n) {
-    if (n <= cap_) { size_ = n; return; }    // reuse: no fault, no lock, no memset
-
-    uint8_t * old_ptr = ptr_; size_t old_cap = cap_;
-
-    size_t cap = 0;
-    uint8_t * p = pool().take(n, cap);
-    if (!p) {
-        // round up so near-identical sizes hit the same slab next time
-        cap = ((n + (64ull<<20) - 1) / (64ull<<20)) * (64ull<<20);
-        p = pool().fresh(cap);
-        if (!p) { cap = n; p = pool().fresh(cap); }
-        if (!p) { throw std::runtime_error("common_state_buf: mmap failed"); }
+    // A zero-length state needs no mapping: data() is nullptr and size() is 0,
+    // which is exactly the default-constructed state callers already handle.
+    // Allocating here instead would round the capacity to 0 and hand mmap a
+    // zero length, which fails EINVAL - and the fallback retries with the same
+    // 0 and fails identically, so the first empty resize aborted the process.
+    if (n == 0) {
+        size_ = 0;
+        return;
     }
 
-    ptr_ = p; cap_ = cap; size_ = n;
-    if (old_ptr) pool().give(old_ptr, old_cap);
+    if (buf_ && buf_.use_count() == 1 && n <= buf_->cap) {
+        size_ = n;                    // reuse: no fault, no lock, no memset
+        return;
+    }
+
+    auto p = std::make_shared<payload>();
+
+    size_t cap = 0;
+    uint8_t * mem = pool().take(n, cap);
+    if (!mem) {
+        cap = ((n + (64ull<<20) - 1) / (64ull<<20)) * (64ull<<20);
+        mem = pool().fresh(cap);
+        if (!mem) { cap = n; mem = pool().fresh(cap); }
+        if (!mem) { throw std::runtime_error("common_state_buf: mmap failed"); }
+    }
+
+    p->ptr = mem;
+    p->cap = cap;
+    buf_   = std::move(p);
+    size_  = n;
 }
 
-void common_state_buf::release() {
-    if (ptr_) pool().give(ptr_, cap_);
-    ptr_ = nullptr; size_ = cap_ = 0;
-}
