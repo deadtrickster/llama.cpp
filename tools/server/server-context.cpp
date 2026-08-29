@@ -2531,14 +2531,23 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                const bool saved = slot.prompt_save(*prompt_cache);
+                                if (saved) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
 
                                 if (params_base.kv_unified) {
                                     // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
+                                    // Only discard the slot's context once it is safely stored.
+                                    // prompt_save() returns false when the state exceeds the cache
+                                    // size limit; clearing anyway threw away a conversation that was
+                                    // never cached, and the skip is only logged inside the cache.
+                                    if (saved) {
+                                        slot.prompt_clear();
+                                    } else {
+                                        SLT_WRN(slot, "%s", "state exceeds the prompt cache limit - keeping its context instead of clearing it\n");
+                                    }
                                 }
                             }
                         }
