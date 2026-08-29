@@ -11,6 +11,13 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <algorithm>
+#include <csignal>
+#include <unistd.h>
+#include <system_error>
+#include <filesystem>
+#include <cstdio>
+#include <fstream>
 
 //
 // task_params
@@ -1688,6 +1695,231 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// [l2-spill] level-2 (disk) tier: evicted entries spill to disk instead of
+// being destroyed. Only the bulk buffers go out; tokens and checkpoint metadata
+// stay in RAM, so prefix matching in load() never touches the disk.
+static const uint32_t L2_SPILL_MAGIC   = 0x4C325350; // "L2SP"
+static const uint32_t L2_SPILL_VERSION = 1;
+
+static void l2_write_vec(std::ofstream & f, const std::vector<uint8_t> & v) {
+    const uint64_t n = v.size();
+    f.write(reinterpret_cast<const char *>(&n), sizeof(n));
+    if (n > 0) {
+        f.write(reinterpret_cast<const char *>(v.data()), n);
+    }
+}
+
+static bool l2_read_vec(std::ifstream & f, std::vector<uint8_t> & v) {
+    uint64_t n = 0;
+    if (!f.read(reinterpret_cast<char *>(&n), sizeof(n))) {
+        return false;
+    }
+    v.resize(n);
+    if (n > 0 && !f.read(reinterpret_cast<char *>(v.data()), n)) {
+        return false;
+    }
+    return true;
+}
+
+// [l2-spill] least-recently-used entry satisfying `pred`, or end().
+template <typename Pred>
+static std::list<server_prompt_cache_state>::iterator lru_find(
+        std::list<server_prompt_cache_state> & states, Pred pred) {
+    auto best = states.end();
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (!pred(*it)) {
+            continue;
+        }
+        if (best == states.end() || it->t_last_used < best->t_last_used) {
+            best = it;
+        }
+    }
+    return best;
+}
+
+size_t server_prompt_cache::disk_size() const {
+    size_t res = 0;
+    for (const auto & state : states) {
+        if (state.spilled()) {
+            res += state.spill_bytes;
+        }
+    }
+    return res;
+}
+
+bool server_prompt_cache::spill(server_prompt_cache_state & state) {
+    if (disk_dir.empty() || state.spilled()) {
+        return false;
+    }
+
+    const size_t bytes = state.size();
+    if (bytes == 0) {
+        return false;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    const std::string path = disk_dir + "l2-" + std::to_string((long long) getpid())
+                           + "-" + std::to_string(spill_seq++) + ".spill";
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        SRV_WRN(" - L2: cannot open %s for writing, dropping entry instead\n", path.c_str());
+        return false;
+    }
+
+    f.write(reinterpret_cast<const char *>(&L2_SPILL_MAGIC),   sizeof(L2_SPILL_MAGIC));
+    f.write(reinterpret_cast<const char *>(&L2_SPILL_VERSION), sizeof(L2_SPILL_VERSION));
+
+    l2_write_vec(f, state.data.main);
+    l2_write_vec(f, state.data.drft);
+
+    const uint32_t n_ckpt = (uint32_t) state.prompt.checkpoints.size();
+    f.write(reinterpret_cast<const char *>(&n_ckpt), sizeof(n_ckpt));
+    for (const auto & c : state.prompt.checkpoints) {
+        l2_write_vec(f, c.data_tgt);
+        l2_write_vec(f, c.data_dft);
+        l2_write_vec(f, c.data_spec);
+    }
+
+    f.flush();
+    if (!f.good()) {
+        SRV_WRN(" - L2: write failed for %s, dropping entry instead\n", path.c_str());
+        f.close();
+        std::remove(path.c_str());
+        return false;
+    }
+    f.close();
+
+    // release the RAM
+    state.data.main.clear(); state.data.main.shrink_to_fit();
+    state.data.drft.clear(); state.data.drft.shrink_to_fit();
+    for (auto & c : state.prompt.checkpoints) {
+        c.data_tgt.clear();  c.data_tgt.shrink_to_fit();
+        c.data_dft.clear();  c.data_dft.shrink_to_fit();
+        c.data_spec.clear(); c.data_spec.shrink_to_fit();
+    }
+
+    state.spill_path  = path;
+    state.spill_bytes = bytes;
+
+    const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+    SRV_INF(" - L2: spilled %7d tokens (%.3f MiB) in %.0f ms (%.2f GB/s) to %s\n",
+            state.prompt.n_tokens(), bytes / (1024.0 * 1024.0), t_ms,
+            (bytes / 1e9) / (t_ms / 1000.0), path.c_str());
+
+    return true;
+}
+
+bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
+    if (!state.spilled()) {
+        return true;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    std::ifstream f(state.spill_path, std::ios::binary);
+    if (!f) {
+        SRV_WRN(" - L2: cannot reopen %s\n", state.spill_path.c_str());
+        return false;
+    }
+
+    uint32_t magic = 0, version = 0;
+    if (!f.read(reinterpret_cast<char *>(&magic), sizeof(magic)) ||
+        !f.read(reinterpret_cast<char *>(&version), sizeof(version)) ||
+        magic != L2_SPILL_MAGIC || version != L2_SPILL_VERSION) {
+        SRV_WRN(" - L2: bad header in %s\n", state.spill_path.c_str());
+        return false;
+    }
+
+    if (!l2_read_vec(f, state.data.main) || !l2_read_vec(f, state.data.drft)) {
+        SRV_WRN(" - L2: truncated payload in %s\n", state.spill_path.c_str());
+        return false;
+    }
+
+    uint32_t n_ckpt = 0;
+    if (!f.read(reinterpret_cast<char *>(&n_ckpt), sizeof(n_ckpt)) ||
+        n_ckpt != (uint32_t) state.prompt.checkpoints.size()) {
+        SRV_WRN(" - L2: checkpoint count mismatch in %s\n", state.spill_path.c_str());
+        return false;
+    }
+    for (auto & c : state.prompt.checkpoints) {
+        if (!l2_read_vec(f, c.data_tgt) ||
+            !l2_read_vec(f, c.data_dft) ||
+            !l2_read_vec(f, c.data_spec)) {
+            SRV_WRN(" - L2: truncated checkpoint in %s\n", state.spill_path.c_str());
+            return false;
+        }
+    }
+    f.close();
+
+    const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+    SRV_INF(" - L2: restored %7d tokens (%.3f MiB) in %.0f ms (%.2f GB/s) from %s\n",
+            state.prompt.n_tokens(), state.spill_bytes / (1024.0 * 1024.0), t_ms,
+            (state.spill_bytes / 1e9) / (t_ms / 1000.0), state.spill_path.c_str());
+
+    std::remove(state.spill_path.c_str());
+    state.spill_path.clear();
+    state.spill_bytes = 0;
+
+    return true;
+}
+
+// [l2-spill] Remove spill files left behind by processes that are no longer
+// running. A SIGKILL or crash skips the destructor, and each orphan can be
+// several GiB, so without this the directory grows without bound.
+void server_prompt_cache::sweep_orphans() const {
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(disk_dir, ec)) {
+        if (ec) {
+            break;
+        }
+
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("l2-", 0) != 0 || name.size() < 4 || entry.path().extension() != ".spill") {
+            continue;
+        }
+
+        // l2-<pid>-<seq>.spill
+        const size_t p0 = 3;
+        const size_t p1 = name.find('-', p0);
+        if (p1 == std::string::npos) {
+            continue;
+        }
+
+        long long pid = 0;
+        try {
+            pid = std::stoll(name.substr(p0, p1 - p0));
+        } catch (const std::exception &) {
+            continue;
+        }
+
+        if (pid == (long long) getpid()) {
+            continue;
+        }
+
+        // kill(pid, 0) succeeds only while that pid exists
+        if (::kill((pid_t) pid, 0) == 0) {
+            continue; // another live server owns it
+        }
+
+        SRV_WRN(" - L2: removing orphaned spill file %s\n", entry.path().c_str());
+        std::filesystem::remove(entry.path(), ec);
+    }
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    for (const auto & state : states) {
+        if (state.spilled()) {
+            std::remove(state.spill_path.c_str());
+        }
+    }
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1750,10 +1982,23 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+            // [l2-spill] prefer moving the oldest resident entry to disk over
+            // destroying it. Spilled entries keep their index in RAM but stop
+            // counting toward the size limit.
+            auto it = lru_find(states, [](const server_prompt_cache_state & st) { return !st.spilled(); });
 
-            states.pop_front();
+            if (it == states.end()) {
+                break; // nothing resident left to free
+            }
+
+            if (spill(*it)) {
+                continue;
+            }
+
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    it->size() / (1024.0 * 1024.0));
+
+            states.erase(it);
         }
     }
 
@@ -1785,6 +2030,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.spill_path  =*/ {},   // [l2-spill] resident on creation
+        /*.spill_bytes =*/ 0,
+        /*.t_last_used =*/ ggml_time_us(),
     });
 
     return &states.back();
@@ -1824,6 +2072,18 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        it_best->t_last_used = ggml_time_us(); // [l2-spill] LRU bookkeeping
+
+        // [l2-spill] the winning entry may have its bulk on disk
+        if (it_best->spilled() && !unspill(*it_best)) {
+            SRV_WRN("%s", " - L2: failed to read spilled entry back, discarding it\n");
+
+            std::remove(it_best->spill_path.c_str());
+            states.erase(it_best);
+
+            return true; // nothing restored, but the slot is untouched
+        }
 
         {
             auto & data = it_best->data.main;
@@ -1870,24 +2130,71 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            // [l2-spill] move the oldest resident entry to disk rather than
+            // destroying it. Spilled entries stay in `states` (their token list
+            // is the index) but no longer count toward the RAM limit.
+            auto it = lru_find(states, [](const server_prompt_cache_state & st) { return !st.spilled(); });
 
-            states.pop_front();
+            if (it == states.end()) {
+                break; // everything resident has already been spilled
+            }
+
+            if (spill(*it)) {
+                continue;
+            }
+
+            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", it->size() / (1024.0 * 1024.0));
+
+            states.erase(it);
         }
     }
 
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+    // [l2-spill] enforce the disk cap: drop the oldest spilled entries. Done
+    // after the spill pass above so a fresh spill can push out an older one.
+    if (limit_disk > 0) {
+        while (disk_size() > limit_disk) {
+            auto it = lru_find(states, [](const server_prompt_cache_state & st) { return st.spilled(); });
+
+            if (it == states.end()) {
+                break;
+            }
+
+            SRV_WRN(" - L2: disk limit reached (%.3f / %.3f GiB), removing oldest spilled entry\n",
+                    disk_size() / (1024.0*1024.0*1024.0), limit_disk / (1024.0*1024.0*1024.0));
+
+            std::remove(it->spill_path.c_str());
+            states.erase(it);
+        }
+    }
+
+    // average size per token -- must count spilled bytes too, otherwise this
+    // collapses once entries move to disk and limit_tokens stops binding
+    size_t bytes_total = 0;
+    for (const auto & state : states) {
+        bytes_total += state.size_total();
+    }
+
+    const float size_per_token = std::max<float>(1.0f, float(bytes_total) / (std::max<size_t>(1, n_tokens())));
 
     // dynamically increase the token limit if it can fit in the memory limit
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            auto it = lru_find(states, [](const server_prompt_cache_state &) { return true; });
+            if (it == states.end()) {
+                break;
+            }
 
-            states.pop_front();
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing least-recently-used entry (size = %.3f MiB)\n",
+                    limit_tokens, limit_tokens_cur, it->size_total() / (1024.0 * 1024.0));
+
+            // [l2-spill] this entry is being destroyed for good -- drop its file too
+            if (it->spilled()) {
+                std::remove(it->spill_path.c_str());
+            }
+
+            states.erase(it);
         }
     }
 
