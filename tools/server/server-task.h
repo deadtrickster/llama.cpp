@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>      // [no-init] allocator_traits
+#include <type_traits>
 #include "common.h"
 #include "llama.h"
 
@@ -585,9 +587,13 @@ struct server_prompt {
     }
 };
 
+// [no-init] allocator and buffer type live in common/common.h
+using server_state_buf = common_state_buf;
+
+
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    server_state_buf main;
+    server_state_buf drft;
 
     size_t size() const {
         return main.size() + drft.size();
@@ -662,6 +668,9 @@ struct server_prompt_cache {
 
     // move an entry's bulk buffers to disk, keeping its index in RAM
     bool spill(server_prompt_cache_state & state);
+
+    // [state-buf] Pooling now lives inside common_state_buf (common/common.h):
+    // mmap + MAP_POPULATE + mlock, recycled through a global free list.
 
     // read an entry's bulk buffers back from disk
     bool unspill(server_prompt_cache_state & state);
