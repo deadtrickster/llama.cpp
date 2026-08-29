@@ -598,7 +598,26 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // [l2-spill] when non-empty, the bulk buffers (data.main, data.drft and the
+    // checkpoints' data_*) live in this file instead of RAM. prompt.tokens and
+    // the checkpoint position metadata stay resident so prefix matching in
+    // load() never needs to touch the disk.
+    std::string spill_path;
+    size_t      spill_bytes = 0;
+
+    // [l2-spill] last time this entry was created or hit, for LRU selection.
+    // The list order is insertion order (FIFO), which evicts an old-but-hot
+    // entry ahead of a newer cold one.
+    int64_t t_last_used = 0;
+
+    bool spilled() const { return !spill_path.empty(); }
+
+    // RAM footprint. A spilled entry costs only its token list + metadata.
     size_t size() const {
+        if (spilled()) {
+            return 0;
+        }
+
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
@@ -607,15 +626,48 @@ struct server_prompt_cache_state {
 
         return res;
     }
+
+    // total bytes held, wherever they are
+    size_t size_total() const {
+        return spilled() ? spill_bytes : size();
+    }
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, std::string disk_dir = "", int64_t limit_disk_mib = 0) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->disk_dir     = std::move(disk_dir);
+        this->limit_disk   = 1024ull*1024ull*(limit_disk_mib < 0 ? 0 : (size_t) limit_disk_mib);
     }
 
+    ~server_prompt_cache();
+
     std::list<server_prompt_cache_state> states;
+
+    // [l2-spill] directory for the level-2 (disk) tier. Empty = disabled, in
+    // which case update() drops evicted entries as before.
+    std::string disk_dir;
+
+    // [l2-spill] cap on total spilled bytes, 0 = no limit. Without this the
+    // tier grows without bound: spilled entries do not count toward limit_size,
+    // which also collapses the size_per_token estimate that drives limit_tokens.
+    size_t limit_disk = 0;
+
+    // total bytes currently held on disk
+    size_t disk_size() const;
+
+    // running counter, only used for naming spill files
+    uint64_t spill_seq = 0;
+
+    // move an entry's bulk buffers to disk, keeping its index in RAM
+    bool spill(server_prompt_cache_state & state);
+
+    // read an entry's bulk buffers back from disk
+    bool unspill(server_prompt_cache_state & state);
+
+    // delete spill files owned by processes that no longer exist
+    void sweep_orphans() const;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
