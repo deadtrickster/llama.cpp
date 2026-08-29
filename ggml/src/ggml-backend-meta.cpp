@@ -1866,12 +1866,25 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+
+    // [meta-async-fallback] The replicated / multi-segment layouts (nr[0] != 1 or
+    // n_segments != 1) are implemented only in the SYNCHRONOUS buffer callbacks
+    // above. The async entry points asserted instead, so any code path that read
+    // or wrote such a tensor asynchronously aborted the process. llama-server hit
+    // this on every context-checkpoint capture under -sm tensor
+    // (common_prompt_checkpoint::update_tgt -> create_checkpoint -> pre_decode),
+    // which made tensor parallelism and --ctx-checkpoints mutually exclusive.
+    // Falling back costs the async overlap for these tensors but is correct.
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
+
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -1911,12 +1924,25 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+
+    // [meta-async-fallback] The replicated / multi-segment layouts (nr[0] != 1 or
+    // n_segments != 1) are implemented only in the SYNCHRONOUS buffer callbacks
+    // above. The async entry points asserted instead, so any code path that read
+    // or wrote such a tensor asynchronously aborted the process. llama-server hit
+    // this on every context-checkpoint capture under -sm tensor
+    // (common_prompt_checkpoint::update_tgt -> create_checkpoint -> pre_decode),
+    // which made tensor parallelism and --ctx-checkpoints mutually exclusive.
+    // Falling back costs the async overlap for these tensors but is correct.
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(tensor, data, offset, size);
+        return;
+    }
+
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
