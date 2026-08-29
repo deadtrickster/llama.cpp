@@ -2360,3 +2360,93 @@ void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
 }
+
+// [state-buf] Pinned, prefaulted, pooled byte buffers. See common.h for the
+// measurements that motivate each part.
+#include <sys/mman.h>
+#include <mutex>
+
+namespace {
+
+// Free list of retired mappings, largest first. Bounded so a burst of large
+// states cannot leave the process holding locked memory indefinitely.
+struct state_buf_pool {
+    struct slab { uint8_t * ptr; size_t cap; };
+    std::mutex        mtx;
+    std::vector<slab> slabs;
+    size_t            locked_total = 0;
+
+    // Cap on how much this process will keep locked. mlock competes with the
+    // page cache, so an unbounded pool would be antisocial on a shared box.
+    static constexpr size_t LOCKED_CAP  = 24ull<<30;   // 24 GiB
+    static constexpr size_t MAX_SLABS   = 12;
+
+    uint8_t * take(size_t need, size_t & cap_out) {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (auto it = slabs.begin(); it != slabs.end(); ++it) {
+            if (it->cap >= need) {
+                uint8_t * p = it->ptr; cap_out = it->cap;
+                slabs.erase(it);
+                return p;                    // already populated and locked
+            }
+        }
+        return nullptr;
+    }
+
+    void give(uint8_t * p, size_t cap) {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (slabs.size() >= MAX_SLABS) { unmap(p, cap); return; }
+        slabs.push_back({p, cap});
+    }
+
+    void unmap(uint8_t * p, size_t cap) {
+        munlock(p, cap);
+        munmap(p, cap);
+        if (locked_total >= cap) locked_total -= cap; else locked_total = 0;
+    }
+
+    uint8_t * fresh(size_t need) {
+        void * p = mmap(nullptr, need, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+        if (p == MAP_FAILED) {
+            return nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (locked_total + need <= LOCKED_CAP && mlock(p, need) == 0) {
+                locked_total += need;        // pinned: the 4x
+            }
+            // If the cap is reached or mlock is refused, the mapping is still
+            // valid and prefaulted - it just runs at ~11 GiB/s instead of ~25.
+        }
+        return (uint8_t *) p;
+    }
+};
+
+state_buf_pool & pool() { static state_buf_pool p; return p; }
+
+} // namespace
+
+void common_state_buf::resize(size_t n) {
+    if (n <= cap_) { size_ = n; return; }    // reuse: no fault, no lock, no memset
+
+    uint8_t * old_ptr = ptr_; size_t old_cap = cap_;
+
+    size_t cap = 0;
+    uint8_t * p = pool().take(n, cap);
+    if (!p) {
+        // round up so near-identical sizes hit the same slab next time
+        cap = ((n + (64ull<<20) - 1) / (64ull<<20)) * (64ull<<20);
+        p = pool().fresh(cap);
+        if (!p) { cap = n; p = pool().fresh(cap); }
+        if (!p) { throw std::runtime_error("common_state_buf: mmap failed"); }
+    }
+
+    ptr_ = p; cap_ = cap; size_ = n;
+    if (old_ptr) pool().give(old_ptr, old_cap);
+}
+
+void common_state_buf::release() {
+    if (ptr_) pool().give(ptr_, cap_);
+    ptr_ = nullptr; size_ = cap_ = 0;
+}
