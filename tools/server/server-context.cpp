@@ -2681,9 +2681,15 @@ private:
                                     // never cached, and the skip is only logged inside the cache.
                                     if (saved) {
                                         slot.prompt_clear();
-                                    } else {
+                                    } else if (slot.prompt.tokens.size() > 0) {
                                         SLT_WRN(slot, "%s", "state exceeds the prompt cache limit - keeping its context instead of clearing it\n");
                                     }
+                                    // an EMPTY slot also returns false here, from the
+                                    // `prompt.tokens.size() == 0` early-out in prompt_save(). It has
+                                    // nothing to keep and nothing to clear, and reporting it as a
+                                    // size-limit refusal sent an investigation looking for a limit
+                                    // that was two orders of magnitude away (2,580 MiB state against
+                                    // an 81,920 MiB --cache-ram).
                                 }
                             }
                         }
