@@ -646,11 +646,22 @@ void server_tokens::keep_first(size_t n) {
         // allowed to resize      ^                    ^
         // disallowed to resize          ^      ^             ^
         if (n > 0) {
-            // make sure we never remove tokens in the middle of an image
-            // note that the case where we keep a full image at the end is allowed:
-            //   tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] != LLAMA_TOKEN_NULL
-            if (tokens[n - 1] == LLAMA_TOKEN_NULL && tokens[n] == LLAMA_TOKEN_NULL) {
-                find_chunk(n - 1); // will throw an error if the token is not begin-of-chunk
+            // make sure we never remove tokens in the middle of an image.
+            //
+            // the cut is legal exactly when n does not fall STRICTLY INSIDE a
+            // chunk - that is, when n is not a media position at all, or when it
+            // is the START of one. note this is a property of n alone; the
+            // previous index says nothing useful about it.
+            //
+            // the earlier form asked find_chunk(n - 1) whenever tokens[n - 1]
+            // and tokens[n] were both LLAMA_TOKEN_NULL, which throws unless
+            // n - 1 happens to begin a chunk. for two ADJACENT chunks that is a
+            // false positive: in the example above, n = 8 cuts exactly between
+            // img0 and img1 and is perfectly legal, yet find_chunk(7) throws
+            // because img0 begins at 5. it only worked while the preceding chunk
+            // was one token long.
+            if (tokens[n] == LLAMA_TOKEN_NULL && map_idx_to_media.find(n) == map_idx_to_media.end()) {
+                throw std::runtime_error("keep_first: cannot cut in the middle of a media chunk");
             }
         }
         // remove all image chunks that are not used anymore
