@@ -1740,6 +1740,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if (!is_mem_shared && desync[seq_id]) {
+                // the prompt ended with a media span that process() skipped, so ctx_dft's
+                // KV still stops before it while dp.n_past is past it. Decoding here would
+                // just fail the position check; sit this round out and let the next
+                // process() repair the sequence.
+                continue;
+            }
+
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
