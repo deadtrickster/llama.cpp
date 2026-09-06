@@ -655,6 +655,10 @@ struct server_prompt_cache {
     // which case update() drops evicted entries as before.
     std::string disk_dir;
 
+    // [l2-header] whether an mmproj is loaded. Needed to deserialize the prompt
+    // tokens out of a spill file header, since media chunks are only valid with one.
+    bool has_mtmd = false;
+
     // [l2-spill] cap on total spilled bytes, 0 = no limit. Without this the
     // tier grows without bound: spilled entries do not count toward limit_size,
     // which also collapses the size_per_token estimate that drives limit_tokens.

@@ -18,6 +18,7 @@
 #include <system_error>
 #include <filesystem>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 
 //
@@ -1700,7 +1701,21 @@ json server_task_result_apply_lora::to_json() {
 // being destroyed. Only the bulk buffers go out; tokens and checkpoint metadata
 // stay in RAM, so prefix matching in load() never touches the disk.
 static const uint32_t L2_SPILL_MAGIC   = 0x4C325350; // "L2SP"
-static const uint32_t L2_SPILL_VERSION = 1;
+
+// [l2-header] version 2 puts a self-describing header in front of the bulk:
+//
+//   u32 magic, u32 version
+//   u64 header_bytes             -- size of everything below, so a reader can seek past it
+//     u64 n_bytes + bytes        -- server_tokens::serialize()
+//     u32 n_ckpt
+//     per checkpoint: i64 n_tokens, i32 id_task, i32 pos_min, i32 pos_max
+//   <bulk section>               -- unchanged: data.main, data.drft, n_ckpt,
+//                                   then per checkpoint data_tgt/data_dft/data_spec
+//
+// The header is what identifies an entry, and it is first and length-prefixed so
+// that indexing a directory reads a few KB per file instead of the gigabytes of
+// KV state behind it. Version 1 files have no header and are ignored, not deleted.
+static const uint32_t L2_SPILL_VERSION = 2;
 
 template <typename V>
 static void l2_write_vec(std::ofstream & f, const V & v) {
@@ -1721,6 +1736,176 @@ static bool l2_read_vec(std::ifstream & f, V & v) {
     if (n > 0 && !f.read(reinterpret_cast<char *>(v.data()), n)) {
         return false;
     }
+    return true;
+}
+
+// [l2-header] append-only writer for the fixed-size header section. The header
+// is built in memory first so its length is known before anything is written.
+struct l2_header_writer {
+    std::vector<char> buf;
+
+    template <typename T>
+    void put(const T & v) {
+        const char * p = reinterpret_cast<const char *>(&v);
+        buf.insert(buf.end(), p, p + sizeof(T));
+    }
+
+    void put_bytes(const void * p, size_t n) {
+        const uint64_t n64 = n;
+        put(n64);
+        const char * c = static_cast<const char *>(p);
+        buf.insert(buf.end(), c, c + n);
+    }
+};
+
+// [l2-header] cursor over a header section that has already been read into RAM.
+struct l2_header_reader {
+    const char * p   = nullptr;
+    const char * end = nullptr;
+
+    l2_header_reader(const std::vector<char> & b) : p(b.data()), end(b.data() + b.size()) {}
+
+    template <typename T>
+    bool get(T & v) {
+        if ((size_t)(end - p) < sizeof(T)) {
+            return false;
+        }
+        std::memcpy(&v, p, sizeof(T));
+        p += sizeof(T);
+        return true;
+    }
+
+    bool get_bytes(std::vector<char> & v) {
+        uint64_t n = 0;
+        if (!get(n) || (uint64_t)(end - p) < n) {
+            return false;
+        }
+        v.assign(p, p + n);
+        p += n;
+        return true;
+    }
+};
+
+// [l2-header] the part of an entry that identifies it: the prompt tokens plus the
+// position metadata of each checkpoint. Everything here is cheap to read; the KV
+// bulk that follows it in the file is not.
+struct l2_spill_index_entry {
+    server_tokens tokens;
+    std::list<common_prompt_checkpoint> checkpoints; // position metadata only, data_* empty
+};
+
+// [l2-header] serialize the identifying part of an entry
+static bool l2_write_header(std::ofstream & f, const server_prompt_cache_state & state) {
+    l2_header_writer w;
+
+    std::vector<char> packed;
+    try {
+        packed = state.prompt.tokens.serialize();
+    } catch (const std::exception & err) {
+        SRV_WRN(" - L2: cannot serialize prompt tokens (%s), dropping entry instead\n", err.what());
+        return false;
+    }
+
+    w.put_bytes(packed.data(), packed.size());
+
+    const uint32_t n_ckpt = (uint32_t) state.prompt.checkpoints.size();
+    w.put(n_ckpt);
+    for (const auto & c : state.prompt.checkpoints) {
+        w.put((int64_t)   c.n_tokens);
+        w.put((int32_t)   c.id_task);
+        w.put((llama_pos) c.pos_min);
+        w.put((llama_pos) c.pos_max);
+    }
+
+    const uint64_t header_bytes = w.buf.size();
+    f.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes));
+    f.write(w.buf.data(), w.buf.size());
+
+    return true;
+}
+
+// [l2-header] read magic + version + header section from an open file, leaving the
+// stream positioned at the first byte of the bulk. `out` may be null when the
+// caller only needs to skip the header.
+static bool l2_read_header(std::ifstream & f, const std::string & path, bool has_mtmd, l2_spill_index_entry * out) {
+    uint32_t magic = 0, version = 0;
+    if (!f.read(reinterpret_cast<char *>(&magic),   sizeof(magic)) ||
+        !f.read(reinterpret_cast<char *>(&version), sizeof(version)) ||
+        magic != L2_SPILL_MAGIC) {
+        SRV_WRN(" - L2: bad header in %s\n", path.c_str());
+        return false;
+    }
+
+    if (version != L2_SPILL_VERSION) {
+        // not ours to interpret and not ours to delete
+        SRV_WRN(" - L2: %s has format version %u, expected %u - ignoring the file\n",
+                path.c_str(), version, L2_SPILL_VERSION);
+        return false;
+    }
+
+    uint64_t header_bytes = 0;
+    if (!f.read(reinterpret_cast<char *>(&header_bytes), sizeof(header_bytes))) {
+        SRV_WRN(" - L2: truncated header in %s\n", path.c_str());
+        return false;
+    }
+
+    if (out == nullptr) {
+        f.seekg((std::streamoff) header_bytes, std::ios::cur);
+        return f.good();
+    }
+
+    std::vector<char> hdr(header_bytes);
+    if (header_bytes > 0 && !f.read(hdr.data(), header_bytes)) {
+        SRV_WRN(" - L2: truncated header in %s\n", path.c_str());
+        return false;
+    }
+
+    l2_header_reader r(hdr);
+
+    std::vector<char> packed;
+    if (!r.get_bytes(packed) || packed.size() % sizeof(llama_token) != 0) {
+        SRV_WRN(" - L2: malformed token section in %s\n", path.c_str());
+        return false;
+    }
+
+    llama_tokens packed_tok(packed.size() / sizeof(llama_token));
+    if (!packed.empty()) {
+        std::memcpy(packed_tok.data(), packed.data(), packed.size());
+    }
+
+    try {
+        out->tokens = server_tokens::deserialize(packed_tok, has_mtmd);
+    } catch (const std::exception & err) {
+        SRV_WRN(" - L2: cannot restore prompt tokens from %s (%s)\n", path.c_str(), err.what());
+        return false;
+    }
+
+    uint32_t n_ckpt = 0;
+    if (!r.get(n_ckpt)) {
+        SRV_WRN(" - L2: malformed checkpoint section in %s\n", path.c_str());
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n_ckpt; ++i) {
+        int64_t   n_tokens = 0;
+        int32_t   id_task  = -1;
+        llama_pos pos_min  = 0;
+        llama_pos pos_max  = 0;
+
+        if (!r.get(n_tokens) || !r.get(id_task) || !r.get(pos_min) || !r.get(pos_max)) {
+            SRV_WRN(" - L2: malformed checkpoint section in %s\n", path.c_str());
+            return false;
+        }
+
+        common_prompt_checkpoint c;
+        c.n_tokens = n_tokens;
+        c.id_task  = id_task;
+        c.pos_min  = pos_min;
+        c.pos_max  = pos_max;
+
+        out->checkpoints.push_back(std::move(c));
+    }
+
     return true;
 }
 
@@ -1773,6 +1958,14 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
 
     f.write(reinterpret_cast<const char *>(&L2_SPILL_MAGIC),   sizeof(L2_SPILL_MAGIC));
     f.write(reinterpret_cast<const char *>(&L2_SPILL_VERSION), sizeof(L2_SPILL_VERSION));
+
+    // [l2-header] identify the entry before the bulk, so a reader never has to
+    // touch the KV state to find out what prompt this file holds
+    if (!l2_write_header(f, state)) {
+        f.close();
+        std::remove(path.c_str());
+        return false;
+    }
 
     l2_write_vec(f, state.data.main);
     l2_write_vec(f, state.data.drft);
@@ -1827,11 +2020,8 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
         return false;
     }
 
-    uint32_t magic = 0, version = 0;
-    if (!f.read(reinterpret_cast<char *>(&magic), sizeof(magic)) ||
-        !f.read(reinterpret_cast<char *>(&version), sizeof(version)) ||
-        magic != L2_SPILL_MAGIC || version != L2_SPILL_VERSION) {
-        SRV_WRN(" - L2: bad header in %s\n", state.spill_path.c_str());
+    // [l2-header] the identifying header is already in RAM - skip straight to the bulk
+    if (!l2_read_header(f, state.spill_path, has_mtmd, nullptr)) {
         return false;
     }
 
