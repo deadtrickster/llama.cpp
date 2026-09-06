@@ -444,6 +444,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     std::vector<std::vector<float>> pending_g_last;
     std::vector<llama_pos>          pending_pos_last;
 
+    // [per-seq] set when process() skipped an embedding (image/audio) batch, so ctx_dft's
+    // KV is behind ctx_tgt's by the length of that media span
+    std::vector<bool> desync;
+
     // [per-seq] snapshot of the most recent process()'s encoder output
     std::vector<std::vector<float>> verify_g;         // [n_seq][n_rows * n_embd_dec]
     std::vector<llama_pos>          verify_pos_first; // [n_seq] — pos of verify_g[seq][0]
@@ -527,6 +531,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
         pending_g_last.assign(n_seq, std::vector<float>(n_embd_dec, 0.0f));
         pending_pos_last.assign(n_seq, -1);
+        desync.assign(n_seq, false);
 
         verify_g.assign(n_seq, std::vector<float>());
         verify_pos_first.assign(n_seq, -1);
@@ -561,6 +566,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // expected state after prefill: ctx_dft has pos 0..N-2 (last position is deferred to
         // draft()'s seed step). Warn only if more than one position is missing.
         auto * ctx_dft = this->params.ctx_dft;
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq && desync[seq_id]) {
+            // the prompt ends with a media span that process() had to skip; ctx_dft is
+            // known to be behind and is resynced on the next non-embedding batch
+            SPC_DBG("ctx_dft is behind by a skipped media span (seq_id=%d) — will resync\n", (int) seq_id);
+            return;
+        }
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
         if (pos_max < N - 2) {
             SPC_WRN("ctx_dft pos_max=%d < N-2=%d — process() did not run on every prefill ubatch. "
@@ -574,7 +585,29 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             return true;
         }
 
+        // An image or audio span from mtmd arrives as an embedding batch. The EAGLE3
+        // decoder is fed (token, g_embd) pairs and there is no token here, so the batch
+        // is skipped - but ctx_tgt does consume it, leaving ctx_dft's KV short by the
+        // length of the span. Record that so the next non-embedding batch can repair it,
+        // and drop the deferred boundary: the pair it holds belongs to the last
+        // pre-media position and pairing it with a post-media token would be wrong, and
+        // draft() would otherwise place the next sampled token at that stale position.
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            for (int k = 0; k < batch_in.n_tokens; ++k) {
+                if (batch_in.n_seq_id[k] != 1) {
+                    continue;
+                }
+
+                const llama_seq_id seq_id = batch_in.seq_id[k][0];
+                if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                    continue;
+                }
+
+                desync[seq_id]           = true;
+                pending_pos_last[seq_id] = -1;
+                verify_g_rows[seq_id]    = 0;
+            }
+
             return true;
         }
 
@@ -666,6 +699,24 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         //       deferred boundary, completed by the next process() or draft() call.
         //   (c) refresh deferred state — stash this ubatch's full g_embd into verify_g,
         //       update pending_g_last / pending_pos_last to the last row.
+        //
+        // Before any of that: repair a sequence whose KV was left short by a skipped
+        // embedding batch. This batch's positions start past the hole, which
+        // llama_batch_allocr either rejects outright (Y == X + 1 for rope types with
+        // n_pos_per_embd == 1) or silently accepts as a forward jump (M-RoPE) leaving
+        // the hole in place. Removing the sequence drives seq_pos_max to -1 so the
+        // check is skipped and ctx_dft tracks ctx_tgt again from here on. Acceptance
+        // suffers until the draft has re-seen enough context; correctness does not,
+        // since the target verifies every drafted token.
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (!desync[seq_id] || i_batch_beg[seq_id] < 0) {
+                continue;
+            }
+
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+            desync[seq_id] = false;
+        }
+
         common_batch_clear(batch);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
