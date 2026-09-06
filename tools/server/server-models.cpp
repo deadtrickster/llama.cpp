@@ -41,6 +41,19 @@ extern char **environ;
 
 #define DEFAULT_STOP_TIMEOUT 10 // seconds
 
+// [l2-spill] A child spills its whole prompt cache to disk on shutdown before it
+// exits. A fixed 10 s is not enough for a large --cache-ram, and the router does
+// not wait for a spill it cannot see - it SIGKILLs, which truncates the spill and
+// loses exactly the conversations the spill exists to preserve.
+//
+// Measured on lab2x1 (Samsung 9100 PRO, /data): 2,580 MiB written in 378 ms =
+// 7.17 GB/s. With --cache-ram 81920 a full cache is 80 GiB, i.e. ~11.2 s - past
+// the 10 s timeout, so the failure is intermittent and depends on how warm the
+// cache happens to be. Derive a floor from the configured cache limit instead,
+// at a deliberately pessimistic rate so a slower disk is still covered.
+#define SPILL_FLOOR_MIB_PER_SEC 2048   // ~2 GiB/s, well under the 7.17 measured
+#define MAX_DERIVED_STOP_TIMEOUT 600   // never wait longer than this for an exit
+
 #define CMD_ROUTER_TO_CHILD_EXIT  "cmd_router_to_child:exit"
 #define CMD_CHILD_TO_ROUTER_STATE "cmd_child_to_router:state:" // followed by json string
 
@@ -255,6 +268,30 @@ struct server_lru_sched {
 // short loopback budget for the resumable stream router to child JSON calls (probe, lookup,
 // delete). distinct from params.timeout_read/write which only applies to the generation proxy
 static constexpr int STREAM_LOOKUP_TIMEOUT_MS = 250;
+
+
+// [l2-spill] see SPILL_FLOOR_MIB_PER_SEC: a model configured with a large prompt
+// cache needs proportionally longer to shut down cleanly.
+static int derive_stop_timeout(const common_preset & preset) {
+    std::string val;
+    if (!preset.get_option("LLAMA_ARG_CACHE_RAM", val)) {
+        return DEFAULT_STOP_TIMEOUT;
+    }
+    long long mib = 0;
+    try {
+        mib = std::stoll(val);
+    } catch (...) {
+        return DEFAULT_STOP_TIMEOUT;
+    }
+    if (mib <= 0) {
+        // 0 disables the cache; -1 means "no limit", for which no floor can be
+        // derived - fall back to the maximum rather than the minimum, because
+        // "no limit" is precisely the case with the most to lose.
+        return mib < 0 ? MAX_DERIVED_STOP_TIMEOUT : DEFAULT_STOP_TIMEOUT;
+    }
+    const int derived = (int) (mib / SPILL_FLOOR_MIB_PER_SEC) + DEFAULT_STOP_TIMEOUT;
+    return std::min(derived, MAX_DERIVED_STOP_TIMEOUT);
+}
 
 static std::filesystem::path get_server_exec_path() {
 #if defined(_WIN32)
@@ -613,7 +650,18 @@ void server_models::load_models() {
     auto apply_stop_timeout = [&]() {
         for (auto & [name, inst] : mapping) {
             std::string val;
-            if (inst.meta.preset.get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, val)) {
+            if (!inst.meta.preset.get_option(COMMON_ARG_PRESET_STOP_TIMEOUT, val)) {
+                // no explicit setting: size the wait to the shutdown spill
+                const int derived = derive_stop_timeout(inst.meta.preset);
+                if (derived != inst.meta.stop_timeout) {
+                    SRV_INF("model '%s': stop-timeout %d s derived from its prompt-cache size "
+                            "(a shutdown spill must finish before the instance is killed)\n",
+                            name.c_str(), derived);
+                }
+                inst.meta.stop_timeout = derived;
+                continue;
+            }
+            {
                 try {
                     inst.meta.stop_timeout = std::stoi(val);
                 } catch (...) {
