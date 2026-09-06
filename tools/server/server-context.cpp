@@ -1666,6 +1666,10 @@ private:
 
         bool update_cache = false;
 
+        // carried out of the LCP block purely so the decision can be logged below
+        float f_keep_sel = -1.0f;
+        float f_sim_sel  = -1.0f;
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1719,6 +1723,9 @@ private:
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
 
+                f_keep_sel = f_keep;
+                f_sim_sel  = f_sim_best;
+
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
@@ -1755,6 +1762,19 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // the save/load decision is otherwise invisible below INFO: every step of
+            // it logs at SRV_TRC (verbosity 4), and when update_cache is false
+            // NOTHING is emitted at all - the skip has to be inferred from the
+            // absence of a line. That made a regression costing 72% of all prefill
+            // indistinguishable from the cache simply not being there.
+            if (prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
+                SLT_INF(*ret, "prompt cache %s: f_keep = %.3f, f_sim = %.3f, %zu entries / %.1f MiB\n",
+                        update_cache ? "consulted" : "SKIPPED",
+                        f_keep_sel, f_sim_sel,
+                        prompt_cache->states.size(),
+                        prompt_cache->size() / 1048576.0);
+            }
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
