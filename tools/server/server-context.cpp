@@ -3793,7 +3793,11 @@ private:
 
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
-        if (spec && batch.has_embd) {
+        //
+        // model_dft is null for draft types that build the draft from the target
+        // itself rather than from a separate draft model - draft-mtp assigns only
+        // the context. the has_draft path above checks for exactly this.
+        if (spec && batch.has_embd && model_dft) {
             if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
                 SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
                 throw std::runtime_error("unsupported batch.has_embd + spec case");
