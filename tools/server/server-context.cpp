@@ -1726,8 +1726,20 @@ private:
                 f_keep_sel = f_keep;
                 f_sim_sel  = f_sim_best;
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // save whenever ANYTHING is lost. everything in the slot past the
+                // common prefix is destroyed further down by keep_first()/seq_rm(),
+                // so f_keep is the fraction PRESERVED - not evidence that this is
+                // the same conversation continuing.
+                //
+                // with a large shared system prompt that distinction matters: two
+                // unrelated conversations sharing a 6.5k preamble score f_keep > 0.9
+                // while the entire distinguishing tail is thrown away. at 0.5f every
+                // conversation shorter than ~13k tokens looked like a continuation
+                // of every other one.
+                //
+                // f_keep == 1.0 is the genuine continuation: the slot's prompt is a
+                // strict prefix of the incoming one, nothing is lost, nothing to save.
+                if (f_keep < 1.0f) {
                     update_cache = true;
                 }
             }
@@ -1758,32 +1770,46 @@ private:
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
-
             // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+            const bool cache_usable = prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            // THESE ARE TWO DIFFERENT QUESTIONS and they had one answer.
+            //
+            //   do_save: is this slot about to lose context worth keeping?
+            //   do_load: is there something in the cache better than what it holds?
+            //
+            // sharing a flag meant a high f_keep silently skipped the LOOKUP as
+            // well as the save, so a conversation could sit in the cache, be a
+            // perfect match for the incoming prompt, and never be consulted.
+            //
+            // consulting is unconditionally safe: load() seeds its comparison with
+            // the slot's OWN f_keep/f_sim and only replaces the prompt if some
+            // entry strictly beats it on both.
+            const bool do_save = cache_usable && update_cache;
+            const bool do_load = cache_usable;
 
             // the save/load decision is otherwise invisible below INFO: every step of
             // it logs at SRV_TRC (verbosity 4), and when update_cache is false
             // NOTHING is emitted at all - the skip has to be inferred from the
             // absence of a line. That made a regression costing 72% of all prefill
             // indistinguishable from the cache simply not being there.
-            if (prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION) {
-                SLT_INF(*ret, "prompt cache %s: f_keep = %.3f, f_sim = %.3f, %zu entries / %.1f MiB\n",
-                        update_cache ? "consulted" : "SKIPPED",
-                        f_keep_sel, f_sim_sel,
+            if (cache_usable) {
+                SLT_INF(*ret, "prompt cache: save = %d, load = %d, f_keep = %.3f, f_sim = %.3f, %zu entries / %.1f MiB\n",
+                        do_save, do_load, f_keep_sel, f_sim_sel,
                         prompt_cache->states.size(),
                         prompt_cache->size() / 1048576.0);
             }
 
-            if (update_cache) {
+            if (do_save || do_load) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                if (do_save) {
+                    ret->prompt_save(*prompt_cache);
+                }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (do_load && !ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
