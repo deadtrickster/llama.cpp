@@ -176,11 +176,13 @@ def _get_img_base64(url: str) -> str:
 
 
 @pytest.fixture
-def mmproj_server():
+def mmproj_server(tmp_path):
     # tinygemma3 is a small multimodal model: the mmproj is provided by the HF registry API and auto-downloaded on first run.
     os.environ['LLAMA_MEDIA_MARKER'] = '<__media__>'
     mm_server = ServerPreset.tinygemma3()
-    mm_server.slot_save_path = "./tmp"
+    # a per-test directory: the prompt cache also spills into --slot-save-path and
+    # those files outlive the process, so a shared one leaks state between runs
+    mm_server.slot_save_path = str(tmp_path)
     mm_server.temperature = 0.0
     return mm_server
 

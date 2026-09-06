@@ -2138,6 +2138,174 @@ void server_prompt_cache::sweep_orphans() const {
     }
 }
 
+// [l2-persist] enforce the disk cap by dropping the least-recently-used spilled
+// entries, file and all. Shared by update(), spill_all() and index_disk().
+void server_prompt_cache::trim_disk() {
+    if (limit_disk == 0) {
+        return;
+    }
+
+    while (disk_size() > limit_disk) {
+        auto it = lru_find(states, [](const server_prompt_cache_state & st) { return st.spilled(); });
+
+        if (it == states.end()) {
+            break;
+        }
+
+        SRV_WRN(" - L2: disk limit reached (%.3f / %.3f GiB), removing oldest spilled entry\n",
+                disk_size() / (1024.0*1024.0*1024.0), limit_disk / (1024.0*1024.0*1024.0));
+
+        std::remove(it->spill_path.c_str());
+        states.erase(it);
+    }
+}
+
+void server_prompt_cache::spill_all() {
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    size_t n_spilled = 0;
+    size_t n_bytes   = 0;
+
+    for (auto & state : states) {
+        if (state.spilled()) {
+            continue;
+        }
+
+        if (spill(state)) {
+            n_spilled++;
+            n_bytes += state.spill_bytes;
+        }
+    }
+
+    trim_disk();
+
+    if (n_spilled > 0) {
+        SRV_INF(" - L2: spilled %zu remaining cache entries (%.3f MiB) to %s\n",
+                n_spilled, n_bytes / (1024.0 * 1024.0), disk_dir.c_str());
+    }
+}
+
+void server_prompt_cache::index_disk() {
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    const std::string prefix = std::string(L2_SPILL_PREFIX) + model_key + "-";
+
+    struct candidate {
+        std::string path;
+        size_t      bytes;
+        int64_t     mtime;
+    };
+
+    std::vector<candidate> found;
+
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(disk_dir, ec)) {
+        if (ec) {
+            break;
+        }
+
+        const std::string name = entry.path().filename().string();
+
+        // the model key is part of the name, so entries belonging to another model
+        // are never even opened, let alone restored into this one
+        if (name.rfind(prefix, 0) != 0 || entry.path().extension() != ".spill") {
+            continue;
+        }
+
+        std::error_code ec_size;
+        const auto bytes = std::filesystem::file_size(entry.path(), ec_size);
+        if (ec_size) {
+            continue;
+        }
+
+        const auto mtime = std::filesystem::last_write_time(entry.path(), ec_size);
+        if (ec_size) {
+            continue;
+        }
+
+        found.push_back({ entry.path().string(), (size_t) bytes,
+                          (int64_t) mtime.time_since_epoch().count() });
+    }
+
+    if (found.empty()) {
+        return;
+    }
+
+    // newest first, so a disk budget smaller than what is on disk keeps the most
+    // recently used entries and drops the rest, exactly as update() would have
+    std::sort(found.begin(), found.end(),
+              [](const candidate & a, const candidate & b) { return a.mtime > b.mtime; });
+
+    size_t budget = 0;
+    size_t n_kept = 0;
+    for (const auto & c : found) {
+        if (limit_disk > 0 && budget + c.bytes > limit_disk) {
+            SRV_WRN(" - L2: disk budget exhausted while indexing, removing %s\n", c.path.c_str());
+            std::remove(c.path.c_str());
+            continue;
+        }
+        budget += c.bytes;
+        found[n_kept++] = c;
+    }
+    found.resize(n_kept);
+
+    // back to oldest first, so insertion order and t_last_used agree with the LRU
+    std::reverse(found.begin(), found.end());
+
+    const int64_t t_now = ggml_time_us();
+
+    size_t n_indexed = 0;
+    size_t n_bytes   = 0;
+    size_t n_tokens_indexed = 0;
+
+    for (size_t i = 0; i < found.size(); ++i) {
+        const candidate & c = found[i];
+
+        std::ifstream f(c.path, std::ios::binary);
+        if (!f) {
+            SRV_WRN(" - L2: cannot open %s for reading\n", c.path.c_str());
+            continue;
+        }
+
+        l2_spill_index_entry idx;
+        if (!l2_read_header(f, c.path, has_mtmd, &idx)) {
+            // l2_read_header already said why. A file we cannot parse - an older
+            // format, a truncated write - is left where it is, not deleted.
+            continue;
+        }
+        f.close();
+
+        if (idx.tokens.size() == 0) {
+            continue;
+        }
+
+        server_prompt_cache_state state;
+        state.prompt.tokens      = std::move(idx.tokens);
+        state.prompt.checkpoints = std::move(idx.checkpoints);
+        state.spill_path         = c.path;
+        state.spill_bytes        = c.bytes;
+
+        // keep the relative order of the files, and keep every restored entry older
+        // than anything this run creates
+        state.t_last_used = t_now - (int64_t) (found.size() - i);
+
+        n_bytes          += c.bytes;
+        n_tokens_indexed += state.prompt.n_tokens();
+        n_indexed++;
+
+        states.push_back(std::move(state));
+    }
+
+    if (n_indexed > 0) {
+        SRV_INF(" - L2: indexed %zu cache entries from disk (%zu tokens, %.3f MiB) in %s\n",
+                n_indexed, n_tokens_indexed, n_bytes / (1024.0 * 1024.0), disk_dir.c_str());
+    }
+}
+
 server_prompt_cache::~server_prompt_cache() {
     // [l2-persist] spill files deliberately survive. They are named after the model
     // and the prompt, so the next server on this disk_dir can find and reuse them.
@@ -2197,6 +2365,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+
+            // [l2-persist] this entry is gone for good, so its file is too -
+            // otherwise it would be re-indexed on the next start and eat budget
+            if (it->spilled()) {
+                std::remove(it->spill_path.c_str());
+            }
 
             it = states.erase(it);
         } else {
@@ -2376,21 +2550,7 @@ void server_prompt_cache::update() {
 
     // [l2-spill] enforce the disk cap: drop the oldest spilled entries. Done
     // after the spill pass above so a fresh spill can push out an older one.
-    if (limit_disk > 0) {
-        while (disk_size() > limit_disk) {
-            auto it = lru_find(states, [](const server_prompt_cache_state & st) { return st.spilled(); });
-
-            if (it == states.end()) {
-                break;
-            }
-
-            SRV_WRN(" - L2: disk limit reached (%.3f / %.3f GiB), removing oldest spilled entry\n",
-                    disk_size() / (1024.0*1024.0*1024.0), limit_disk / (1024.0*1024.0*1024.0));
-
-            std::remove(it->spill_path.c_str());
-            states.erase(it);
-        }
-    }
+    trim_disk();
 
     // average size per token -- must count spilled bytes too, otherwise this
     // collapses once entries move to disk and limit_tokens stops binding

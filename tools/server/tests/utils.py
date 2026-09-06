@@ -114,6 +114,7 @@ class ServerProcess:
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
     n_cache_reuse: int | None = None
+    cache_disk: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -281,6 +282,8 @@ class ServerProcess:
             server_args.extend(["--cache-ram", self.cache_ram])
         if self.n_cache_reuse is not None:
             server_args.extend(["--cache-reuse", self.n_cache_reuse])
+        if self.cache_disk is not None:
+            server_args.extend(["--cache-disk", self.cache_disk])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:

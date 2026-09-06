@@ -667,6 +667,9 @@ struct server_prompt_cache {
     // total bytes currently held on disk
     size_t disk_size() const;
 
+    // [l2-spill] drop least-recently-used spilled entries until limit_disk holds
+    void trim_disk();
+
     // [l2-name] sanitized model tag + fingerprint, e.g. "tinyllama_2-3fa1...".
     // Part of every spill file name, so two models can share a disk_dir and their
     // entries can never be mistaken for each other.
@@ -683,6 +686,15 @@ struct server_prompt_cache {
 
     // delete spill files owned by processes that no longer exist
     void sweep_orphans() const;
+
+    // [l2-persist] move every still-resident entry to disk. Called on shutdown and
+    // on the sleep path, where the alternative is throwing the whole cache away.
+    void spill_all();
+
+    // [l2-persist] adopt this model's spill files left by a previous run. Only the
+    // headers are read, so the entries come back marked spilled(): tokens resident
+    // for prefix matching, bulk still on disk until a hit pays for it.
+    void index_disk();
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

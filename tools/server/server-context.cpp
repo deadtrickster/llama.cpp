@@ -1057,6 +1057,13 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // [l2-persist] this runs on the sleep path too, where the model is unloaded
+        // and reloaded around a swap. Without this the whole cache is discarded and
+        // every conversation pays a full re-prefill on its next turn.
+        if (prompt_cache) {
+            prompt_cache->spill_all();
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1558,6 +1565,11 @@ private:
             prompt_cache->model_key = build_prompt_cache_model_key();
             prompt_cache->has_mtmd  = mctx != nullptr;
             prompt_cache->sweep_orphans();
+
+            // [l2-persist] adopt whatever the previous run (or the pre-sleep cache)
+            // left behind for this exact model. Only headers are read here; the KV
+            // bulk stays on disk until an entry actually wins a prefix match.
+            prompt_cache->index_disk();
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
