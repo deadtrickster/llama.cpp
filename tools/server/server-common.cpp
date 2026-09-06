@@ -633,7 +633,9 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    // this cannot keep map_idx_to_media in sync, so the prompt must hold no media
+    // note: the cache reuse loop calls this for text-only prompts on a multimodal server
+    GGML_ASSERT(!has_media());
     tokens[pos] = id;
 }
 
