@@ -1475,6 +1475,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
+        if (seq_id >= 0 && seq_id < (llama_seq_id) n_seq && desync[seq_id]) {
+            // the prompt ends with a media span that process() had to skip; ctx_dft is
+            // known to be behind and will be resynced on the next non-embedding batch.
+            // this is expected, not a symptom of a missing process() hook.
+            SPC_DBG("ctx_dft is behind by a skipped media span (seq_id=%d) - will resync\n", (int) seq_id);
+            return;
+        }
+
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
                     "process() hook may not have run on every prefill ubatch "
@@ -1561,6 +1569,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
+            // A previous batch for this sequence was an embedding batch that the draft
+            // could not consume, so ctx_dft's KV stops short of ctx_tgt's by the length
+            // of that media span. The batch we are about to build starts past the hole,
+            // which llama_batch_allocr rejects outright when the draft's rope type makes
+            // positions strictly consecutive (Y == X + 1), and tolerates as a forward
+            // jump under M-RoPE - a hard failure in one case and corrupt attention in
+            // the other. Drop the sequence's draft KV entirely: that drives the memory's
+            // seq_pos_max to -1 so the consistency check is skipped, and ctx_dft tracks
+            // ctx_tgt again from this batch on. Only acceptance suffers, and only until
+            // the draft has re-seen enough context - the target still verifies every
+            // drafted token.
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!desync[seq_id] || i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, -1, -1);
+                desync[seq_id] = false;
+            }
+
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
