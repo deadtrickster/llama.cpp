@@ -1346,6 +1346,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // call to pair with, so it's stashed here until that next call fires.
     std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
 
+    // Set for a sequence whose KV in ctx_dft has fallen behind ctx_tgt because
+    // process() skipped an embedding (image/audio) batch for it. The draft
+    // cannot consume such a batch, so the target advances over the media
+    // positions while the draft does not.
+    std::vector<bool> desync;                    // [n_seq]
+
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
@@ -1430,6 +1436,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        desync.assign(n_seq, false);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1482,8 +1489,49 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        // TODO: how to make it work with vision tokens?
+        // The MTP head consumes a token embedding, so an embedding batch (an image or
+        // audio span coming from mtmd) cannot be replayed into ctx_dft as-is and is
+        // skipped. ctx_tgt however does consume it, so the draft's KV falls behind by
+        // the length of the span. Record that, and refresh the carried-over hidden
+        // state so the first token AFTER the span is paired with the hidden state of
+        // the LAST media position rather than the last pre-media token - otherwise the
+        // MTP head is fed a (h_p, x_q) pair with q != p+1, which is silent, unbounded
+        // quality loss.
+        //
+        // Reading the target's rows here is valid: ctx_tgt runs with
+        // llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false), so nextn rows are
+        // dense and indexed by raw batch index, and mtmd_helper_decode_image_chunk()
+        // decodes the batch before invoking this callback.
+        // TODO: how to make the draft actually see vision tokens?
         if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+            std::vector<int32_t> i_last_of_seq(n_seq, -1);
+
+            for (int k = 0; k < batch_in.n_tokens; ++k) {
+                if (batch_in.n_seq_id[k] != 1) {
+                    continue;
+                }
+
+                const llama_seq_id seq_id = batch_in.seq_id[k][0];
+                if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                    continue;
+                }
+
+                i_last_of_seq[seq_id] = k;
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_last_of_seq[seq_id] < 0) {
+                    continue;
+                }
+
+                desync[seq_id] = true;
+
+                const float * h = llama_get_embeddings_nextn_ith(this->params.ctx_tgt, i_last_of_seq[seq_id]);
+                if (h != nullptr) {
+                    std::memcpy(pending_h[seq_id].data(), h, (size_t) n_embd * sizeof(float));
+                }
+            }
+
             return true;
         }
 
