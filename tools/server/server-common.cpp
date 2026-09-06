@@ -462,6 +462,10 @@ std::string server_tokens::str() const {
     return oss.str();
 }
 
+bool server_tokens::has_media() const {
+    return !map_idx_to_media.empty();
+}
+
 const mtmd::input_chunk_ptr & server_tokens::find_chunk(size_t idx) const {
     auto it = map_idx_to_media.find(idx);
     if (it != map_idx_to_media.end()) {

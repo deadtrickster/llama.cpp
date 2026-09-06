@@ -184,6 +184,10 @@ public:
     // number of tokens with position < max_pos
     size_t size_up_to_pos(llama_pos max_pos) const;
 
+    // true if the prompt contains media. note: has_mtmd only tells that a projector is loaded
+    // note: do not use find_next_media_chunk(0) here, its upper_bound misses a chunk at index 0
+    bool has_media() const;
+
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
     // find next media chunk after idx
