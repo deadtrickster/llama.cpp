@@ -3878,10 +3878,15 @@ private:
             });
 
             if (!ok) {
-                SRV_ERR("%s", "failed to process speculative batch\n");
-
-                // TODO: handle error
-                throw std::runtime_error("failed to process speculative batch");
+                // the TARGET decode has already succeeded - this is the success
+                // branch, metrics_post_decode() ran just above. everything the
+                // client asked for has been computed correctly. all that failed
+                // is maintaining the draft's shadow of that state.
+                //
+                // speculation is an optimization: the target verifies every
+                // drafted token before it is emitted, so a stale or empty draft
+                // costs acceptance rate and nothing else.
+                SRV_WRN("%s", "failed to process speculative batch - continuing without speculation for this batch\n");
             }
         }
 
