@@ -97,6 +97,15 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // [l2-spill] flush the prompt cache to disk NOW, while the llama_context and
+    // the backend are still alive. Idempotent and safe to call when there is no
+    // cache. Call this before tearing anything else down: the only other path to
+    // a spill is ~server_context_impl(), which runs after clean_up() has already
+    // called llama_backend_free(), and which never runs at all if the process is
+    // killed during shutdown - exactly what happens to a router child that hits
+    // its stop timeout. Durable state must not depend on a destructor.
+    void flush_prompt_cache();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

@@ -452,6 +452,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // setup clean up function, to be called before exit
         clean_up = [&ctx_http, &ctx_server, &mcp_mgr]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
+            // [l2-spill] FIRST, while the llama_context and backend are still up.
+            // The only other route to a spill is ~server_context_impl(), which runs
+            // after llama_backend_free() below and does not run at all if we are
+            // killed during shutdown - which is what happened to router children,
+            // silently losing every cached conversation on a model swap.
+            ctx_server.flush_prompt_cache();
             // stop the session GC first, it finalizes live sessions and wakes pending readers
             server_stream_session_manager_stop();
             ctx_http.stop();

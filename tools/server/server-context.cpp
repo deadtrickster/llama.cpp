@@ -4433,6 +4433,12 @@ void server_context::terminate() {
     impl->queue_tasks.terminate();
 }
 
+void server_context::flush_prompt_cache() {
+    if (impl && impl->prompt_cache) {
+        impl->prompt_cache->spill_all();
+    }
+}
+
 llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
