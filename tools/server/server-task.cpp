@@ -1795,16 +1795,8 @@ struct l2_spill_index_entry {
 };
 
 // [l2-header] serialize the identifying part of an entry
-static bool l2_write_header(std::ofstream & f, const server_prompt_cache_state & state) {
+static void l2_write_header(std::ofstream & f, const server_prompt_cache_state & state, const std::vector<char> & packed) {
     l2_header_writer w;
-
-    std::vector<char> packed;
-    try {
-        packed = state.prompt.tokens.serialize();
-    } catch (const std::exception & err) {
-        SRV_WRN(" - L2: cannot serialize prompt tokens (%s), dropping entry instead\n", err.what());
-        return false;
-    }
 
     w.put_bytes(packed.data(), packed.size());
 
@@ -1820,8 +1812,6 @@ static bool l2_write_header(std::ofstream & f, const server_prompt_cache_state &
     const uint64_t header_bytes = w.buf.size();
     f.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes));
     f.write(w.buf.data(), w.buf.size());
-
-    return true;
 }
 
 // [l2-header] read magic + version + header section from an open file, leaving the
@@ -1909,6 +1899,42 @@ static bool l2_read_header(std::ifstream & f, const std::string & path, bool has
     return true;
 }
 
+// [l2-name] FNV-1a over a byte range. Used for both the model fingerprint and the
+// per-prompt part of a spill file name, so the two are computed the same way.
+static uint64_t l2_hash(const void * data, size_t n, uint64_t h = 0xcbf29ce484222325ull) {
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 0x100000001b3ull;
+    }
+    return h;
+}
+
+static std::string l2_hex64(uint64_t h) {
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
+    return buf;
+}
+
+// [l2-name] Spill files outlive the process that wrote them, so the name has to
+// be reproducible by a successor and has to say which model the KV inside belongs
+// to. Restoring one model's KV into another passes every size check the loader
+// makes and then produces silent garbage, so the model key is a correctness
+// device, not a naming convenience.
+//
+//   l2p-<model_key>-<n_tokens>-<hash of the serialized tokens>.spill
+//
+// The `l2p-` prefix separates these from the `l2-<pid>-<seq>.spill` scratch files
+// written by earlier versions, which are still swept as orphans.
+static const char * L2_SPILL_PREFIX = "l2p-";
+
+static std::string l2_spill_name(const std::string & model_key, int n_tokens, const std::vector<char> & packed) {
+    return std::string(L2_SPILL_PREFIX) + model_key
+         + "-" + std::to_string(n_tokens)
+         + "-" + l2_hex64(l2_hash(packed.data(), packed.size()))
+         + ".spill";
+}
+
 // [l2-spill] least-recently-used entry satisfying `pred`, or end().
 template <typename Pred>
 static std::list<server_prompt_cache_state>::iterator lru_find(
@@ -1947,8 +1973,18 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
 
     const int64_t t_start = ggml_time_us();
 
-    const std::string path = disk_dir + "l2-" + std::to_string((long long) getpid())
-                           + "-" + std::to_string(spill_seq++) + ".spill";
+    // [l2-name] the tokens are needed twice: to name the file and to write its
+    // header. Serializing once also means an entry that cannot be serialized
+    // (media chunks without an mmproj) is dropped before any file is created.
+    std::vector<char> packed;
+    try {
+        packed = state.prompt.tokens.serialize();
+    } catch (const std::exception & err) {
+        SRV_WRN(" - L2: cannot serialize prompt tokens (%s), dropping entry instead\n", err.what());
+        return false;
+    }
+
+    const std::string path = disk_dir + l2_spill_name(model_key, state.prompt.n_tokens(), packed);
 
     std::ofstream f(path, std::ios::binary);
     if (!f) {
@@ -1961,11 +1997,7 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
 
     // [l2-header] identify the entry before the bulk, so a reader never has to
     // touch the KV state to find out what prompt this file holds
-    if (!l2_write_header(f, state)) {
-        f.close();
-        std::remove(path.c_str());
-        return false;
-    }
+    l2_write_header(f, state, packed);
 
     l2_write_vec(f, state.data.main);
     l2_write_vec(f, state.data.drft);
@@ -2058,9 +2090,10 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
     return true;
 }
 
-// [l2-spill] Remove spill files left behind by processes that are no longer
-// running. A SIGKILL or crash skips the destructor, and each orphan can be
-// several GiB, so without this the directory grows without bound.
+// [l2-spill] Remove LEGACY `l2-<pid>-<seq>.spill` scratch files left behind by
+// processes that are no longer running. Those were process-local and unreadable
+// by anyone else, so an orphan was pure waste. Files written by this version are
+// named `l2p-...`, are meant to outlive their writer, and are never swept here.
 void server_prompt_cache::sweep_orphans() const {
     if (disk_dir.empty()) {
         return;
@@ -2077,7 +2110,7 @@ void server_prompt_cache::sweep_orphans() const {
             continue;
         }
 
-        // l2-<pid>-<seq>.spill
+        // l2-<pid>-<seq>.spill  (note: "l2p-" does not match the "l2-" test above)
         const size_t p0 = 3;
         const size_t p1 = name.find('-', p0);
         if (p1 == std::string::npos) {
@@ -2106,11 +2139,10 @@ void server_prompt_cache::sweep_orphans() const {
 }
 
 server_prompt_cache::~server_prompt_cache() {
-    for (const auto & state : states) {
-        if (state.spilled()) {
-            std::remove(state.spill_path.c_str());
-        }
-    }
+    // [l2-persist] spill files deliberately survive. They are named after the model
+    // and the prompt, so the next server on this disk_dir can find and reuse them.
+    // Entries dropped during normal operation still unlink their file at the point
+    // they are dropped - see load() and update().
 }
 
 size_t server_prompt_cache::size() const {

@@ -1122,6 +1122,74 @@ private:
         return true;
     }
 
+    // [l2-name] Key identifying the KV state this server produces, used to name the
+    // prompt cache's spill files. Two servers sharing a --slot-save-path must never
+    // read each other's entries: a foreign KV blob passes the size checks in
+    // llama_state_seq_set_data_ext and then decodes as garbage, with no error.
+    //
+    // The existing /slots save path is no help here - it takes its filename straight
+    // from the request body, so the <alias>-<hash> convention seen in practice lives
+    // in the caller, not in the server. This builds its own key instead, and hashes
+    // everything that changes the shape or the meaning of a sequence state buffer:
+    // the model's architecture, parameter count, quantization and geometry (all of
+    // which llama_model_desc summarizes, with n_embd/n_layer/n_vocab spelled out),
+    // the file it came from, the KV cache element types, the context size, and the
+    // draft model if one is attached, since data.drft belongs to that context.
+    std::string build_prompt_cache_model_key() const {
+        std::string desc;
+        {
+            char buf[256] = {0};
+            llama_model_desc(model_tgt, buf, sizeof(buf));
+            desc = buf;
+        }
+
+        std::string fp;
+        fp += desc;
+        fp += "|path="   + params_base.model.path;
+        fp += "|n_embd=" + std::to_string(llama_model_n_embd(model_tgt));
+        fp += "|n_layer=" + std::to_string(llama_model_n_layer(model_tgt));
+        fp += "|n_vocab=" + std::to_string(llama_vocab_n_tokens(llama_model_get_vocab(model_tgt)));
+        fp += "|n_params=" + std::to_string(llama_model_n_params(model_tgt));
+        fp += "|n_ctx="  + std::to_string(n_ctx);
+        fp += "|type_k=" + std::to_string((int) params_base.cache_type_k);
+        fp += "|type_v=" + std::to_string((int) params_base.cache_type_v);
+        fp += "|kvu="    + std::to_string((int) params_base.kv_unified);
+
+        if (model_dft) {
+            char buf[256] = {0};
+            llama_model_desc(model_dft, buf, sizeof(buf));
+            fp += "|dft=";
+            fp += buf;
+        }
+
+        // FNV-1a, same as the spill-name hash
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (unsigned char c : fp) {
+            h ^= c;
+            h *= 0x100000001b3ull;
+        }
+
+        char hex[17];
+        snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) h);
+
+        // the alias reaches this from the command line, and the key goes into a
+        // path - keep only characters that cannot mean anything to a filesystem
+        std::string tag;
+        for (char c : model_name) {
+            if (tag.size() >= 48) {
+                break;
+            }
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') || c == '.' || c == '_';
+            tag += ok ? c : '_';
+        }
+        if (tag.empty() || tag.find_first_not_of('.') == std::string::npos) {
+            tag = "model";
+        }
+
+        return tag + "-" + hex;
+    }
+
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
@@ -1464,28 +1532,6 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
-                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
-            } else {
-                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
-            }
-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
-
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.slot_save_path, params_base.cache_disk_mib);
-            prompt_cache->sweep_orphans();
-        } else {
-            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
-        }
-        SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
-
-        if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
-        } else {
-            SRV_TRC("%s", "context checkpoints disabled\n");
-        }
-
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
@@ -1499,6 +1545,30 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        if (params_base.cache_ram_mib != 0) {
+            if (params_base.cache_ram_mib < 0) {
+                SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+            } else {
+                SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+            }
+            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.slot_save_path, params_base.cache_disk_mib);
+            prompt_cache->model_key = build_prompt_cache_model_key();
+            prompt_cache->has_mtmd  = mctx != nullptr;
+            prompt_cache->sweep_orphans();
+        } else {
+            SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+        SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        if (params_base.n_ctx_checkpoints > 0) {
+            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
+                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+        } else {
+            SRV_TRC("%s", "context checkpoints disabled\n");
+        }
 
         // propagate new defaults back to caller
         params = params_base;

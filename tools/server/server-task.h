@@ -667,8 +667,10 @@ struct server_prompt_cache {
     // total bytes currently held on disk
     size_t disk_size() const;
 
-    // running counter, only used for naming spill files
-    uint64_t spill_seq = 0;
+    // [l2-name] sanitized model tag + fingerprint, e.g. "tinyllama_2-3fa1...".
+    // Part of every spill file name, so two models can share a disk_dir and their
+    // entries can never be mistaken for each other.
+    std::string model_key = "unknown";
 
     // move an entry's bulk buffers to disk, keeping its index in RAM
     bool spill(server_prompt_cache_state & state);
