@@ -191,6 +191,43 @@ bool llama_memory_hybrid::seq_max_resize(uint32_t n_seq_max) {
     return true;
 }
 
+// [pool] the attention cache holds the cells (and the DSA indexer its own, in lockstep); the recurrent state has none and is untouched.
+// Attention first, then the indexer, which mirrors its slot layout cell for cell and so packs the same way.
+bool llama_memory_hybrid::n_ctx_resize(uint32_t n_ctx) {
+    const uint32_t n_ctx_old = mem_attn->get_size();
+
+    if (!mem_attn->n_ctx_resize(n_ctx)) {
+        return false;
+    }
+
+    if (mem_idx && !mem_idx->n_ctx_resize(n_ctx)) {
+        mem_attn->n_ctx_resize(n_ctx_old);
+        return false;
+    }
+
+    return mem_recr->n_ctx_resize(n_ctx);
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::n_ctx_cost(uint32_t n_ctx) const {
+    auto res = mem_attn->n_ctx_cost(n_ctx);
+
+    if (mem_idx) {
+        for (const auto & [buft, bytes] : mem_idx->n_ctx_cost(n_ctx)) {
+            res[buft] += bytes;
+        }
+    }
+
+    return res;
+}
+
+void llama_memory_hybrid::set_n_kv_limit(uint32_t n_kv) {
+    mem_attn->set_n_kv_limit(n_kv);
+
+    if (mem_idx) {
+        mem_idx->set_n_kv_limit(n_kv);
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::seq_max_cost(uint32_t n_seq_max) const {
     // the unified attention cache does not grow with the ceiling; the recurrent rows do
     return mem_recr->seq_max_cost(n_seq_max);

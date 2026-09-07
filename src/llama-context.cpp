@@ -600,6 +600,7 @@ void llama_context::sched_reserve() {
     sched_need_reserve = false;
 
     backend_buf_seq_cost_valid = false; // [seq-max] measured against the reserve below
+    backend_buf_ctx_cost_valid = false; // [pool] likewise
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -897,12 +898,17 @@ bool llama_context::set_n_seq_max(uint32_t n_seq_max_new) {
 // dry run goes through a scheduler of its own. graph_reserve() works on this->sched, hence the swap.
 // Valid for n_seqs <= the memory's current ceiling: the reserve graph views the memory's state rows
 // for n_seqs sequences and cannot be built for more rows than exist.
-bool llama_context::compute_size_at(uint32_t n_seqs, std::vector<size_t> & sizes) {
+bool llama_context::compute_size_at(uint32_t n_seqs, std::vector<size_t> & sizes, uint32_t n_kv_limit) {
     if (!memory || n_seqs < 1 || n_seqs > cparams.n_seq_max) {
         return false;
     }
 
     synchronize();
+
+    // [pool] the dry run may pretend the pool is smaller than it is (never larger: the reserve graph
+    // views the real tensors); reset on every way out
+    memory->set_n_kv_limit(n_kv_limit);
+    struct limit_reset { llama_memory_i * m; ~limit_reset() { m->set_n_kv_limit(0); } } limit_reset_guard { memory.get() };
 
     const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch);
     const size_t   max_nodes = this->graph_max_nodes(n_tokens);
@@ -980,6 +986,140 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_context::seq_max_cost(uint32_
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 if (backend_buf_seq_cost[i] > 0) {
                     res[backend_buft[i]] += backend_buf_seq_cost[i] * (n_seq_max_new - n_seq_max_cur);
+                }
+            }
+        }
+    }
+
+    return res;
+}
+
+// [pool] The cell count is not fixed for the life of the context either: -c sizes the KV pool once, by
+// OOM-bisection before any conversation exists, and every cell nobody uses is memory a sequence id could
+// have had (GLM-5.3-Flash: 1 GiB is 54,613 cells or four more sequences). This grows or shrinks the pool
+// of every attention cache, keeping every live cell, and re-reserves the worst-case compute graph for the
+// new n_kv - now, so an allocation failure is rolled back and reported here. Unified only, as the
+// ceiling is. The caller guarantees no batch is in flight.
+bool llama_context::set_n_ctx(uint32_t n_ctx_new) {
+    const uint32_t n_ctx_cur = cparams.n_ctx;
+
+    n_ctx_new = GGML_PAD(n_ctx_new, 256);
+
+    if (n_ctx_new == n_ctx_cur) {
+        return true;
+    }
+
+    if (n_ctx_new < cparams.n_batch) {
+        LLAMA_LOG_ERROR("%s: n_ctx = %u is below n_batch = %u\n", __func__, n_ctx_new, cparams.n_batch);
+        return false;
+    }
+
+    if (!cparams.kv_unified) {
+        LLAMA_LOG_ERROR("%s: the cell count can only change with a unified KV cache\n", __func__);
+        return false;
+    }
+
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: no memory module\n", __func__);
+        return false;
+    }
+
+    synchronize();
+
+    if (!memory->n_ctx_resize(n_ctx_new)) {
+        LLAMA_LOG_ERROR("%s: the memory module refused n_ctx = %u\n", __func__, n_ctx_new);
+
+        // as in set_n_seq_max: a refusal can have MOVED the tensors (rebuilt in place, or in host memory),
+        // and the graph kept for reuse holds the old pointers
+        sched_need_reserve = true;
+        try {
+            sched_reserve();
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: re-reserving compute buffers after the refusal failed (%s); left for the next decode\n", __func__, e.what());
+            sched_need_reserve = true;
+        }
+
+        return false;
+    }
+
+    cparams.n_ctx     = n_ctx_new;
+    cparams.n_ctx_seq = n_ctx_new; // unified: every sequence may use the whole pool
+
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: reserving compute buffers for n_ctx = %u failed (%s), rolling back to %u\n",
+                __func__, n_ctx_new, e.what(), n_ctx_cur);
+
+        cparams.n_ctx     = n_ctx_cur;
+        cparams.n_ctx_seq = n_ctx_cur;
+
+        bool back = false;
+        try {
+            // every live cell fitted in n_ctx_cur a moment ago, so this cannot refuse for cells; an
+            // allocation can fail, and then the module has rebuilt its tensors where it could
+            back = memory->n_ctx_resize(n_ctx_cur);
+        } catch (const std::exception & e2) {
+            LLAMA_LOG_ERROR("%s: the memory module threw returning to %u cells: %s\n", __func__, n_ctx_cur, e2.what());
+        }
+        if (!back) {
+            LLAMA_LOG_ERROR("%s: the memory module could not return to %u cells\n", __func__, n_ctx_cur);
+        }
+
+        sched_need_reserve = true;
+        try {
+            sched_reserve();
+        } catch (const std::exception & e2) {
+            LLAMA_LOG_ERROR("%s: re-reserving compute buffers for n_ctx = %u failed after the rollback (%s); left for the next decode\n",
+                    __func__, n_ctx_cur, e2.what());
+            sched_need_reserve = true;
+        }
+
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: n_ctx %u -> %u\n", __func__, n_ctx_cur, n_ctx_new);
+
+    return true;
+}
+
+// [pool] What one more cell costs, asked of THIS model: the KV rows exactly (every attention cache knows
+// its bytes per cell), plus the compute buffers' marginal cost measured here - the reserved size against
+// a dry run at half the pool, per cell. The compute term is what the KQ mask, the indexer's scores and
+// everything else sized by n_kv add; it is not small (GLM at 327,680 cells: hundreds of MiB).
+std::map<ggml_backend_buffer_type_t, size_t> llama_context::n_ctx_cost(uint32_t n_ctx_new, bool & ok) {
+    std::map<ggml_backend_buffer_type_t, size_t> res;
+
+    const uint32_t n_ctx_cur = cparams.n_ctx;
+
+    n_ctx_new = GGML_PAD(n_ctx_new, 256);
+
+    ok = memory && cparams.kv_unified;
+    if (!ok || n_ctx_new <= n_ctx_cur) {
+        return res;
+    }
+
+    res = memory->n_ctx_cost(n_ctx_new);
+
+    if (!model.hparams.no_alloc) {
+        if (!backend_buf_ctx_cost_valid) {
+            const uint32_t n_kv_half = std::max(256u, GGML_PAD(n_ctx_cur / 2, 256));
+            std::vector<size_t> sizes;
+            if (n_kv_half < n_ctx_cur && compute_size_at(cparams.n_seq_max, sizes, n_kv_half)) {
+                backend_buf_ctx_cost.assign(backend_ptrs.size(), 0.0);
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    if (backend_buf_exp_size[i] > sizes[i]) {
+                        backend_buf_ctx_cost[i] = (double) (backend_buf_exp_size[i] - sizes[i]) / (n_ctx_cur - n_kv_half);
+                    }
+                }
+                backend_buf_ctx_cost_valid = true;
+            }
+        }
+        if (backend_buf_ctx_cost_valid) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (backend_buf_ctx_cost[i] > 0) {
+                    res[backend_buft[i]] += (size_t) (backend_buf_ctx_cost[i] * (n_ctx_new - n_ctx_cur));
                 }
             }
         }
@@ -4010,6 +4150,16 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 bool llama_set_n_seq_max(llama_context * ctx, uint32_t n_seq_max) {
     return ctx->set_n_seq_max(n_seq_max);
+}
+
+bool llama_set_n_ctx(llama_context * ctx, uint32_t n_ctx) {
+    GGML_UNUSED(ctx); GGML_UNUSED(n_ctx);
+    return false; // [pool] RED: not wired yet
+}
+
+int32_t llama_n_ctx_cost(llama_context * ctx, uint32_t n_ctx, ggml_backend_buffer_type_t * bufts, size_t * sizes, int32_t n_max) {
+    GGML_UNUSED(ctx); GGML_UNUSED(n_ctx); GGML_UNUSED(bufts); GGML_UNUSED(sizes); GGML_UNUSED(n_max);
+    return -1; // [pool] RED: not wired yet
 }
 
 int32_t llama_seq_max_cost(llama_context * ctx, uint32_t n_seq_max, ggml_backend_buffer_type_t * bufts, size_t * sizes, int32_t n_max) {

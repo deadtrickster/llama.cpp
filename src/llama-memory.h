@@ -111,6 +111,23 @@ struct llama_memory_i {
     // state this memory holds, exact. Growth only - a shrink frees and reports nothing.
     virtual std::map<ggml_backend_buffer_type_t, size_t> seq_max_cost(uint32_t n_seq_max) const { GGML_UNUSED(n_seq_max); return {}; }
 
+    // [pool] the number of KV cells this memory holds (the pool). Growing allocates room for the new
+    // cells; shrinking keeps every live cell, packed toward the front when they would not fit where
+    // they are, and is refused when there are more live cells than the new size holds. Returns false
+    // and leaves the memory exactly as it was when the request cannot be honoured: an unsupported
+    // memory type, a non-unified attention cache, a pending position shift, or an allocation failure.
+    // A memory with no cells (recurrent state) returns true and does nothing.
+    virtual bool n_ctx_resize(uint32_t n_ctx) { GGML_UNUSED(n_ctx); return false; }
+
+    // [pool] bytes, per buffer type, that n_ctx_resize(n_ctx) would ADD: the KV rows of the new
+    // cells, exact. Growth only - a shrink frees and reports nothing.
+    virtual std::map<ggml_backend_buffer_type_t, size_t> n_ctx_cost(uint32_t n_ctx) const { GGML_UNUSED(n_ctx); return {}; }
+
+    // [pool] for a dry run of the compute graph only: the full-memory context reports at most n_kv
+    // cells (0 = every cell), so the compute buffers can be sized as if the pool were smaller without
+    // reallocating it. Never set while a batch is in flight; reset to 0 after the dry run.
+    virtual void set_n_kv_limit(uint32_t n_kv) { GGML_UNUSED(n_kv); }
+
     //
     // ops
     //

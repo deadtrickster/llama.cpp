@@ -66,6 +66,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return  model.hparams.is_swa(il);
     };
 
+    this->swa_full = swa_full;
+    this->n_ubatch = n_ubatch;
+    this->n_swa    = hparams.n_swa;
+
     const uint32_t size_base = kv_size;
 
     // note: the SWA cache is always padded to 256 for performance
@@ -254,6 +258,45 @@ bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&
            kv_base->get_size() == kv_swa->get_size();
+}
+
+// [pool] the SWA cache is sized from the window, not the pool: n_swa*n_seq_max + n_ubatch, capped by the
+// base size (or equal to it under swa_full). A resize of the base re-derives that cap; the SWA cache
+// only moves when the cap does.
+static uint32_t swa_size_for(uint32_t size_base, bool swa_full, bool unified, uint32_t n_swa, uint32_t n_seq_max, uint32_t n_ubatch) {
+    if (swa_full) {
+        return size_base;
+    }
+    return GGML_PAD(std::min(size_base, n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+}
+
+bool llama_kv_cache_iswa::n_ctx_resize(uint32_t n_ctx) {
+    const uint32_t size_base_old = kv_base->get_size();
+    const uint32_t size_swa_old  = kv_swa->get_size();
+    const uint32_t size_swa_new  = swa_size_for(n_ctx, swa_full, unified, n_swa, kv_base->get_n_seq_max(), n_ubatch);
+
+    if (!kv_base->n_ctx_resize(n_ctx)) {
+        return false;
+    }
+    if (size_swa_new != size_swa_old && !kv_swa->n_ctx_resize(size_swa_new)) {
+        kv_base->n_ctx_resize(size_base_old);
+        return false;
+    }
+    return true;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::n_ctx_cost(uint32_t n_ctx) const {
+    auto res = kv_base->n_ctx_cost(n_ctx);
+    const uint32_t size_swa_new = swa_size_for(n_ctx, swa_full, unified, n_swa, kv_base->get_n_seq_max(), n_ubatch);
+    for (const auto & [buft, bytes] : kv_swa->n_ctx_cost(size_swa_new)) {
+        res[buft] += bytes;
+    }
+    return res;
+}
+
+void llama_kv_cache_iswa::set_n_kv_limit(uint32_t n_kv) {
+    kv_base->set_n_kv_limit(n_kv);
+    kv_swa ->set_n_kv_limit(n_kv);
 }
 
 bool llama_kv_cache_iswa::seq_max_resize(uint32_t n_seq_max) {

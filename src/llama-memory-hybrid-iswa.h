@@ -61,6 +61,10 @@ public:
     bool seq_max_resize(uint32_t n_seq_max) override;
     std::map<ggml_backend_buffer_type_t, size_t> seq_max_cost(uint32_t n_seq_max) const override;
 
+    bool n_ctx_resize(uint32_t n_ctx) override;
+    std::map<ggml_backend_buffer_type_t, size_t> n_ctx_cost(uint32_t n_ctx) const override;
+    void set_n_kv_limit(uint32_t n_kv) override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
