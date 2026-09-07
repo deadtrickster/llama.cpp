@@ -4153,13 +4153,24 @@ bool llama_set_n_seq_max(llama_context * ctx, uint32_t n_seq_max) {
 }
 
 bool llama_set_n_ctx(llama_context * ctx, uint32_t n_ctx) {
-    GGML_UNUSED(ctx); GGML_UNUSED(n_ctx);
-    return false; // [pool] RED: not wired yet
+    return ctx->set_n_ctx(n_ctx);
 }
 
 int32_t llama_n_ctx_cost(llama_context * ctx, uint32_t n_ctx, ggml_backend_buffer_type_t * bufts, size_t * sizes, int32_t n_max) {
-    GGML_UNUSED(ctx); GGML_UNUSED(n_ctx); GGML_UNUSED(bufts); GGML_UNUSED(sizes); GGML_UNUSED(n_max);
-    return -1; // [pool] RED: not wired yet
+    bool ok = false;
+    const auto cost = ctx->n_ctx_cost(n_ctx, ok);
+    if (!ok) {
+        return -1;
+    }
+    int32_t i = 0;
+    for (const auto & [buft, bytes] : cost) {
+        if (i < n_max) {
+            bufts[i] = buft;
+            sizes[i] = bytes;
+        }
+        i++;
+    }
+    return i;
 }
 
 int32_t llama_seq_max_cost(llama_context * ctx, uint32_t n_seq_max, ggml_backend_buffer_type_t * bufts, size_t * sizes, int32_t n_max) {

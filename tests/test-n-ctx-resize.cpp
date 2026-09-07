@@ -27,10 +27,14 @@
 #include <string>
 #include <vector>
 
-static int g_log_n_error = 0;
+static int g_log_n_error  = 0;
+static int g_log_n_packed = 0; // resize lines that report live cells packed toward the front
 static void count_log(enum ggml_log_level level, const char * text, void * user_data) {
     if (level == GGML_LOG_LEVEL_ERROR) {
         g_log_n_error++;
+    }
+    if (strstr(text, ", packed") != nullptr) {
+        g_log_n_packed++;
     }
     fputs(text, stderr);
     (void) user_data;
@@ -40,8 +44,11 @@ static void count_log(enum ggml_log_level level, const char * text, void * user_
 
 static const int N_BATCH = 64;
 
+static bool g_flash_attn = true; // off exercises the transposed V layout, whose cells are strided
+
 static llama_context * make_ctx(llama_model * model, uint32_t n_ctx) {
     llama_context_params cp = llama_context_default_params();
+    cp.flash_attn_type = g_flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cp.n_ctx      = n_ctx;
     cp.n_batch    = N_BATCH;
     cp.n_ubatch   = N_BATCH;
@@ -123,19 +130,8 @@ static int32_t print_cost(llama_context * ctx, uint32_t n_ctx, const char * tag)
     return n;
 }
 
-int main(int argc, char ** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]);
-        return 2;
-    }
-
-    llama_backend_init();
-
-    llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
-    llama_model * model = llama_model_load_from_file(argv[1], mp);
-    CHECK(model, "failed to load %s", argv[1]);
-
+static int run(llama_model * model, const char * path) {
+    const char * argv[2] = { "", path };
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     CHECK(n_vocab > 64, "vocab of %d tokens is too small", n_vocab);
     auto fixed = [&](int seed, int n) {
@@ -176,13 +172,13 @@ int main(int argc, char ** argv) {
         CHECK(generate(ref, {0, 1}, {R0b.back(), R1.back()}, {p0_2, p1_1}, N4, g) == 0, "ref: gen 0+1 more");
         R0d = g[0];
         R1d = g[1];
-        CHECK(llama_memory_seq_rm(llama_get_memory(ref), 0, -1, -1), "ref: seq_rm 0");
         CHECK(decode_tokens(ref, Q2, 2, 0) == 0, "ref: decode Q2 on seq 2");
         const llama_token q2_first = greedy(ref, -1);
         CHECK(generate(ref, {1, 2}, {R1d.back(), q2_first}, {p1_2, (llama_pos) Q2.size()}, N5, g) == 0, "ref: gen 1+2");
         R1e = g[0];
         R2  = g[1];
         R2.insert(R2.begin(), q2_first);
+        CHECK(llama_memory_seq_rm(llama_get_memory(ref), 0, -1, -1), "ref: seq_rm 0");
         CHECK(llama_memory_seq_rm(llama_get_memory(ref), 1, -1, -1), "ref: seq_rm 1");
         CHECK(generate(ref, {2}, {R2.back()}, {p2_1}, N6, g) == 0, "ref: gen 2 alone");
         R2c = g[0];
@@ -249,7 +245,9 @@ int main(int argc, char ** argv) {
     }
 
     // ---- sequence 2 lands above cell 256; the pool is cut to 256 under it once it is alone ----
-    CHECK(llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1), "seq_rm 0");
+    // Placement is by construction: sequences 0 and 1 fill cells 0..356 contiguously (39 + 318 cells from
+    // a search head of 0), so sequence 2 goes above 356. Removing the others frees the cells below it
+    // but does not move it; only the shrink does, and its log line says so (", packed").
     CHECK(print_cost(ctx, 2048, argv[1]) >= 0, "llama_n_ctx_cost(2048) refused");
     CHECK(llama_set_n_ctx(ctx, 2048), "grow to 2048 refused");
     CHECK(llama_n_ctx(ctx) == 2048, "n_ctx is %u after the second grow", llama_n_ctx(ctx));
@@ -262,12 +260,19 @@ int main(int argc, char ** argv) {
     CHECK(g[0] == R1e, "seq 1 at 2048 cells diverged:\n  got %s\n  ref %s", show(g[0]).c_str(), show(R1e).c_str());
     CHECK(A2 == R2,    "seq 2 at 2048 cells diverged:\n  got %s\n  ref %s", show(A2).c_str(), show(R2).c_str());
 
+    CHECK(llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1), "seq_rm 0");
     CHECK(llama_memory_seq_rm(llama_get_memory(ctx), 1, -1, -1), "seq_rm 1");
     CHECK(llama_memory_seq_pos_max(llama_get_memory(ctx), 2) == p2_1 - 1, "seq 2 lost positions before the shrink");
 
-    // sequence 2 sits at cells ~345..359: a shrink to 256 must pack it, not refuse it
-    CHECK(llama_set_n_ctx(ctx, 256), "shrink to 256 refused with only %d live cells", (int) p2_1);
+    // sequence 2 sits at cells ~357..370: a shrink to 256 must pack it, not refuse it
+    g_log_n_packed = 0;
+    llama_log_set(count_log, nullptr);
+    const bool shrunk = llama_set_n_ctx(ctx, 256);
+    llama_log_set(nullptr, nullptr);
+    CHECK(shrunk, "shrink to 256 refused with only %d live cells", (int) p2_1);
     CHECK(llama_n_ctx(ctx) == 256, "n_ctx is %u after the shrink", llama_n_ctx(ctx));
+    CHECK(g_log_n_packed > 0, "the shrink to 256 did not pack anything: sequence 2 was not above cell 256, the test proves nothing");
+    printf("packing shrink: %d cache(s) packed their live cells\n", g_log_n_packed);
     CHECK(llama_memory_seq_pos_max(llama_get_memory(ctx), 2) == p2_1 - 1, "seq 2 lost positions in the shrink");
 
     CHECK(generate(ctx, {2}, {A2.back()}, {p2_1}, N6, g) == 0, "gen 2 after the shrink");
@@ -283,6 +288,33 @@ int main(int argc, char ** argv) {
     CHECK(decode_tokens(ctx, Q, 3, 0) == 0, "decode 300 tokens on seq 3 after the grow to 8192");
 
     llama_free(ctx);
+
+    printf("OK (flash_attn %s)\n", g_flash_attn ? "on" : "off");
+    return 0;
+}
+
+int main(int argc, char ** argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <model.gguf>\n", argv[0]);
+        return 2;
+    }
+
+    llama_backend_init();
+
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;
+    llama_model * model = llama_model_load_from_file(argv[1], mp);
+    CHECK(model, "failed to load %s", argv[1]);
+
+    // both V layouts: rows per cell (FA) and cells per embedding row (no FA, transposed)
+    for (int fa = 1; fa >= 0; --fa) {
+        g_flash_attn = fa != 0;
+        const int rc = run(model, argv[1]);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+
     llama_model_free(model);
     llama_backend_free();
 
