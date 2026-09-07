@@ -88,6 +88,7 @@ class ServerProcess:
     kv_unified: bool | None = False
     kv_unified_per_slot: int | None = None
     seq_max: int | None = None
+    parallel_max: int | None = None
     swa_full: bool | None = False
     server_slots: bool | None = False
     pooling: str | None = None
@@ -101,6 +102,8 @@ class ServerProcess:
     spec_type: str | None = None
     slot_quantum: int | None = None
     slot_resume_after: int | None = None
+    slot_deadline_preempt: bool = False
+    decode_per_prefill: int | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
     spec_synth_len: float | None = None
@@ -214,6 +217,8 @@ class ServerProcess:
             server_args.extend(["--kv-unified-per-slot", self.kv_unified_per_slot])
         if self.seq_max is not None:
             server_args.extend(["--seq-max", self.seq_max])
+        if self.parallel_max is not None:
+            server_args.extend(["--parallel-max", self.parallel_max])
         if self.swa_full:
             server_args.append("--swa-full")
         if self.server_slots:
@@ -257,6 +262,10 @@ class ServerProcess:
             server_args.extend(["--slot-quantum", self.slot_quantum])
         if self.slot_resume_after is not None:
             server_args.extend(["--slot-resume-after", self.slot_resume_after])
+        if self.slot_deadline_preempt:
+            server_args.append("--slot-deadline-preempt")
+        if self.decode_per_prefill is not None:
+            server_args.extend(["--decode-per-prefill", self.decode_per_prefill])
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:
@@ -323,6 +332,12 @@ class ServerProcess:
         args = [str(arg) for arg in [server_path, *server_args]]
         print(f"tests: starting server with: {' '.join(args)}")
 
+        # the port has to be ours before the server asks for it. Two ways it was not: the previous server on this
+        # port (load_all() starts them back-to-back) had not let go yet, and a port inside the kernel's ephemeral
+        # range was taken by somebody's outbound connection. Either way the server died with "couldn't bind" and
+        # the test read as "Server process died with return code 1" - 298 verdicts in one run. Wait for it.
+        self._wait_port_free()
+
         flags = 0
         if "nt" == os.name:
             flags |= subprocess.DETACHED_PROCESS
@@ -367,6 +382,35 @@ class ServerProcess:
                 last_print_time = time.time()
             time.sleep(0.01)
         raise TimeoutError(f"Server did not start within {timeout_seconds} seconds")
+
+    def _wait_port_free(self, timeout_s: float = 10.0) -> None:
+        import socket
+        try:
+            with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+                lo, hi = (int(x) for x in f.read().split())
+            if lo <= self.server_port <= hi:
+                print(f"tests: WARNING port {self.server_port} is inside the ephemeral range {lo}-{hi}; "
+                      f"an outbound connection can take it from under the server - set PORT below {lo}")
+        except Exception:
+            pass
+        deadline = time.time() + timeout_s
+        waited = False
+        while True:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.server_host, self.server_port))
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    print(f"tests: port {self.server_port} is still held after {timeout_s:.0f} s, starting anyway")
+                    break
+                waited = True
+                time.sleep(0.2)
+            finally:
+                sock.close()
+        if waited:
+            print(f"tests: waited for port {self.server_port} to be free")
 
     def stop(self) -> None:
         if self.external_server:

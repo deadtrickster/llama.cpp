@@ -459,6 +459,7 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_seq_max             =     0; // number of sequence ids the context is allocated for (0 = n_parallel); a residency ceiling, NOT free - see --seq-max
+    int32_t n_parallel_max        =     0; // [seats] the most batch seats the server may add on top of --parallel (0 = derive from the pool); see --parallel-max
     int32_t seq_max_headroom_mib  =     0; // [seq-max] free device memory to keep when raising the ceiling at runtime, see --seq-max-headroom
 
     // the n_seq_max the context is actually created with. llama sizes per-sequence state (recurrent memory,
@@ -650,6 +651,8 @@ struct common_params {
     // ageing bonus: a suspended task waiting longer than this resumes even when
     // new work is still queued, so a long generation cannot be starved forever.
     int32_t slot_resume_after_ms = 30000;
+    bool    slot_deadline_preempt = false; // [deadline] past --slot-resume-after, take a seat/id/room from a running generation; see --slot-deadline-preempt
+    int32_t decode_per_prefill    = 0;     // [ratio] decode-only batches between two prefill batches while both exist (0 = merge them, the old greedy loop); see --decode-per-prefill
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

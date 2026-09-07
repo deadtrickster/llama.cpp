@@ -161,6 +161,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
             SRV_ERR("--seq-max (%d) must be >= --parallel (%d)\n", params.n_seq_max, params.n_parallel);
             return 1;
         }
+
+        // [seats] --parallel is the floor; a cap below it is a contradiction
+        if (params.n_parallel_max > 0 && params.n_parallel_max < params.n_parallel) {
+            SRV_ERR("--parallel-max (%d) must be >= --parallel (%d)\n", params.n_parallel_max, params.n_parallel);
+            return 1;
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c

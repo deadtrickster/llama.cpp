@@ -1745,6 +1745,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_RESUME_AFTER"));
     add_opt(common_arg(
+        {"--slot-deadline-preempt"},
+        {"--no-slot-deadline-preempt"},
+        string_format("[deadline] make --slot-resume-after a hard bound: a suspended generation that has waited that long takes "
+            "a seat (and, if it needs them, an id and KV room) from the running generation that has had its seat the "
+            "longest, with a copy of that one's state (default: %s). Off, it only wins a seat that frees up on its own",
+            params.slot_deadline_preempt ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.slot_deadline_preempt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_DEADLINE_PREEMPT"));
+    add_opt(common_arg(
+        {"--decode-per-prefill"}, "N",
+        string_format("[ratio] while a prompt is being prefilled and other slots are generating, run N decode-only batches "
+            "between two prefill batches (default: %d, 0 = merge prefill and decode into every batch). Merged, a "
+            "generating slot gets ONE token per prefill batch, so its rate becomes the prefill's batch rate "
+            "(measured on GLM: 0.34 t/s against 43 during a 174k-token prefill); N gives decode its own clock at the "
+            "price of N small batches per prefill batch", params.decode_per_prefill),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--decode-per-prefill must be >= 0");
+            }
+            params.decode_per_prefill = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_PER_PREFILL"));
+    add_opt(common_arg(
         {"--cache-disk"}, "N",
         string_format("[l2-spill] max size in MiB of the level-2 (disk) prompt cache, 0 = no limit "
             "(default: %d). Requires --slot-save-path; evicted prompt-cache entries are spilled there "
@@ -2626,6 +2651,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.seq_max_headroom_mib = value;
             }
         ).set_env("LLAMA_ARG_SEQ_MAX_HEADROOM").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--parallel-max"}, "N",
+            string_format(
+                "the most server slots there may be (default: %d, 0 = derive: as many as the pool holds sequences, up to the sequence ceiling's cap)\n"
+                "slots follow residency: --parallel is the floor that always exists, and a slot is added for every resident sequence with work while the model says one more fits;\n"
+                "set this only to hold the batch narrower than the pool - a yielded generation then stays resident and waits for a slot instead of being copied out",
+                params.n_parallel_max),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("error: invalid value for --parallel-max\n");
+                }
+                params.n_parallel_max = value;
+            }
+        ).set_env("LLAMA_ARG_N_PARALLEL_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",
