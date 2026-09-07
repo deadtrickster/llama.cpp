@@ -118,6 +118,8 @@ class ServerProcess:
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
     n_cache_reuse: int | None = None
+    n_ctx_checkpoints: int | None = None
+    checkpoint_min_step: int | None = None
     cache_disk: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
@@ -294,6 +296,10 @@ class ServerProcess:
             server_args.extend(["--cache-ram", self.cache_ram])
         if self.n_cache_reuse is not None:
             server_args.extend(["--cache-reuse", self.n_cache_reuse])
+        if self.n_ctx_checkpoints is not None:
+            server_args.extend(["--ctx-checkpoints", self.n_ctx_checkpoints])
+        if self.checkpoint_min_step is not None:
+            server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
         if self.cache_disk is not None:
             server_args.extend(["--cache-disk", self.cache_disk])
         if self.no_cache_idle_slots:

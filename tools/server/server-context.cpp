@@ -4306,6 +4306,22 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // schedule fallback: true when no checkpoint has been created for checkpoint_min_step
+                    // tokens, counted from the last checkpoint or from the start of the prompt. user-message
+                    // boundaries stay the preferred placement; this only fires when none has shown up for
+                    // that long. without it a prompt whose user boundaries all sit near its end gets
+                    // checkpoints only there, and a rollback to anywhere earlier finds nothing usable and
+                    // reprocesses the whole prefix (measured: 33k prompt, rollback to 18k, 18k tokens
+                    // thrown away, GLM-TODO T3.5c). a min step of 0 means "no minimum" and never schedules.
+                    const auto is_checkpoint_due = [&](int n_tokens) {
+                        if (params_base.checkpoint_min_step <= 0) {
+                            return false;
+                        }
+                        const auto & checkpoints = slot.prompt.checkpoints;
+                        const int64_t last = checkpoints.empty() ? 0 : checkpoints.back().n_tokens;
+                        return n_tokens > last + params_base.checkpoint_min_step;
+                    };
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
@@ -4342,6 +4358,11 @@ private:
                             }
                         }
 
+                        // break on the schedule fallback so that the next batch starts on a checkpoint
+                        if (do_checkpoint && is_checkpoint_due(slot.prompt.n_tokens())) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -4373,6 +4394,7 @@ private:
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_sched_start = is_checkpoint_due(n_tokens_start);
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -4390,8 +4412,9 @@ private:
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
-                        // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        // message, is due on the checkpoint_min_step schedule, or we are near the
+                        // end of the prompt
+                        if (!is_user_start && !near_prompt_end && !is_sched_start) {
                             do_checkpoint = false;
                         }
                     }
