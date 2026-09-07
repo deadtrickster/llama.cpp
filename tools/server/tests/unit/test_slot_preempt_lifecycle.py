@@ -257,3 +257,73 @@ def test_suspended_task_survives_shutdown(tmp_path):
     # this is 0 or 1 (BOS).
     assert t["cache_n"] >= n_prompt_a + len(partial.split()) // 2, \
         f"suspended conversation lost at shutdown: cache_n={t['cache_n']} of {t['prompt_n'] + t['cache_n']}"
+
+
+def test_failed_resume_answers_the_client_and_clears_the_slot():
+    """T1.4. Forces a REAL restore failure. state_read_meta() first does
+    seq_rm(dest) and then find_slot(cont=false), so it fails exactly when the
+    pool has fewer free cells than the saved state - and the cells it just
+    freed belong to the resume slot's previous occupant, so the bulk has to be
+    on the OTHER slot.
+
+    Layout, --kv-unified pool of 1024 cells, --batch-size 2:
+      A (slot 0): 100-token prompt, then generation
+      B (slot 1): 600-token prompt sent right after, n_predict 300. Slot 0 fills
+                  the batch first, so B prefills 1 token per A step.
+      C:          deferred behind both - that arms A's quantum trigger. B is
+                  still in prefill at A's 320th token (600 > 320), and a prefill
+                  never yields, so A is the one that goes: 100 + 320 = 420 cells.
+                  C then takes slot 0 for 330 tokens; B keeps growing 1/step and
+                  is at ~650 cells when C finishes and A tries to come back:
+                  1024 - 650 < 420.
+
+    Before the fix that failure was logged and the entry destroyed: A's client
+    waited forever, and slot 0 kept C's prompt with none of its cells in KV."""
+    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log, quantum=320, n_slots=2, n_ctx=1024)
+    sp.kv_unified = True
+    sp.n_batch = 2
+    sp.start(timeout_seconds=120)
+    try:
+        _wait_ready(sp)
+        toks = _tokens(sp, " ".join(["the cat sat on the mat and looked at the dog"] * 120))
+        assert len(toks) >= 700, f"precondition: only {len(toks)} tokens to build prompts from"
+        prompt_a = toks[:100]
+        prompt_b = toks[:600]
+        prompt_c = toks[600:620]
+        prompt_d = toks[600:640]          # C's prompt is a prefix of D's
+
+        conn_a = _raw_post(sp, _completion(prompt_a, 1500), timeout=20)
+        time.sleep(0.005)
+        b, c = [], []
+        tb = threading.Thread(target=_busy, args=(sp, prompt_b, 300, b)); tb.start()
+        time.sleep(0.005)
+        tc = threading.Thread(target=_busy, args=(sp, prompt_c, 330, c)); tc.start()
+
+        # PRECONDITIONS: A yielded, and its resume failed for real
+        assert _wait_log(log, "yielded the slot", 15), "precondition: no yield happened"
+        assert _wait_log(log, "failed to resume a suspended generation", 15), \
+            "precondition: the resume did not fail, so the layout did not force a restore failure"
+
+        # the stated defect: nobody tells A's client
+        try:
+            resp = conn_a.getresponse()
+            body = resp.read()
+        except socket.timeout:
+            pytest.fail("A's client hung after the failed resume: no error was sent")
+        assert resp.status in (200, 500), f"unexpected status {resp.status}: {body!r}"
+
+        tb.join(timeout=60); tc.join(timeout=60)
+        assert b and b[0].status_code == 200, f"B failed: {b}"
+        assert c and c[0].status_code == 200, f"C failed: {c}"
+
+        # the corruption: the failed restore did seq_rm(0) before it read, so slot 0
+        # has no cells for the prompt it still claims (C's). A request on slot 0
+        # whose prompt extends C's must NOT be told any of it is cached.
+        r = sp.make_request("POST", "/completion", data={
+            "prompt": prompt_d, "id_slot": 0, "n_predict": 1, "temperature": 0.0, "cache_prompt": True})
+        assert r.status_code == 200, r.body
+        assert r.body["timings"]["cache_n"] == 0, \
+            f"slot 0 reused {r.body['timings']['cache_n']} cached tokens that are not in the KV"
+    finally:
+        sp.stop()

@@ -444,6 +444,10 @@ struct server_slot_suspended {
 
     int64_t t_suspended_ms = 0;
     int     n_decoded_at_suspend = 0;
+
+    // how many times resume() has refused this state. The resume pass retries
+    // once and then answers the task instead of dropping it.
+    int n_resume_failures = 0;
 };
 
 struct server_slot {
@@ -839,19 +843,32 @@ struct server_slot {
     }
 
     // [preempt] inverse of suspend(). The slot must be idle and empty.
-    bool resume(std::unique_ptr<server_slot_suspended> st) {
+    //
+    // Takes the state by reference and consumes it only on success, so a failed
+    // restore leaves `st` intact for the caller to retry or answer. The restore
+    // itself is not transactional: state_read_meta() does seq_rm(dest) BEFORE
+    // it reads, so after a failure this slot's cells are gone whatever `prompt`
+    // says. prompt_clear() makes the two agree again - without it the next
+    // task on this slot reuses a prefix that is not in the KV.
+    bool resume(std::unique_ptr<server_slot_suspended> & st) {
         if (!st) {
             return false;
         }
 
         if (llama_state_seq_set_data_ext(ctx_tgt, st->data_tgt.data(), st->data_tgt.size(),
                                          id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
-            SLT_ERR(*this, "%s", "resume: failed to restore target KV state\n");
+            SLT_ERR(*this, "resume: failed to restore target KV state (%zu bytes)\n", st->data_tgt.size());
+            prompt_clear();
             return false;
         }
         if (ctx_dft && !st->data_dft.empty()) {
-            llama_state_seq_set_data_ext(ctx_dft, st->data_dft.data(), st->data_dft.size(),
-                                         id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (llama_state_seq_set_data_ext(ctx_dft, st->data_dft.data(), st->data_dft.size(),
+                                             id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+                // the target half is already in; half a state is worse than none
+                SLT_ERR(*this, "resume: failed to restore draft KV state (%zu bytes)\n", st->data_dft.size());
+                prompt_clear();
+                return false;
+            }
         }
 
         prompt                 = std::move(st->prompt);
@@ -3521,8 +3538,20 @@ private:
                     auto st = std::move(queue_suspended.front());
                     queue_suspended.pop_front();
                     const int n_gen_at = st->n_decoded_at_suspend;
-                    if (!slot.resume(std::move(st))) {
-                        SLT_ERR(slot, "failed to resume a suspended generation (%d tokens in)\n", n_gen_at);
+                    if (!slot.resume(st)) {
+                        // resume() left `st` intact and this slot cleared. The usual cause
+                        // is the pool: the other slots grew while this one waited and its
+                        // cells no longer fit. One retry at the FRONT covers another slot
+                        // freeing up (the loop goes on to it right now if one is idle);
+                        // after that the task is answered, because a dropped entry is a
+                        // client waiting forever for a generation nobody is running.
+                        if (st->n_resume_failures++ == 0) {
+                            SLT_WRN(slot, "failed to resume a suspended generation (%d tokens in), will retry once\n", n_gen_at);
+                            queue_suspended.push_front(std::move(st));
+                            continue;
+                        }
+                        SLT_ERR(slot, "failed to resume a suspended generation (%d tokens in), giving up\n", n_gen_at);
+                        send_error(*st->task, "failed to resume the suspended generation: no room in the KV cache", ERROR_TYPE_SERVER);
                     } else if (aged && !nobody_new) {
                         SLT_INF(slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
                                 waited_ms, queue_tasks.queue_tasks_deferred_size());
@@ -4645,8 +4674,9 @@ private:
                     slot.stats.n_gen > 0 &&
                     slot.stats.n_gen % (uint64_t) selftest_every == 0) {
                     auto st = slot.suspend();
-                    if (st && !slot.resume(std::move(st))) {
+                    if (st && !slot.resume(st)) {
                         SLT_ERR(slot, "%s", "preempt selftest: resume FAILED\n");
+                        send_error(*st->task, "preempt selftest: resume failed", ERROR_TYPE_SERVER);
                     }
                 }
             }
