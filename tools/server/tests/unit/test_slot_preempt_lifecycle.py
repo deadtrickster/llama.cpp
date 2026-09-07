@@ -161,3 +161,99 @@ def test_cancel_reaches_a_suspended_task():
         assert _slots_idle(sp), "a slot is still processing after every live client is done"
     finally:
         sp.stop()
+
+
+def _read_stream_until_quiet(resp: http.client.HTTPResponse) -> str:
+    """Collect the content of an SSE completion until the server goes quiet
+    (socket timeout) - for a suspended task that is everything sent so far."""
+    content = ""
+    try:
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            line = line.decode("utf-8", errors="replace").strip()
+            if line.startswith("data: ") and "[DONE]" not in line:
+                content += json.loads(line[6:]).get("content", "")
+    except (socket.timeout, TimeoutError):
+        pass
+    return content
+
+
+def test_suspended_task_survives_shutdown(tmp_path):
+    """T1.5. A yields to B; SIGTERM lands while A is suspended and B holds the
+    slot. flush_prompt_cache() walked `slots` only, so B was saved and A - whose
+    KV state and prompt were sitting in queue_suspended in exactly the format
+    the cache stores - died with the process.
+
+    Two facts after the shutdown: the spill directory holds an entry of exactly
+    A's prompt + generated-so-far length, and a restart on the same
+    --slot-save-path serves the conversation A's client actually has (prompt +
+    the streamed partial output) from the cache. The bare prompt alone would
+    not hit: the cache refuses entries it would keep less than 25% of
+    (f_keep < 0.25, "don't trash large prompts"), which is its general policy
+    for any long conversation and not this flush's business.
+
+    The clients hang up after the flush: server_context::terminate() stops the
+    task queue only, so a handler whose client is still connected polls forever
+    and ctx_http.stop() waits on it (pre-existing, not the subject here)."""
+    cache_dir = str(tmp_path)
+    log = os.path.join(cache_dir, "srv1.log")
+    sp = _mk(log, quantum=8, n_slots=1, n_threads=1)
+    sp.cache_ram = 100
+    sp.slot_save_path = cache_dir
+    sp.start(timeout_seconds=120)
+    rc = None
+    conns = []
+    try:
+        _wait_ready(sp)
+        n_prompt_a = len(_tokens(sp, PROMPT_A)) + 1     # + BOS
+        conns.append(_raw_post(sp, _completion(PROMPT_A, 1500, stream=True), timeout=1.0))
+        time.sleep(0.05)
+        conns.append(_raw_post(sp, _completion(PROMPT_B, 3000), timeout=60))
+
+        assert _wait_log(log, "yielded the slot", 10), "precondition: no yield happened"
+        # what A's client has in hand at this point
+        partial = _read_stream_until_quiet(conns[0].getresponse())
+        assert len(partial) > 0, "precondition: A streamed nothing before it yielded"
+
+        # SIGTERM, the same thing stop() sends, but we want the exit status
+        sp.process.terminate()
+        assert _wait_log(log, "remaining cache entries", 30), "precondition: the shutdown spill never ran"
+        for c in conns:
+            c.close()
+        rc = sp.process.wait(timeout=30)
+    finally:
+        sp.stop()
+    assert rc == 0, f"server exited with {rc}"
+    assert _log_count(log, "flush:") > 0, "precondition: the shutdown flush never ran"
+
+    # fact 1: the suspended state is on disk, as an entry of A's exact length.
+    # spill files are named l2p-<model>-<fingerprint>-<n_tokens>-<hash>.spill
+    with open(log, errors="replace") as f:
+        m = re.search(r"suspended after (\d+) generated tokens", f.read())
+    assert m, "precondition: no suspend line in the log"
+    n_suspended = n_prompt_a + int(m.group(1))
+    spilled = sorted(int(os.path.basename(p).split("-")[3]) for p in glob.glob(os.path.join(cache_dir, "l2p-*.spill")))
+    assert any(abs(n - n_suspended) <= 1 for n in spilled), \
+        f"no spill entry of ~{n_suspended} tokens (A's prompt {n_prompt_a} + {m.group(1)} generated); on disk: {spilled}"
+
+    # fact 2: a new process serves A's conversation from that entry
+    sp2 = _mk(os.path.join(cache_dir, "srv2.log"), quantum=8, n_slots=1)
+    sp2.cache_ram = 100
+    sp2.slot_save_path = cache_dir
+    sp2.start(timeout_seconds=120)
+    try:
+        _wait_ready(sp2)
+        r = sp2.make_request("POST", "/completion", data={
+            "prompt": PROMPT_A + partial, "n_predict": 4, "temperature": 0.0, "cache_prompt": True})
+        assert r.status_code == 200, r.body
+        t = r.body["timings"]
+    finally:
+        sp2.stop()
+
+    # detokenize/retokenize can move a boundary or two, so "the whole prompt and
+    # most of the partial output" rather than an exact count. Without the flush
+    # this is 0 or 1 (BOS).
+    assert t["cache_n"] >= n_prompt_a + len(partial.split()) // 2, \
+        f"suspended conversation lost at shutdown: cache_n={t['cache_n']} of {t['prompt_n'] + t['cache_n']}"

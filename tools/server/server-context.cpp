@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -1328,6 +1329,36 @@ private:
             return;
         }
 
+        // [preempt] a suspended generation is in no slot, and its KV state is
+        // already a byte blob in exactly the shape the cache stores, so it can
+        // be materialised without a context - which is why this runs before the
+        // context check below. The entries stay in the deque: on the exit path
+        // nothing reads them again, and on the sleep path a task still waiting
+        // for a slot is not this function's to drop.
+        int n_susp_saved  = 0;
+        int n_susp_cached = 0;
+        for (auto & st : queue_suspended) {
+            auto * cur = prompt_cache->alloc(st->prompt, st->data_tgt.size(), st->data_dft.size());
+            if (cur == nullptr) {
+                if (prompt_cache->contains(st->prompt)) {
+                    n_susp_cached++;
+                } else {
+                    SRV_WRN("flush: suspended task %d holds %d tokens but the cache refused it (state over the cache size limit?)\n",
+                            st->task->id, st->prompt.n_tokens());
+                }
+                continue;
+            }
+            std::memcpy(cur->data.main.data(), st->data_tgt.data(), st->data_tgt.size());
+            if (!st->data_dft.empty()) {
+                std::memcpy(cur->data.drft.data(), st->data_dft.data(), st->data_dft.size());
+            }
+            n_susp_saved++;
+        }
+        if (!queue_suspended.empty()) {
+            SRV_INF("flush: %zu suspended task(s), %d saved, %d already cached\n",
+                    queue_suspended.size(), n_susp_saved, n_susp_cached);
+        }
+
         // destroy() frees the context but leaves the slots populated - they are
         // only rebuilt by load_model(). A shutdown while sleeping therefore
         // arrives here with slots that still claim tokens and a ctx_tgt that
@@ -1336,6 +1367,9 @@ private:
         // free. The spill below is context-free and still runs.
         if (ctx_tgt == nullptr) {
             SRV_INF("flush: context is gone (%s), skipping slot walk\n", sleeping ? "sleeping" : "not loaded");
+            if (n_susp_saved > 0) {
+                prompt_cache->update();
+            }
             prompt_cache->spill_all();
             return;
         }
@@ -1363,7 +1397,7 @@ private:
         SRV_INF("flush: %d slot(s) with tokens, %d saved, %d already cached, cache now %zu entries / %.1f MiB\n",
                 n_live, n_saved, n_cached, prompt_cache->states.size(),
                 prompt_cache->size() / 1048576.0);
-        if (n_saved > 0) {
+        if (n_saved > 0 || n_susp_saved > 0) {
             prompt_cache->update();
         }
 
