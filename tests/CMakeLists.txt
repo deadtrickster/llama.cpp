@@ -149,6 +149,7 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-memory-can-shift.cpp)
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -238,6 +239,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     set_tests_properties(test-recurrent-state-rollback-dsv4 PROPERTIES
         FIXTURES_REQUIRED generate-models
     )
+
+    # a cache holding recurrent state must refuse position shifts; an attention-only cache must not
+    foreach(can_shift_model mamba-dense qwen35-dense nemotron_h-dense llama-dense)
+        llama_test(
+            test-memory-can-shift
+            NAME test-memory-can-shift-${can_shift_model}
+            LABEL main
+            ARGS -m "${MODEL_DIR}/${can_shift_model}.gguf"
+        )
+        set_tests_properties(test-memory-can-shift-${can_shift_model} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
 
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(

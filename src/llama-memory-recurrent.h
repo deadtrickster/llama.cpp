@@ -59,6 +59,11 @@ public:
     // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
 
+    // whether any recurrent layer is resident in this cache. a cache built with every layer
+    // filtered out (the glm5next MTP draft context) holds no r_l/s_l and behaves like plain
+    // position bookkeeping; every restriction that protects recurrent state is lifted for it.
+    bool has_state() const;
+
     bool get_can_shift() const override;
 
     // state write/load

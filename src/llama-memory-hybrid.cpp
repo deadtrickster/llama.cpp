@@ -160,11 +160,12 @@ llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, 
 }
 
 bool llama_memory_hybrid::get_can_shift() const {
-    // Shifting is trivially supported for recurrent
+    // the recurrent half refuses while it holds state (see llama_memory_recurrent::get_can_shift);
+    // only a hybrid whose every recurrent layer is filtered out (the MTP draft context) can shift
     if (mem_idx && !mem_idx->get_can_shift()) {
         return false;
     }
-    return mem_attn->get_can_shift();
+    return mem_attn->get_can_shift() && mem_recr->get_can_shift();
 }
 
 void llama_memory_hybrid::clear(bool data) {

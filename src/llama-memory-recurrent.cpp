@@ -188,8 +188,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     // a cache with no resident recurrent layers holds no state that could be partially
     // erased, so the restriction does not apply to it. this is the glm5next MTP draft
     // context, which runs only the NextN block and filters every KDA layer out.
-    const bool has_state = std::any_of(s_l.begin(), s_l.end(),
-            [](const ggml_tensor * t) { return t != nullptr; });
+    const bool has_state = this->has_state();
 
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
@@ -721,9 +720,18 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     return n >= n_seqs;
 }
 
+bool llama_memory_recurrent::has_state() const {
+    return std::any_of(s_l.begin(), s_l.end(), [](const ggml_tensor * t) { return t != nullptr; });
+}
+
 bool llama_memory_recurrent::get_can_shift() const {
-    // shifting the pos is trivial for recurrent models
-    return true;
+    // seq_add moves cell.pos and leaves r_l/s_l untouched. the state of a recurrent layer is a
+    // function of the exact token history it consumed, so after a shift the cache holds state
+    // computed over one history while claiming to sit at the positions of another - and nothing
+    // downstream can tell. the server's --cache-reuse then restores checkpoints and serves
+    // answers that still depend on tokens the client deleted (GLM-TODO T3.5). a shift is only
+    // safe when there is no state to go stale: the MTP draft context with every layer filtered.
+    return !has_state();
 }
 
 size_t llama_memory_recurrent::total_size() const {
