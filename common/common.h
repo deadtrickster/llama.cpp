@@ -458,6 +458,11 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    int32_t n_seq_max             =     0; // number of sequence ids the context is allocated for (0 = n_parallel); a residency ceiling, NOT free - see --seq-max
+
+    // the n_seq_max the context is actually created with. llama sizes per-sequence state (recurrent memory,
+    // KV streams, samplers, output reservation) by this, not by n_parallel - so must anything that feeds it
+    int32_t n_seq_max_eff() const { return n_seq_max > 0 ? n_seq_max : n_parallel; }
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
