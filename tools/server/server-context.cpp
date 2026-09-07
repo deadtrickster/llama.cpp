@@ -1,4 +1,5 @@
-#include <deque>
+#include <list>
+#include <map>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -396,20 +397,68 @@ static bool slot_aux_load(
     return true;
 }
 
-// [preempt] Everything a mid-flight generation needs to be put down and picked
-// up again producing an IDENTICAL continuation. That equality is the whole
-// correctness argument for preemption, so this must mirror reset() exactly:
-// anything reset() clears and resume() does not restore is silent corruption,
-// visible only as a subtly different completion.
+// save a sequence's state into the prompt cache, straight from the contexts. false = nothing to save,
+// already cached, or refused (state over the cache limit); the caller tells those apart with contains()
+static bool prompt_state_save(server_prompt_cache & prompt_cache, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq_id, const server_prompt & prompt) {
+    if (prompt.tokens.size() == 0) {
+        return false;
+    }
+
+    const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+    const size_t cur_size = cur_size_tgt + cur_size_dft;
+
+    SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+            (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+
+    auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+    if (cur == nullptr) {
+        return false;
+    }
+
+    llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (ctx_dft) {
+        llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    }
+
+    return true;
+}
+
+struct server_slot;
+
+// [seq] One record per live sequence (T2.3). A sequence is a llama_seq_id and the KV cells it holds; a
+// seat (server_slot) is a batch position that drives one sequence at a time. The record is what outlives
+// the seat:
 //
-// Deliberately NOT routed through the prompt cache. A suspended task's state
-// must not be evictable - if the cache drops it the task can never resume - and
-// a dedicated buffer keeps that impossible rather than merely unlikely.
-struct server_slot_suspended {
+//   RUNNING    seated and the seat is processing          cells + a seat
+//   RESIDENT   holds cells under seq_id, nobody decoding    cells, no seat needed - seated-idle (the seat
+//              that last drove it still points at it) or unseated (the seat moved on)
+//   OFFLOADED  no cells, no id: a yielded generation whose id was needed by someone else, held in
+//              data_tgt/data_dft until an id frees up (T2.7 routes this through the prompt cache)
+//
+// The state is derived from the facts (seq_id, slot, task), never stored.
+//
+// While a sequence is SEATED its prompt and generation state live in the slot, as they always did; they
+// move here when the seat is released and back when one is acquired. The moves are cheap (vectors); the
+// KV never moves while the sequence keeps its id - that is the whole point.
+//
+// Everything reset() clears and seat_acquire() does not restore is silent corruption of a resumed
+// generation, visible only as a subtly different completion, so the mid-flight fields mirror reset() exactly.
+struct server_sequence {
+    llama_seq_id  seq_id = -1;      // -1: OFFLOADED, no cells
+    server_slot * slot   = nullptr; // the seat, while seated (idle or running)
+
+    // LRU for eviction: last launch, release or re-seat
+    int64_t t_last_used = 0;
+
+    // valid while UNSEATED; a seated sequence's prompt is slot->prompt
+    server_prompt prompt;
+
+    // mid-flight generation: non-null while a yielded task waits for a seat
     std::unique_ptr<const server_task> task;
 
-    // prompt + KV
-    server_prompt        prompt;
+    // OFFLOADED only: the whole KV state, target and draft
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
@@ -449,17 +498,41 @@ struct server_slot_suspended {
 
     uint64_t next_yield_at = 0;
 
-    // how many times resume() has refused this state. The resume pass retries
+    // how many times a restore of the offloaded state has failed. The resume pass retries
     // once and then answers the task instead of dropping it.
     int n_resume_failures = 0;
+
+    bool seated()     const { return slot != nullptr; }
+    bool mid_flight() const { return task != nullptr; }
+    bool offloaded()  const { return seq_id < 0; }
+
+    // forget the task (cancelled or aborted): what is left is a finished conversation
+    void drop_mid_flight() {
+        task.reset();
+        smpl.reset();
+        generated_text.clear();
+        generated_tokens.clear();
+        generated_token_probs.clear();
+        spec_draft.clear();
+        spec_prompt.clear();
+        spec_i_batch.clear();
+        spec_ckpt.clear();
+        stats = {};
+        n_accepted_per_pos.clear();
+    }
 };
 
 struct server_slot {
     int id;
 
     // the llama_seq_id this slot drives in ctx_tgt/ctx_dft (batch, memory, sampler, state, checkpoints, spec).
-    // today it is always == id; kept separate so a sequence can outlive its seat later (adaptive parallel, T2.3+)
-    llama_seq_id seq_id;
+    // -1 while the seat holds no sequence; always == seq->seq_id otherwise
+    llama_seq_id seq_id = -1;
+
+    // [seq] the registry record this seat drives, idle or running; nullptr when it holds none
+    server_sequence * seq = nullptr;
+
+    bool bound() const { return seq != nullptr; }
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -519,29 +592,7 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
-            return false;
-        }
-
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
-            return false;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        return true;
+        return prompt_state_save(prompt_cache, ctx_tgt, ctx_dft, seq_id, prompt);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -556,7 +607,10 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        mem.seq_rm(seq_id, -1, -1);
+        // an unbound seat holds no cells, and seq_rm(-1) would remove everyone's
+        if (seq_id >= 0) {
+            mem.seq_rm(seq_id, -1, -1);
+        }
 
         prompt.clear();
     }
@@ -626,7 +680,9 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        llama_set_sampler(ctx_tgt, seq_id, nullptr);
+        if (seq_id >= 0) {
+            llama_set_sampler(ctx_tgt, seq_id, nullptr);
+        }
 
         // clear alora start
         alora_invocation_start = -1;
@@ -792,139 +848,140 @@ struct server_slot {
         prompt.tokens.insert(spec_draft);
     }
 
-    // [preempt] Put this generation down mid-flight. Returns nullptr if the slot
-    // is not generating - preemption during prefill is never correct, the prompt
-    // is only half in the KV.
-    std::unique_ptr<server_slot_suspended> suspend() {
-        if (state != SLOT_STATE_GENERATING || !task) {
-            return nullptr;
+    // [seq] Hand the seat back and leave the sequence where it is: the cells stay under seq_id, the record
+    // keeps the id, nothing is copied (T2.4). An idle seat moves its prompt into the record; a generating
+    // seat moves the mid-flight state too, so a later seat_acquire() produces the identical continuation -
+    // which is why the field list mirrors reset() exactly. Never during prefill: the prompt is only half in
+    // the KV, so that returns false and changes nothing.
+    bool seat_release() {
+        GGML_ASSERT(seq && seq->slot == this);
+
+        if (is_processing() && (state != SLOT_STATE_GENERATING || !task)) {
+            return false;
         }
 
-        auto st = std::make_unique<server_slot_suspended>();
+        server_sequence & s = *seq;
 
-        const size_t sz_tgt =           llama_state_seq_get_size_ext(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const bool mid_flight = is_processing();
 
-        st->data_tgt.resize(sz_tgt);
-        llama_state_seq_get_data_ext(ctx_tgt, st->data_tgt.data(), sz_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (sz_dft > 0) {
-            st->data_dft.resize(sz_dft);
-            llama_state_seq_get_data_ext(ctx_dft, st->data_dft.data(), sz_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        // the backend sampler binding belongs to the id; seat_acquire() or the next launch on this id re-binds it
+        llama_set_sampler(ctx_tgt, seq_id, nullptr);
+
+        s.prompt = std::move(prompt);   // move-only: server_tokens deletes copy-assign
+        prompt.clear();
+        prompt.tokens.has_mtmd = mctx != nullptr;
+
+        if (mid_flight) {
+            // a clone, not a move: llama_set_sampler() initializes a backend sampler chain and asserts on a second
+            // init, and seat_acquire() binds again. The clone starts uninitialized and carries the sampling state
+            // (repetition penalties, grammar position, RNG) - without it the continuation diverges on identical KV
+            s.smpl.reset(common_sampler_clone(smpl.get()));
+            s.last_nl_pos            = last_nl_pos;
+            s.generated_text         = generated_text;
+            s.has_new_line           = has_new_line;
+            s.truncated              = truncated;
+            s.stop                   = stop;
+            s.stopping_word          = stopping_word;
+            s.n_sent_text            = n_sent_text;
+            s.generated_tokens       = generated_tokens;
+            s.generated_token_probs  = generated_token_probs;
+            s.json_schema            = json_schema;
+            s.sampled                = sampled;
+            s.n_predict_max          = n_predict_max;
+            s.alora_invocation_start = alora_invocation_start;
+            s.spec_is_replay         = spec_is_replay;
+            s.spec_draft             = spec_draft;
+            s.spec_prompt            = spec_prompt;
+            s.spec_i_batch           = spec_i_batch;
+            s.spec_ckpt              = spec_ckpt;
+            s.spec_synth_rng         = spec_synth_rng;
+            s.stats                  = stats;
+            s.n_accepted_per_pos     = n_accepted_per_pos;
+            s.lora                   = lora;
+            s.n_decoded_at_suspend   = (int) stats.n_gen;
+            s.next_yield_at          = next_yield_at;
+            s.t_suspended_ms         = ggml_time_ms();
+            s.task                   = std::move(task);
         }
 
-        // the sampler carries repetition penalties, grammar position and RNG;
-        // without it the resumed continuation diverges even with identical KV
-        st->smpl.reset(common_sampler_clone(smpl.get()));
+        s.slot        = nullptr;
+        s.t_last_used = ggml_time_us();
 
-        st->prompt                 = std::move(prompt);   // move-only: server_tokens deletes copy-assign
-        st->last_nl_pos            = last_nl_pos;
-        st->generated_text         = generated_text;
-        st->has_new_line           = has_new_line;
-        st->truncated              = truncated;
-        st->stop                   = stop;
-        st->stopping_word          = stopping_word;
-        st->n_sent_text            = n_sent_text;
-        st->generated_tokens       = generated_tokens;
-        st->generated_token_probs  = generated_token_probs;
-        st->json_schema            = json_schema;
-        st->sampled                = sampled;
-        st->n_predict_max          = n_predict_max;
-        st->alora_invocation_start = alora_invocation_start;
-        st->spec_is_replay         = spec_is_replay;
-        st->spec_draft             = spec_draft;
-        st->spec_prompt            = spec_prompt;
-        st->spec_i_batch           = spec_i_batch;
-        st->spec_ckpt              = spec_ckpt;
-        st->spec_synth_rng         = spec_synth_rng;
-        st->stats                  = stats;
-        st->n_accepted_per_pos     = n_accepted_per_pos;
-        st->lora                   = lora;
-        st->n_decoded_at_suspend   = (int) stats.n_gen;
-        st->next_yield_at          = next_yield_at;
-        st->t_suspended_ms         = ggml_time_ms();
-        st->task                   = std::move(task);
+        seq    = nullptr;
+        seq_id = -1;
 
-        SLT_INF(*this, "suspended after %d generated tokens (%.1f MiB target + %.1f MiB draft state)\n",
-                st->n_decoded_at_suspend, sz_tgt / 1048576.0, sz_dft / 1048576.0);
+        if (mid_flight) {
+            SLT_INF(*this, "suspended after %d generated tokens (sequence %d stays resident, zero copy)\n",
+                    s.n_decoded_at_suspend, s.seq_id);
 
-        // hand the slot back WITHOUT release(): task has already moved out, and
-        // callback_on_reset() must NOT run - it publishes a FINISHED generation's
-        // stats. resume() restores `stats`; the final release() counts them once.
-        state = SLOT_STATE_IDLE;
-        t_last_used = ggml_time_us();
-        reset();
-        callback_on_release(id);
+            // hand the seat back WITHOUT release(): task has already moved out, and callback_on_reset() must
+            // NOT run - it publishes a FINISHED generation's stats. seat_acquire() restores `stats`; the final
+            // release() counts them once.
+            state = SLOT_STATE_IDLE;
+            t_last_used = ggml_time_us();
+            reset();
+            callback_on_release(id);
+        }
 
-        return st;
+        return true;
     }
 
-    // [preempt] inverse of suspend(). The slot must be idle and empty.
-    //
-    // Takes the state by reference and consumes it only on success, so a failed
-    // restore leaves `st` intact for the caller to retry or answer. The restore
-    // itself is not transactional: state_read_meta() does seq_rm(dest) BEFORE
-    // it reads, so after a failure this slot's cells are gone whatever `prompt`
-    // says. prompt_clear() makes the two agree again - without it the next
-    // task on this slot reuses a prefix that is not in the KV.
-    bool resume(std::unique_ptr<server_slot_suspended> & st) {
-        if (!st) {
-            return false;
+    // [seq] Drive `s` from this seat, the inverse of seat_release(). The seat must be idle and unbound, `s`
+    // unseated and holding an id. A finished record is just re-seated (its next task goes through the normal
+    // launch); a mid-flight one resumes generating where it stopped. No KV moves.
+    void seat_acquire(server_sequence & s) {
+        GGML_ASSERT(!seq && !is_processing());
+        GGML_ASSERT(!s.seated() && !s.offloaded());
+
+        seq    = &s;
+        seq_id = s.seq_id;
+
+        s.slot        = this;
+        s.t_last_used = ggml_time_us();
+
+        prompt = std::move(s.prompt);
+        s.prompt.clear();
+        prompt.tokens.has_mtmd = mctx != nullptr;
+
+        if (!s.mid_flight()) {
+            return;
         }
 
-        if (llama_state_seq_set_data_ext(ctx_tgt, st->data_tgt.data(), st->data_tgt.size(),
-                                         seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
-            SLT_ERR(*this, "resume: failed to restore target KV state (%zu bytes)\n", st->data_tgt.size());
-            prompt_clear();
-            return false;
-        }
-        if (ctx_dft && !st->data_dft.empty()) {
-            if (llama_state_seq_set_data_ext(ctx_dft, st->data_dft.data(), st->data_dft.size(),
-                                             seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
-                // the target half is already in; half a state is worse than none
-                SLT_ERR(*this, "resume: failed to restore draft KV state (%zu bytes)\n", st->data_dft.size());
-                prompt_clear();
-                return false;
-            }
-        }
+        last_nl_pos            = s.last_nl_pos;
+        generated_text         = s.generated_text;
+        has_new_line           = s.has_new_line;
+        truncated              = s.truncated;
+        stop                   = s.stop;
+        stopping_word          = s.stopping_word;
+        n_sent_text            = s.n_sent_text;
+        generated_tokens       = s.generated_tokens;
+        generated_token_probs  = s.generated_token_probs;
+        json_schema            = s.json_schema;
+        sampled                = s.sampled;
+        n_predict_max          = s.n_predict_max;
+        alora_invocation_start = s.alora_invocation_start;
+        spec_is_replay         = s.spec_is_replay;
+        spec_draft             = s.spec_draft;
+        spec_prompt            = s.spec_prompt;
+        spec_i_batch           = s.spec_i_batch;
+        spec_ckpt              = s.spec_ckpt;
+        spec_synth_rng         = s.spec_synth_rng;
+        stats                  = s.stats;
+        n_accepted_per_pos     = s.n_accepted_per_pos;
+        lora                   = s.lora;
+        next_yield_at          = s.next_yield_at;
 
-        prompt                 = std::move(st->prompt);
-        last_nl_pos            = st->last_nl_pos;
-        generated_text         = st->generated_text;
-        has_new_line           = st->has_new_line;
-        truncated              = st->truncated;
-        stop                   = st->stop;
-        stopping_word          = st->stopping_word;
-        n_sent_text            = st->n_sent_text;
-        generated_tokens       = st->generated_tokens;
-        generated_token_probs  = st->generated_token_probs;
-        json_schema            = st->json_schema;
-        sampled                = st->sampled;
-        n_predict_max          = st->n_predict_max;
-        alora_invocation_start = st->alora_invocation_start;
-        spec_is_replay         = st->spec_is_replay;
-        spec_draft             = st->spec_draft;
-        spec_prompt            = st->spec_prompt;
-        spec_i_batch           = st->spec_i_batch;
-        spec_ckpt              = st->spec_ckpt;
-        spec_synth_rng         = st->spec_synth_rng;
-        stats                  = st->stats;
-        n_accepted_per_pos     = st->n_accepted_per_pos;
-        lora                   = st->lora;
-        next_yield_at          = st->next_yield_at;
+        smpl = std::move(s.smpl);
+        task = std::move(s.task);
 
-        smpl = std::move(st->smpl);
-        task = std::move(st->task);
-
-        // reset() unbound the backend sampler; bind the restored one
+        // the seat's reset() unbound the backend sampler; bind the restored one
         sampler_bind(*task);
 
         has_next_token = true;
         state          = SLOT_STATE_GENERATING;
 
-        SLT_INF(*this, "resumed at %d generated tokens after %" PRId64 " ms suspended\n",
-                st->n_decoded_at_suspend, ggml_time_ms() - st->t_suspended_ms);
-
-        return true;
+        SLT_INF(*this, "resumed at %d generated tokens after %" PRId64 " ms suspended (sequence %d)\n",
+                s.n_decoded_at_suspend, ggml_time_ms() - s.t_suspended_ms, seq_id);
     }
 
     void release() {
@@ -1292,11 +1349,13 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
-    // [preempt] P2: where a yielded generation lives. It is neither queued (it
-    // has partial state that server_task cannot carry) nor running, so it needs
-    // a third place. FIFO: a task that yields goes to the BACK, so a slot that
-    // just yielded cannot immediately reclaim itself.
-    std::deque<std::unique_ptr<server_slot_suspended>> queue_suspended;
+    // [seq] the sequence registry (T2.3): one record per live sequence in any state. Walked by everything
+    // that used to walk `slots` and miss what was not in one: flush, sleep, shutdown, cancel, abort,
+    // metrics, eviction. A std::list because seats point into it.
+    std::list<server_sequence> seqs;
+
+    // seq_rm/seq_cp on both contexts for records that have no seat
+    common_memory seq_mem;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -1335,6 +1394,14 @@ private:
             prompt_cache->spill_all();
         }
 
+        // [seq] the context goes and every record holding cells with it; offloaded ones live in RAM and stay.
+        // Seats are rebuilt by load_model(); one still processing at exit is unbound like any other.
+        for (auto & slot : slots) {
+            slot.seq    = nullptr;
+            slot.seq_id = -1;
+        }
+        seqs.remove_if([](const server_sequence & s) { return !s.offloaded(); });
+
         spec.reset();
         spec_init.reset();
 
@@ -1363,75 +1430,70 @@ private:
             return;
         }
 
-        // [preempt] a suspended generation is in no slot, and its KV state is
-        // already a byte blob in exactly the shape the cache stores, so it can
-        // be materialised without a context - which is why this runs before the
-        // context check below. The entries stay in the deque: on the exit path
-        // nothing reads them again, and on the sleep path a task still waiting
-        // for a slot is not this function's to drop.
-        int n_susp_saved  = 0;
-        int n_susp_cached = 0;
-        for (auto & st : queue_suspended) {
-            auto * cur = prompt_cache->alloc(st->prompt, st->data_tgt.size(), st->data_dft.size());
-            if (cur == nullptr) {
-                if (prompt_cache->contains(st->prompt)) {
-                    n_susp_cached++;
-                } else {
-                    SRV_WRN("flush: suspended task %d holds %d tokens but the cache refused it (state over the cache size limit?)\n",
-                            st->task->id, st->prompt.n_tokens());
+        // [seq] one walk over the registry, whatever state each sequence is in. An offloaded generation's
+        // state is already a byte blob in exactly the shape the cache stores and needs no context; the rest
+        // is read out of the contexts, so it is skipped when the context is gone (a shutdown while sleeping:
+        // destroy() freed it, and the sleep path flushed before the free). The records stay: on the exit path
+        // nothing reads them again, on the sleep path a waiting task is not this function's to drop.
+        int n_live       = 0;
+        int n_saved      = 0;
+        int n_cached     = 0;
+        int n_offl       = 0;
+        int n_offl_saved = 0;
+
+        for (auto & s : seqs) {
+            if (s.offloaded()) {
+                n_offl++;
+                auto * cur = prompt_cache->alloc(s.prompt, s.data_tgt.size(), s.data_dft.size());
+                if (cur == nullptr) {
+                    if (prompt_cache->contains(s.prompt)) {
+                        n_cached++;
+                    } else {
+                        SRV_WRN("flush: suspended task %d holds %d tokens but the cache refused it (state over the cache size limit?)\n",
+                                s.task->id, s.prompt.n_tokens());
+                    }
+                    continue;
                 }
+                std::memcpy(cur->data.main.data(), s.data_tgt.data(), s.data_tgt.size());
+                if (!s.data_dft.empty()) {
+                    std::memcpy(cur->data.drft.data(), s.data_dft.data(), s.data_dft.size());
+                }
+                n_offl_saved++;
                 continue;
             }
-            std::memcpy(cur->data.main.data(), st->data_tgt.data(), st->data_tgt.size());
-            if (!st->data_dft.empty()) {
-                std::memcpy(cur->data.drft.data(), st->data_dft.data(), st->data_dft.size());
+
+            if (ctx_tgt == nullptr) {
+                continue;
             }
-            n_susp_saved++;
-        }
-        if (!queue_suspended.empty()) {
-            SRV_INF("flush: %zu suspended task(s), %d saved, %d already cached\n",
-                    queue_suspended.size(), n_susp_saved, n_susp_cached);
+
+            const auto & prompt = seq_prompt(s);
+
+            const int nt = prompt.n_tokens();
+            if (nt == 0) {
+                continue;
+            }
+
+            n_live++;
+            if (prompt_state_save(*prompt_cache, ctx_tgt, ctx_dft, s.seq_id, prompt)) {
+                n_saved++;
+            } else if (prompt_cache->contains(prompt)) {
+                // the normal case: this conversation is already in the cache, so declining
+                // is not a refusal and warning about it sends readers looking for a size
+                // limit that never applied
+                n_cached++;
+                SRV_DBG("flush: sequence %d holds %d tokens, already in the cache\n", s.seq_id, nt);
+            } else {
+                SRV_WRN("flush: sequence %d holds %d tokens but prompt_save() refused it (state over the cache size limit?)\n", s.seq_id, nt);
+            }
         }
 
-        // destroy() frees the context but leaves the slots populated - they are
-        // only rebuilt by load_model(). A shutdown while sleeping therefore
-        // arrives here with slots that still claim tokens and a ctx_tgt that
-        // was freed; prompt_save() on those is a use-after-free. Nothing is
-        // lost by skipping the walk: the sleep path flushed them before the
-        // free. The spill below is context-free and still runs.
         if (ctx_tgt == nullptr) {
-            SRV_INF("flush: context is gone (%s), skipping slot walk\n", sleeping ? "sleeping" : "not loaded");
-            if (n_susp_saved > 0) {
-                prompt_cache->update();
-            }
-            prompt_cache->spill_all();
-            return;
+            SRV_INF("flush: context is gone (%s), only offloaded state could be saved\n", sleeping ? "sleeping" : "not loaded");
         }
-
-        int n_saved  = 0;
-        int n_cached = 0;
-        int n_live   = 0;
-        for (auto & slot : slots) {
-            const int nt = slot.prompt.n_tokens();
-            if (nt > 0) {
-                n_live++;
-                if (slot.prompt_save(*prompt_cache)) {
-                    n_saved++;
-                } else if (prompt_cache->contains(slot.prompt)) {
-                    // the normal case: this conversation is already in the cache,
-                    // so prompt_save() declining is not a refusal and warning about
-                    // it sends readers looking for a size limit that never applied
-                    n_cached++;
-                    SRV_DBG("flush: slot %d holds %d tokens, already in the cache\n", slot.id, nt);
-                } else {
-                    SRV_WRN("flush: slot %d holds %d tokens but prompt_save() refused it (state over the cache size limit?)\n", slot.id, nt);
-                }
-            }
-        }
-        SRV_INF("flush: %d slot(s) with tokens, %d saved, %d already cached, cache now %zu entries / %.1f MiB\n",
-                n_live, n_saved, n_cached, prompt_cache->states.size(),
+        SRV_INF("flush: %d sequence(s) with tokens, %d saved, %d already cached, %d offloaded (%d saved), cache now %zu entries / %.1f MiB\n",
+                n_live, n_saved, n_cached, n_offl, n_offl_saved, prompt_cache->states.size(),
                 prompt_cache->size() / 1048576.0);
-        if (n_saved > 0 || n_susp_saved > 0) {
+        if (n_saved > 0 || n_offl_saved > 0) {
             prompt_cache->update();
         }
 
@@ -1449,6 +1511,10 @@ private:
             // the slots are rebuilt empty on reload, so anything still only in
             // a slot has to reach the cache now or it is gone
             flush_prompt_cache();
+            // a yielded generation's cells die with the context; copy them out so it can resume after the wake
+            for (auto * s : seq_mid_flight(/*resident_only*/ true)) {
+                seq_offload(*s);
+            }
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1842,11 +1908,13 @@ private:
             return false;
         }
 
+        seq_mem.init(ctx_tgt, ctx_dft);
+
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
 
             slot.id      = i;
-            slot.seq_id  = i;
+            slot.seq_id  = -1; // a sequence is bound at the first launch
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
@@ -2097,16 +2165,417 @@ private:
         return nullptr;
     }
 
-    // the slot currently driving a sequence. A batch token carries a seq id, not a slot index:
-    // the two coincide today (slot.seq_id == slot.id) but the batch must not be indexed by it
-    server_slot & get_slot_by_seq_id(llama_seq_id seq_id) {
+    // the slot currently driving a sequence, or nullptr. A batch token carries a seq id, not a slot index,
+    // and the seat can have let the sequence go (finished, cancelled, yielded) before the metrics see the batch
+    server_slot * get_slot_by_seq_id(llama_seq_id seq_id) {
         for (server_slot & slot : slots) {
-            if (slot.seq_id == seq_id) {
-                return slot;
+            if (slot.bound() && slot.seq_id == seq_id) {
+                return &slot;
             }
         }
 
-        GGML_ABORT("no slot drives seq_id %d\n", seq_id);
+        return nullptr;
+    }
+
+    //
+    // [seq] the registry: sequences outlive seats (T2.3), and the ceiling of ids moves with them (seq-max)
+    //
+
+    bool seq_running(const server_sequence & s) const {
+        return s.slot != nullptr && s.slot->is_processing();
+    }
+
+    const server_prompt & seq_prompt(const server_sequence & s) const {
+        return s.slot != nullptr ? s.slot->prompt : s.prompt;
+    }
+
+    // what the context says right now, never a cached copy: it moves
+    uint32_t seq_ceiling() const {
+        return llama_n_seq_max(ctx_tgt);
+    }
+
+    // how far the ceiling may be raised: --seq-max when given, else the library maximum
+    uint32_t seq_ceiling_cap() const {
+        return params_base.n_seq_max > 0 ? (uint32_t) params_base.n_seq_max : (uint32_t) llama_max_parallel_sequences();
+    }
+
+    server_sequence * seq_by_id(llama_seq_id id) {
+        for (auto & s : seqs) {
+            if (s.seq_id == id) {
+                return &s;
+            }
+        }
+        return nullptr;
+    }
+
+    llama_seq_id seq_id_free() {
+        const uint32_t n = seq_ceiling();
+        for (uint32_t id = 0; id < n; ++id) {
+            if (seq_by_id(id) == nullptr) {
+                return id;
+            }
+        }
+        return -1;
+    }
+
+    llama_seq_id seq_id_highest() const {
+        llama_seq_id res = -1;
+        for (const auto & s : seqs) {
+            res = std::max(res, s.seq_id);
+        }
+        return res;
+    }
+
+    server_sequence & seq_create(llama_seq_id id) {
+        GGML_ASSERT(id >= 0 && seq_by_id(id) == nullptr);
+
+        seqs.emplace_back();
+        auto & s = seqs.back();
+
+        s.seq_id      = id;
+        s.t_last_used = ggml_time_us();
+        s.prompt.tokens.has_mtmd = mctx != nullptr;
+
+        return s;
+    }
+
+    // drop a record: unseat it, remove its cells (unless the context is already gone), forget it
+    void seq_erase(server_sequence & s, bool rm_cells = true) {
+        if (s.slot != nullptr) {
+            auto & slot = *s.slot;
+            GGML_ASSERT(!slot.is_processing());
+            slot.prompt.clear();
+            slot.prompt.tokens.has_mtmd = mctx != nullptr;
+            slot.seq    = nullptr;
+            slot.seq_id = -1;
+        }
+
+        if (rm_cells && s.seq_id >= 0 && ctx_tgt != nullptr) {
+            seq_mem.seq_rm(s.seq_id, -1, -1);
+        }
+
+        for (auto it = seqs.begin(); it != seqs.end(); ++it) {
+            if (&*it == &s) {
+                seqs.erase(it);
+                return;
+            }
+        }
+
+        GGML_ABORT("sequence is not in the registry");
+    }
+
+    // finished sequences nobody is decoding, cheapest to give up first: empty ones, then least recently used
+    std::vector<server_sequence *> seq_evictable() {
+        std::vector<server_sequence *> res;
+        for (auto & s : seqs) {
+            if (s.offloaded() || s.mid_flight() || seq_running(s)) {
+                continue;
+            }
+            res.push_back(&s);
+        }
+        std::sort(res.begin(), res.end(), [&](const server_sequence * a, const server_sequence * b) {
+            const bool ea = seq_prompt(*a).tokens.empty();
+            const bool eb = seq_prompt(*b).tokens.empty();
+            if (ea != eb) {
+                return ea;
+            }
+            return a->t_last_used < b->t_last_used;
+        });
+        return res;
+    }
+
+    // yielded generations waiting for a seat, oldest suspension first
+    std::vector<server_sequence *> seq_mid_flight(bool resident_only) {
+        std::vector<server_sequence *> res;
+        for (auto & s : seqs) {
+            if (!s.mid_flight() || s.seated()) {
+                continue;
+            }
+            if (resident_only && s.offloaded()) {
+                continue;
+            }
+            res.push_back(&s);
+        }
+        std::sort(res.begin(), res.end(), [](const server_sequence * a, const server_sequence * b) {
+            return a->t_suspended_ms < b->t_suspended_ms;
+        });
+        return res;
+    }
+
+    // [seq] a finished conversation leaves the KV: into the prompt cache when there is one and it takes it,
+    // then its cells go and the record with them. A refused save (state over the cache limit) keeps the
+    // sequence unless `force` - the caller decided losing it beats the alternative. No cache at all means
+    // the conversation is lost, as it always was, and the log says so.
+    bool seq_evict(server_sequence & s, bool force, const char * why) {
+        GGML_ASSERT(!s.offloaded() && !s.mid_flight() && !seq_running(s));
+
+        const auto & prompt = seq_prompt(s);
+        const size_t nt = prompt.tokens.size();
+
+        if (nt > 0) {
+            const char * where = s.slot != nullptr ? "slot" : "sequence";
+            const int    which = s.slot != nullptr ? s.slot->id : s.seq_id;
+
+            if (prompt_cache) {
+                const bool saved = prompt_state_save(*prompt_cache, ctx_tgt, ctx_dft, s.seq_id, prompt);
+                if (saved) {
+                    prompt_cache->update();
+                }
+                if (saved || prompt_cache->contains(prompt)) {
+                    SRV_WRN("purging %s %d with %zu tokens (saved to the prompt cache, %s)\n", where, which, nt, why);
+                } else if (!force) {
+                    SRV_WRN("%s %d: state exceeds the prompt cache limit - keeping its context instead of purging it\n", where, which);
+                    return false;
+                } else {
+                    SRV_WRN("purging %s %d with %zu tokens (the prompt cache refused it, conversation lost, %s)\n", where, which, nt, why);
+                }
+            } else {
+                SRV_WRN("purging %s %d with %zu tokens (no prompt cache, conversation lost, %s)\n", where, which, nt, why);
+            }
+        }
+
+        seq_erase(s);
+
+        return true;
+    }
+
+    // [seq] copy a yielded generation's state out and give up its id: the last rung, taken only when no id
+    // can be had any other way. This is the 1.4-13 GB path on GLM; T2.7 routes it through the prompt cache.
+    void seq_offload(server_sequence & s) {
+        GGML_ASSERT(!s.seated() && !s.offloaded() && s.mid_flight());
+
+        const size_t sz_tgt =           llama_state_seq_get_size_ext(ctx_tgt, s.seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, s.seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        s.data_tgt.resize(sz_tgt);
+        llama_state_seq_get_data_ext(ctx_tgt, s.data_tgt.data(), sz_tgt, s.seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (sz_dft > 0) {
+            s.data_dft.resize(sz_dft);
+            llama_state_seq_get_data_ext(ctx_dft, s.data_dft.data(), sz_dft, s.seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        seq_mem.seq_rm(s.seq_id, -1, -1);
+
+        SRV_INF("offloaded sequence %d mid-flight (task %d, %d tokens in, %.1f MiB target + %.1f MiB draft state)\n",
+                s.seq_id, s.task->id, s.n_decoded_at_suspend, sz_tgt / 1048576.0, sz_dft / 1048576.0);
+
+        s.seq_id = -1;
+    }
+
+    // [seq] the inverse: an offloaded generation gets its state back under `id`. state_read_meta() does
+    // seq_rm(dest) before it reads, so on failure the id's cells are gone whatever else says: the record
+    // stays offloaded with its bytes intact and the id is left free. (T1.4)
+    bool seq_restore(server_sequence & s, llama_seq_id id) {
+        GGML_ASSERT(s.offloaded() && s.mid_flight());
+
+        if (llama_state_seq_set_data_ext(ctx_tgt, s.data_tgt.data(), s.data_tgt.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+            SRV_ERR("restore: failed to restore target KV state (%zu bytes) for task %d\n", s.data_tgt.size(), s.task->id);
+            seq_mem.seq_rm(id, -1, -1);
+            return false;
+        }
+        if (ctx_dft && !s.data_dft.empty()) {
+            if (llama_state_seq_set_data_ext(ctx_dft, s.data_dft.data(), s.data_dft.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+                // the target half is in; half a state is worse than none
+                SRV_ERR("restore: failed to restore draft KV state (%zu bytes) for task %d\n", s.data_dft.size(), s.task->id);
+                seq_mem.seq_rm(id, -1, -1);
+                return false;
+            }
+        }
+
+        SRV_INF("restored task %d under sequence %d (%.1f MiB target + %.1f MiB draft state)\n",
+                s.task->id, id, s.data_tgt.size() / 1048576.0, s.data_dft.size() / 1048576.0);
+
+        s.seq_id = id;
+        s.data_tgt.clear();
+        s.data_tgt.shrink_to_fit();
+        s.data_dft.clear();
+        s.data_dft.shrink_to_fit();
+
+        return true;
+    }
+
+    // [seq-max] one more id, paid for now. Asks the loaded model what one more sequence costs (its state rows,
+    // exact; its compute-buffer share, measured) and the devices what they have free, then raises the ceiling
+    // on every context that shares the ids and on the speculative state - all or nothing.
+    bool seq_ceiling_raise() {
+        const uint32_t n_cur = seq_ceiling();
+        const uint32_t n_new = n_cur + 1;
+
+        if (!params_base.kv_unified) {
+            return false;
+        }
+        if (n_new > seq_ceiling_cap()) {
+            SRV_DBG("sequence ceiling stays at %u: the cap is %u\n", n_cur, seq_ceiling_cap());
+            return false;
+        }
+
+        std::map<ggml_backend_buffer_type_t, size_t> need;
+        for (llama_context * ctx : { ctx_tgt, ctx_dft }) {
+            if (ctx == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_type_t bufts[16];
+            size_t sizes[16];
+            const int32_t n = llama_seq_max_cost(ctx, n_new, bufts, sizes, 16);
+            if (n < 0) {
+                SRV_INF("sequence ceiling stays at %u: the %s context cannot change it\n", n_cur, ctx == ctx_tgt ? "target" : "draft");
+                return false;
+            }
+            for (int32_t i = 0; i < std::min<int32_t>(n, 16); ++i) {
+                need[bufts[i]] += sizes[i];
+            }
+        }
+
+        const size_t headroom = (size_t) params_base.seq_max_headroom_mib * 1024 * 1024;
+
+        std::string cost_str;
+        for (const auto & [buft, bytes] : need) {
+            auto * dev = ggml_backend_buft_get_device(buft);
+            size_t free = 0;
+            size_t total = 0;
+            if (dev != nullptr) {
+                ggml_backend_dev_memory(dev, &free, &total);
+            }
+            cost_str += string_format("%s%s %.1f MiB (%.1f MiB free)", cost_str.empty() ? "" : ", ",
+                    ggml_backend_buft_name(buft), bytes / 1048576.0, free / 1048576.0);
+            if (dev != nullptr && bytes + headroom > free) {
+                SRV_INF("sequence ceiling stays at %u: one more sequence needs %s\n", n_cur, cost_str.c_str());
+                return false;
+            }
+        }
+
+        if (!llama_set_n_seq_max(ctx_tgt, n_new)) {
+            return false;
+        }
+        if (ctx_dft != nullptr && !llama_set_n_seq_max(ctx_dft, n_new)) {
+            llama_set_n_seq_max(ctx_tgt, n_cur);
+            return false;
+        }
+        if (spec && !common_speculative_set_n_seq(spec.get(), n_new)) {
+            if (ctx_dft != nullptr) {
+                llama_set_n_seq_max(ctx_dft, n_cur);
+            }
+            llama_set_n_seq_max(ctx_tgt, n_cur);
+            return false;
+        }
+
+        SRV_INF("raised the sequence ceiling to %u (%s)\n", n_new, cost_str.empty() ? "no per-sequence cost reported" : cost_str.c_str());
+
+        return true;
+    }
+
+    // [seq-max] give ids back when nothing needs them: down to the highest live id, never below the seat
+    // count. Each step is a reallocation and a re-reserve, so this runs in the quiet moment when every seat
+    // is idle and nothing waits, not on every release.
+    void seq_ceiling_shrink() {
+        if (!params_base.kv_unified) {
+            return;
+        }
+
+        const uint32_t n_cur = seq_ceiling();
+        const uint32_t n_new = std::max<uint32_t>((uint32_t) params_base.n_parallel, (uint32_t) (seq_id_highest() + 1));
+        if (n_new >= n_cur) {
+            return;
+        }
+
+        if (!llama_set_n_seq_max(ctx_tgt, n_new)) {
+            return;
+        }
+        if (ctx_dft != nullptr && !llama_set_n_seq_max(ctx_dft, n_new)) {
+            llama_set_n_seq_max(ctx_tgt, n_cur);
+            return;
+        }
+        if (spec) {
+            common_speculative_set_n_seq(spec.get(), n_new);
+        }
+
+        SRV_INF("lowered the sequence ceiling to %u\n", n_new);
+    }
+
+    // [seq] an id for a new sequence, in rising order of cost: one nobody holds; one more from the model if the
+    // device has room (the ceiling grows); the LRU finished conversation's, which goes to the prompt cache; and
+    // last a yielded generation's, whose state is copied out and back later - the price of having no room for
+    // another id. -1 when even that is not allowed or possible.
+    llama_seq_id seq_id_acquire(bool allow_offload, const char * why) {
+        llama_seq_id id = seq_id_free();
+        if (id >= 0) {
+            return id;
+        }
+
+        if (seq_ceiling_raise()) {
+            id = seq_id_free();
+            GGML_ASSERT(id >= 0);
+            return id;
+        }
+
+        // a state the cache refuses is skipped on the first pass; if every candidate is refused the LRU one goes
+        // anyway, as the launch path always did, because refusing the request is worse
+        for (int pass = 0; pass < 2; ++pass) {
+            for (auto * s : seq_evictable()) {
+                id = s->seq_id;
+                if (seq_evict(*s, /*force*/ pass == 1, why)) {
+                    return id;
+                }
+            }
+        }
+
+        if (allow_offload) {
+            auto cands = seq_mid_flight(/*resident_only*/ true);
+            if (!cands.empty()) {
+                id = cands.front()->seq_id;
+                seq_offload(*cands.front());
+                return id;
+            }
+        }
+
+        return -1;
+    }
+
+    // [seq] a fresh sequence on this seat; whatever idle sequence the seat held stays resident
+    server_sequence * seq_new_for(server_slot & slot, const char * why) {
+        const llama_seq_id id = seq_id_acquire(/*allow_offload*/ true, why);
+        if (id < 0) {
+            return nullptr;
+        }
+
+        if (slot.bound()) {
+            slot.seat_release();
+        }
+
+        auto & s = seq_create(id);
+        slot.seat_acquire(s);
+
+        return &s;
+    }
+
+    bool seat_ensure_bound(server_slot & slot) {
+        return slot.bound() || seq_new_for(slot, "slot action") != nullptr;
+    }
+
+    // [seq] the T0.1 pressure path: llama_decode() could not place a batch, make room. Finished conversations
+    // first (they go to the prompt cache), then a yielded generation's cells (they go to RAM and come back when
+    // there is room). One per call; the caller retries the batch.
+    bool try_evict_resident() {
+        if (!params_base.kv_unified) {
+            return false;
+        }
+
+        for (auto * s : seq_evictable()) {
+            if (seq_prompt(*s).tokens.empty()) {
+                continue;
+            }
+            if (seq_evict(*s, /*force*/ false, "KV pool full")) {
+                return true;
+            }
+        }
+
+        auto cands = seq_mid_flight(/*resident_only*/ true);
+        if (!cands.empty()) {
+            seq_offload(*cands.front());
+            return true;
+        }
+
+        return false;
     }
 
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
@@ -2123,8 +2592,12 @@ private:
         return nullptr;
     }
 
+    // [seq] a seat for the task, and a sequence on it: the resident one sharing the longest prefix (re-seated
+    // without a copy if it has no seat), else a fresh one. The seat's own idle sequence stays resident either
+    // way; it is only evicted when its id is needed (seq_id_acquire).
     server_slot * get_available_slot(const server_task & task) {
-        server_slot * ret = nullptr;
+        server_slot     * ret   = nullptr;
+        server_sequence * match = nullptr;
 
         bool update_cache = false;
 
@@ -2137,29 +2610,29 @@ private:
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+                if (ret->is_processing()) {
+                    return ret; // the caller defers the task; nothing below may touch a running seat
+                }
             }
         }
 
-        // find the slot that has at least n% prompt similarity
+        // find the sequence that has at least n% prompt similarity: any finished one nobody is decoding, seated
+        // or not - never a yielded generation, whose prompt is a task in progress. A requested slot pins the
+        // conversation to that seat (slot save/restore relies on it), so only its own sequence qualifies then.
         if (slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
 
-            for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
+            for (auto & s : seqs) {
+                if (s.offloaded() || s.mid_flight() || seq_running(s)) {
+                    continue;
+                }
+                if (task.id_slot != -1 && s.slot != ret) {
                     continue;
                 }
 
-                // skip the slot if it is not available
-                if (slot.is_processing()) {
-                    SLT_TRC(slot, " - skipping, is_processing = %d\n", slot.is_processing());
-                    continue;
-                }
+                const auto & tokens = seq_prompt(s).tokens;
 
-                const auto & tokens = slot.prompt.tokens;
-
-                // skip the slot if it does not contains cached tokens
                 if (tokens.empty()) {
-                    SLT_TRC(slot, "%s", " - skipping, slot is empty\n");
                     continue;
                 }
 
@@ -2167,28 +2640,26 @@ private:
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
 
-                SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
+                SRV_TRC(" - sequence %d: checking sim = %.3f (%zu/%zu) > %.3f\n", s.seq_id, f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
-                // select the current slot if the criteria match
                 if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
 
-                    ret = &slot;
+                    match = &s;
                 }
             }
 
-            if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+            if (match != nullptr) {
+                const float f_keep = (f_sim_best*task.tokens.size()) / seq_prompt(*match).tokens.size();
 
-                if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            f_sim_best, slot_prompt_similarity, f_keep);
-                }
+                SRV_INF("selected sequence %d by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f, %s\n",
+                        match->seq_id, f_sim_best, slot_prompt_similarity, f_keep,
+                        match->slot != nullptr ? "on its seat" : "resident without a seat");
 
                 f_keep_sel = f_keep;
                 f_sim_sel  = f_sim_best;
 
-                // save whenever ANYTHING is lost. everything in the slot past the
+                // save whenever ANYTHING is lost. everything in the sequence past the
                 // common prefix is destroyed further down by keep_first()/seq_rm(),
                 // so f_keep is the fraction PRESERVED - not evidence that this is
                 // the same conversation continuing.
@@ -2199,10 +2670,15 @@ private:
                 // conversation shorter than ~13k tokens looked like a continuation
                 // of every other one.
                 //
-                // f_keep == 1.0 is the genuine continuation: the slot's prompt is a
-                // strict prefix of the incoming one, nothing is lost, nothing to save.
+                // f_keep == 1.0 is the genuine continuation: the sequence is a strict
+                // prefix of the incoming prompt, nothing is lost, nothing to save.
                 if (f_keep < 1.0f) {
                     update_cache = true;
+                }
+
+                // a seated match is used from its own seat
+                if (match->slot != nullptr) {
+                    ret = match->slot;
                 }
             }
         }
@@ -2226,9 +2702,24 @@ private:
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
-
-                update_cache = true;
             }
+        }
+
+        if (ret == nullptr) {
+            return nullptr;
+        }
+
+        if (match != nullptr) {
+            if (match->slot != ret) {
+                if (ret->bound()) {
+                    ret->seat_release();
+                }
+                ret->seat_acquire(*match);
+                SLT_INF(*ret, "re-seated resident sequence %d (%d tokens, zero copy)\n", ret->seq_id, ret->prompt.n_tokens());
+            }
+        } else if (seq_new_for(*ret, "new conversation") == nullptr) {
+            SLT_ERR(*ret, "%s", "no sequence id could be acquired for the task\n");
+            return nullptr;
         }
 
         if (ret) {
@@ -2282,60 +2773,6 @@ private:
         }
 
         return ret;
-    }
-
-    // return true if at least one slot has been cleared
-    // TODO: improve logic
-    //       - smarter decision which slot to clear (LRU or longest prompt?)
-    bool try_clear_idle_slots() {
-        bool res = false;
-
-        if (!params_base.kv_unified) {
-            return res;
-        }
-
-        for (auto & slot : slots) {
-            if (slot.is_processing()) {
-                continue;
-            }
-
-            if (slot.prompt.n_tokens() > 0) {
-                // an idle slot is a finished conversation waiting for its next turn.
-                // making room for a live request by dropping it is a SPILL, not a
-                // deletion: save it to the prompt cache first, exactly like the
-                // launch-time clear in get_available_slot() [TAG_IDLE_SLOT_CLEAR].
-                // this used to call prompt_clear() outright, and the only trace of
-                // the lost conversation was the "purging slot" line below.
-                if (prompt_cache) {
-                    const bool saved = slot.prompt_save(*prompt_cache);
-                    if (saved) {
-                        prompt_cache->update();
-                    } else {
-                        // prompt_save() refuses states above the cache limit. clearing
-                        // anyway would destroy the conversation, so leave this slot
-                        // alone and try the next idle one.
-                        SLT_WRN(slot, "%s", "state exceeds the prompt cache limit - keeping its context instead of purging it\n");
-                        continue;
-                    }
-
-                    SRV_WRN("purging slot %d with %zu tokens (saved to the prompt cache)\n", slot.id, slot.prompt.tokens.size());
-                } else {
-                    // no prompt cache to spill into. the idle conversation is complete
-                    // and the one asking for room is mid-request, so losing the idle
-                    // one is still the lesser evil - but it IS lost, say so.
-                    SRV_WRN("purging slot %d with %zu tokens (no prompt cache, conversation lost)\n", slot.id, slot.prompt.tokens.size());
-                }
-
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
-            }
-        }
-
-        return res;
     }
 
     // the pool has no room for even one token (n_batch == 1, ret == 1). fail ONE slot and let the others retry.
@@ -2423,6 +2860,12 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        // [seq] a seat launched outside get_available_slot() (child tasks) may hold no sequence yet
+        if (!slot.bound() && seq_new_for(slot, "launch") == nullptr) {
+            send_error(task, "no sequence id is available for this request", ERROR_TYPE_SERVER);
+            return false;
+        }
+
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -3125,34 +3568,36 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
-                        for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+                        // [seq] every finished sequence nobody is decoding, seated or not. With a unified cache this
+                        // is the eager pressure valve: nothing stays resident past a launch (T2.5 makes it lazy);
+                        // --no-cache-idle-slots keeps residents until an id or the pool is actually needed
+                        for (auto * s : seq_evictable()) {
+                            const auto & prompt = seq_prompt(*s);
 
-                                const bool saved = slot.prompt_save(*prompt_cache);
+                            SRV_TRC("saving idle sequence %d to prompt cache\n", s->seq_id);
+
+                            const bool saved = prompt_state_save(*prompt_cache, ctx_tgt, ctx_dft, s->seq_id, prompt);
+                            if (saved) {
+                                SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                                prompt_cache->update();
+                            }
+
+                            if (params_base.kv_unified) {
+                                // [TAG_IDLE_SLOT_CLEAR]
+                                // Only discard the context once it is safely stored.
+                                // prompt_state_save() returns false when the state exceeds the cache
+                                // size limit; clearing anyway threw away a conversation that was
+                                // never cached, and the skip is only logged inside the cache.
                                 if (saved) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
+                                    seq_erase(*s);
+                                } else if (prompt.tokens.size() > 0) {
+                                    SRV_WRN("sequence %d: state exceeds the prompt cache limit - keeping its context instead of clearing it\n", s->seq_id);
                                 }
-
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    // Only discard the slot's context once it is safely stored.
-                                    // prompt_save() returns false when the state exceeds the cache
-                                    // size limit; clearing anyway threw away a conversation that was
-                                    // never cached, and the skip is only logged inside the cache.
-                                    if (saved) {
-                                        slot.prompt_clear();
-                                    } else if (slot.prompt.tokens.size() > 0) {
-                                        SLT_WRN(slot, "%s", "state exceeds the prompt cache limit - keeping its context instead of clearing it\n");
-                                    }
-                                    // an EMPTY slot also returns false here, from the
-                                    // `prompt.tokens.size() == 0` early-out in prompt_save(). It has
-                                    // nothing to keep and nothing to clear, and reporting it as a
-                                    // size-limit refusal sent an investigation looking for a limit
-                                    // that was two orders of magnitude away (2,580 MiB state against
-                                    // an 81,920 MiB --cache-ram).
-                                }
+                                // an EMPTY sequence also returns false here, from the
+                                // `prompt.tokens.size() == 0` early-out. It has nothing to keep and
+                                // nothing to clear, and reporting it as a size-limit refusal sent an
+                                // investigation looking for a limit that was two orders of magnitude
+                                // away (2,580 MiB state against an 81,920 MiB --cache-ram).
                             }
                         }
                     }
@@ -3166,14 +3611,19 @@ private:
                             break;
                         }
                     }
-                    // [preempt] or the task is suspended rather than in a slot. Left
-                    // there it resumes into a dead connection and holds a slot, and
-                    // its KV, for the rest of a generation nobody will read.
-                    for (auto it = queue_suspended.begin(); it != queue_suspended.end(); ++it) {
-                        if ((*it)->task->id == task.id_target) {
+                    // [seq] or the task is a yielded generation waiting for a seat. Left there it resumes into a
+                    // dead connection and holds a seat, and its KV, for the rest of a generation nobody will
+                    // read. What it generated so far stays as a finished conversation, like a cancelled seat
+                    // keeps its prompt; an offloaded one has nothing to keep.
+                    for (auto & s : seqs) {
+                        if (s.mid_flight() && s.task->id == task.id_target) {
                             SRV_INF("cancel: dropping suspended task %d (%d tokens in)\n",
-                                    task.id_target, (*it)->n_decoded_at_suspend);
-                            queue_suspended.erase(it);
+                                    task.id_target, s.n_decoded_at_suspend);
+                            if (s.offloaded()) {
+                                seq_erase(s);
+                            } else {
+                                s.drop_mid_flight();
+                            }
                             break;
                         }
                     }
@@ -3274,6 +3724,12 @@ private:
                         break;
                     }
 
+                    // [seq] the seat's own sequence is what is saved or restored; a seat without one gets a fresh one
+                    if (!seat_ensure_bound(*slot)) {
+                        send_error(task, "No sequence id is available for this slot", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -3327,6 +3783,12 @@ private:
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    // [seq] the seat's own sequence is what is saved or restored; a seat without one gets a fresh one
+                    if (!seat_ensure_bound(*slot)) {
+                        send_error(task, "No sequence id is available for this slot", ERROR_TYPE_SERVER);
                         break;
                     }
 
@@ -3407,7 +3869,9 @@ private:
                     // Erase token cache
                     const size_t n_erased = slot->prompt.tokens.size();
 
-                    slot->prompt_clear();
+                    if (slot->bound()) {
+                        slot->prompt_clear();
+                    }
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -3490,13 +3954,16 @@ private:
                 slot.release();
             }
         }
-        // [preempt] suspended generations were waiting on these same slots; the
-        // failure that emptied them is theirs too, and a dropped entry would be
-        // a client waiting forever
-        for (auto & st : queue_suspended) {
-            send_error(*st->task, reason, ERROR_TYPE_SERVER);
+        // [seq] yielded generations were waiting on these same seats; the failure that
+        // emptied them is theirs too, and a dropped entry would be a client waiting forever
+        for (auto * s : seq_mid_flight(/*resident_only*/ false)) {
+            send_error(*s->task, reason, ERROR_TYPE_SERVER);
+            if (s->offloaded()) {
+                seq_erase(*s);
+            } else {
+                s->drop_mid_flight();
+            }
         }
-        queue_suspended.clear();
     }
 
     // @ngxson : for debugging only
@@ -3556,42 +4023,71 @@ private:
         // question here; this is tail-with-ageing, and both ends are measurable
         // by setting --slot-resume-after to 0 (always resume) or a large value
         // (never preempt the newcomers).
-        if (!queue_suspended.empty()) {
+        for (;;) {
+            auto waiting = seq_mid_flight(/*resident_only*/ false);
+            if (waiting.empty()) {
+                break;
+            }
+
+            server_sequence & s = *waiting.front();
+
             const bool     nobody_new = queue_tasks.queue_tasks_deferred_size() == 0;
-            const int64_t  waited_ms  = ggml_time_ms() - queue_suspended.front()->t_suspended_ms;
+            const int64_t  waited_ms  = ggml_time_ms() - s.t_suspended_ms;
             const bool     aged       = params_base.slot_resume_after_ms >= 0 &&
                                         waited_ms >= params_base.slot_resume_after_ms;
 
-            if (nobody_new || aged) {
-                for (auto & slot : slots) {
-                    if (queue_suspended.empty()) {
+            if (!nobody_new && !aged) {
+                break;
+            }
+
+            // an idle seat: one holding nothing first, else the least recently used
+            server_slot * slot = nullptr;
+            for (auto & cand : slots) {
+                if (cand.is_processing()) {
+                    continue;
+                }
+                if (slot == nullptr ||
+                    (!cand.bound() && slot->bound()) ||
+                    (cand.bound() == slot->bound() && cand.t_last_used < slot->t_last_used)) {
+                    slot = &cand;
+                }
+            }
+            if (slot == nullptr) {
+                break;
+            }
+
+            const int n_gen_at = s.n_decoded_at_suspend;
+
+            if (s.offloaded()) {
+                // it needs an id back: a free one, one more from the model, or a finished conversation's (saved
+                // first) - never another yielded generation's, that would only move the problem along
+                const llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "resuming a suspended generation");
+                if (id < 0) {
+                    break;
+                }
+                if (!seq_restore(s, id)) {
+                    // the usual cause is the pool: the other sequences grew while this one waited and its cells
+                    // no longer fit. One retry on a later pass covers room freeing up; after that the task is
+                    // answered, because a dropped entry is a client waiting forever for a generation nobody is running.
+                    if (s.n_resume_failures++ == 0) {
+                        SLT_WRN(*slot, "failed to resume a suspended generation (%d tokens in), will retry once\n", n_gen_at);
                         break;
                     }
-                    if (slot.is_processing()) {
-                        continue;
-                    }
-                    auto st = std::move(queue_suspended.front());
-                    queue_suspended.pop_front();
-                    const int n_gen_at = st->n_decoded_at_suspend;
-                    if (!slot.resume(st)) {
-                        // resume() left `st` intact and this slot cleared. The usual cause
-                        // is the pool: the other slots grew while this one waited and its
-                        // cells no longer fit. One retry at the FRONT covers another slot
-                        // freeing up (the loop goes on to it right now if one is idle);
-                        // after that the task is answered, because a dropped entry is a
-                        // client waiting forever for a generation nobody is running.
-                        if (st->n_resume_failures++ == 0) {
-                            SLT_WRN(slot, "failed to resume a suspended generation (%d tokens in), will retry once\n", n_gen_at);
-                            queue_suspended.push_front(std::move(st));
-                            continue;
-                        }
-                        SLT_ERR(slot, "failed to resume a suspended generation (%d tokens in), giving up\n", n_gen_at);
-                        send_error(*st->task, "failed to resume the suspended generation: no room in the KV cache", ERROR_TYPE_SERVER);
-                    } else if (aged && !nobody_new) {
-                        SLT_INF(slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
-                                waited_ms, queue_tasks.queue_tasks_deferred_size());
-                    }
+                    SLT_ERR(*slot, "failed to resume a suspended generation (%d tokens in), giving up\n", n_gen_at);
+                    send_error(*s.task, "failed to resume the suspended generation: no room in the KV cache", ERROR_TYPE_SERVER);
+                    seq_erase(s);
+                    continue;
                 }
+            }
+
+            if (slot->bound()) {
+                slot->seat_release(); // its idle sequence stays resident
+            }
+            slot->seat_acquire(s);
+
+            if (aged && !nobody_new) {
+                SLT_INF(*slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
+                        waited_ms, queue_tasks.queue_tasks_deferred_size());
             }
         }
 
@@ -3608,6 +4104,11 @@ private:
 
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
+
+                // [seq-max] the quiet moment: no batch in flight, nothing waiting
+                if (queue_tasks.queue_tasks_deferred_size() == 0) {
+                    seq_ceiling_shrink();
+                }
 
                 metrics_flush_idle();
 
@@ -4524,7 +5025,7 @@ private:
             }
 
             // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_clear_idle_slots()) {
+            if (!try_evict_resident()) {
                 n_batch /= 2;
             }
 
@@ -4709,10 +5210,9 @@ private:
                     slot.state == SLOT_STATE_GENERATING &&
                     slot.stats.n_gen > 0 &&
                     slot.stats.n_gen % (uint64_t) selftest_every == 0) {
-                    auto st = slot.suspend();
-                    if (st && !slot.resume(st)) {
-                        SLT_ERR(slot, "%s", "preempt selftest: resume FAILED\n");
-                        send_error(*st->task, "preempt selftest: resume failed", ERROR_TYPE_SERVER);
+                    server_sequence * s = slot.seq;
+                    if (slot.seat_release()) {
+                        slot.seat_acquire(*s);
                     }
                 }
             }
@@ -4892,11 +5392,11 @@ private:
             return;
         }
 
-        auto st = slot.suspend();
-        if (st) {
+        // the sequence stays where it is (resident, mid-flight); only the seat is given up
+        server_sequence * s = slot.seq;
+        if (slot.seat_release()) {
             SLT_INF(slot, "yielded the slot after %d tokens, %zu waiting\n",
-                    st->n_decoded_at_suspend, n_waiting);
-            queue_suspended.push_back(std::move(st));
+                    s->n_decoded_at_suspend, n_waiting);
         }
     }
 
@@ -4951,7 +5451,9 @@ private:
             if (slot.is_processing()) {
                 metrics.n_busy_slots++;
             }
-            metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) slot.prompt.n_tokens());
+        }
+        for (const auto & s : seqs) {
+            metrics.n_tokens_max = std::max(metrics.n_tokens_max, (uint64_t) seq_prompt(s).n_tokens());
         }
 
         // apply enqueued prompt tokens stats
@@ -4968,9 +5470,9 @@ private:
 
             n_prompt_tokens++;
 
-            auto & slot = get_slot_by_seq_id(t.seq_id);
-            if (slot.stats.is_set()) {
-                slot.stats.n_prompt_processed++;
+            auto * slot = get_slot_by_seq_id(t.seq_id);
+            if (slot != nullptr && slot->stats.is_set()) {
+                slot->stats.n_prompt_processed++;
             }
         }
 
@@ -4986,9 +5488,9 @@ private:
         const int64_t t_now = ggml_time_us();
         for (int i = off; i < off + n_tokens; ++i) {
             const auto & t = batch.tokens[i];
-            auto & slot = get_slot_by_seq_id(t.seq_id);
-            if (t.is_prompt && slot.stats.is_set()) {
-                slot.stats.set_prompt_last(t_now);
+            auto * slot = get_slot_by_seq_id(t.seq_id);
+            if (t.is_prompt && slot != nullptr && slot->stats.is_set()) {
+                slot->stats.set_prompt_last(t_now);
             }
         }
     }

@@ -174,6 +174,16 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, common_state_buf & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const common_state_buf & /*data*/) {}
+
+    // [seq-max] resize the per-seq state. The default keeps the arrays and only lowers the bound, so
+    // an implementation without a grow path refuses growth and nothing is left half-resized.
+    virtual bool set_n_seq(uint32_t n_seq_new) {
+        if (n_seq_new > n_seq) {
+            return false;
+        }
+        n_seq = n_seq_new;
+        return true;
+    }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -253,6 +263,30 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
     ~common_speculative_impl_draft_simple() override {
         llama_batch_free(batch);
+    }
+
+    bool set_n_seq(uint32_t n_seq_new) override {
+        auto * ctx_dft = this->params.ctx_dft;
+
+        if (n_seq_new != llama_n_seq_max(ctx_dft)) {
+            SPC_ERR("n_seq mismatch: %u != %u, resize the draft context first\n", n_seq_new, llama_n_seq_max(ctx_dft));
+            return false;
+        }
+
+        const size_t n_old = smpls.size();
+        smpls.resize(n_seq_new);
+        for (size_t i = n_old; i < smpls.size(); ++i) {
+            common_params_sampling params;
+            params.no_perf = false;
+            params.top_k = 10;
+            params.samplers = {
+                COMMON_SAMPLER_TYPE_TOP_K,
+            };
+            smpls[i].reset(common_sampler_init(llama_get_model(ctx_dft), params));
+        }
+
+        n_seq = n_seq_new;
+        return true;
     }
 
     void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
@@ -1515,6 +1549,66 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+    }
+
+    bool set_n_seq(uint32_t n_seq_new) override {
+        auto * ctx_dft = this->params.ctx_dft;
+
+        // backend chains above the new bound are released; new ids get one like the constructor gave
+        for (llama_seq_id seq_id = (llama_seq_id) n_seq_new; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
+            if (backend_chains[seq_id] == nullptr) {
+                continue;
+            }
+            llama_set_sampler(ctx_dft, seq_id, nullptr);
+            llama_sampler_free(backend_chains[seq_id]);
+            backend_chains[seq_id] = nullptr;
+        }
+
+        const size_t n_old = smpls.size();
+
+        smpls.resize(n_seq_new);
+        for (size_t i = n_old; i < smpls.size(); ++i) {
+            common_params_sampling sparams;
+            sparams.no_perf  = false;
+            sparams.top_k    = 10;
+            sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+            smpls[i].reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
+        }
+
+        backend_chains.resize(n_seq_new, nullptr);
+        if (this->params.backend_sampling) {
+            for (llama_seq_id seq_id = (llama_seq_id) n_old; seq_id < (llama_seq_id) n_seq_new; ++seq_id) {
+                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+
+                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
+                    SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
+                    llama_sampler_free(chain);
+                    chain = nullptr;
+                }
+                backend_chains[seq_id] = chain;
+            }
+        }
+
+        if (chain_heads) {
+            chain_h.resize(n_seq_new);
+            for (auto & c : chain_h) {
+                c.reserve((size_t) (this->params.n_max + 1) * n_embd);
+            }
+        }
+
+        pending_h.resize(n_seq_new, std::vector<float>(n_embd, 0.0f));
+        desync.resize(n_seq_new, false);
+
+        i_last.resize(n_seq_new, -1);
+        i_batch_beg.resize(n_seq_new, -1);
+        i_batch_end.resize(n_seq_new, -1);
+
+        verify_h.resize(n_seq_new);
+        verify_h_rows.resize(n_seq_new, 0);
+
+        n_seq = n_seq_new;
+        return true;
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -2887,6 +2981,39 @@ void common_speculative_free(common_speculative * spec) {
     }
 
     delete spec;
+}
+
+uint32_t common_speculative_n_seq(const common_speculative * spec) {
+    return spec ? (uint32_t) spec->dparams.size() : 0;
+}
+
+bool common_speculative_set_n_seq(common_speculative * spec, uint32_t n_seq) {
+    if (spec == nullptr) {
+        return true;
+    }
+
+    const uint32_t n_seq_old = spec->dparams.size();
+    if (n_seq == n_seq_old) {
+        return true;
+    }
+
+    // ask every implementation first; on a refusal put back the ones already resized, so a
+    // mixed set never ends up partly resized
+    for (size_t i = 0; i < spec->impls.size(); ++i) {
+        if (!spec->impls[i]->set_n_seq(n_seq)) {
+            SPC_WRN("implementation '%s' cannot take n_seq = %u, keeping %u\n",
+                    common_speculative_type_to_str(spec->impls[i]->type).c_str(), n_seq, n_seq_old);
+            for (size_t j = 0; j < i; ++j) {
+                spec->impls[j]->set_n_seq(n_seq_old);
+            }
+            return false;
+        }
+    }
+
+    spec->dparams.resize(n_seq);
+    spec->impl_last.resize(n_seq, nullptr);
+
+    return true;
 }
 
 common_speculative_draft_params & common_speculative_get_draft_params(
