@@ -2561,10 +2561,23 @@ private:
         return slot.bound() || seq_new_for(slot, "slot action") != nullptr;
     }
 
-    // [seq] the T0.1 pressure path: llama_decode() could not place a batch, make room. Finished conversations
-    // first (they go to the prompt cache), then a yielded generation's cells (they go to RAM and come back when
-    // there is room). One per call; the caller retries the batch.
-    bool try_evict_resident() {
+    //
+    // [seq] T2.5 the pressure ladder. llama_decode() could not place a batch and the pool has to give something
+    // up. It runs per BATCH, not per launch: sequences grow after admission, and the production case (two
+    // seats, both deep) exhausts the pool with nothing resident to evict. Rungs, in rising order of cost:
+    //   0  defer     this batch already placed some tokens: the rest waits for the next one (nothing moves)
+    //   1  evict     the LRU finished conversation, to the prompt cache (a copy, nothing was running)
+    //   1b offload   a yielded generation waiting for a seat, to RAM (a copy, nothing was running)
+    //   2  suspend   the largest RUNNING generation, with a copy - the 13 GB path on GLM. It WILL fire on that
+    //                box and that is the design working, not failing: the alternative is rung 3
+    //   3  fail      ONE sequence, the largest pending, spilled not destroyed (T0.3) - only when nothing above
+    //                can move
+    // One move per call; the caller retries the batch. Only under --kv-unified: without it every id has its own
+    // stream, and one sequence's wall is nobody else's.
+    //
+
+    // rung 1: the LRU finished conversation with cells leaves the pool. A refused save keeps it unless `force`
+    bool pool_evict_resident(bool force, const char * why) {
         if (!params_base.kv_unified) {
             return false;
         }
@@ -2573,15 +2586,244 @@ private:
             if (seq_prompt(*s).tokens.empty()) {
                 continue;
             }
-            if (seq_evict(*s, /*force*/ false, "KV pool full")) {
+            if (seq_evict(*s, force, why)) {
                 return true;
             }
         }
 
+        return false;
+    }
+
+    // rung 1b: a yielded generation that holds cells while waiting for a seat gives them up
+    bool pool_offload_waiting() {
+        if (!params_base.kv_unified) {
+            return false;
+        }
+
         auto cands = seq_mid_flight(/*resident_only*/ true);
-        if (!cands.empty()) {
-            seq_offload(*cands.front());
+        if (cands.empty()) {
+            return false;
+        }
+
+        seq_offload(*cands.front());
+
+        return true;
+    }
+
+    // the cells the sequences with an id occupy: one per token under --kv-unified, where the pool is one span
+    // and the server knows who holds what. Cells a parent shares with its children are counted once per
+    // holder, so this over-counts them, which errs on the side of waiting. T2.6 makes it exact.
+    size_t pool_cells_held() const {
+        size_t n = 0;
+        for (const auto & s : seqs) {
+            if (s.seq_id >= 0) {
+                n += seq_prompt(s).tokens.size();
+            }
+        }
+        return n;
+    }
+
+    // room for a state, plus the next token of every running sequence and of itself: a state restored into
+    // exactly its own cells is suspended again on the next batch, a copy each way for nothing. Without
+    // --kv-unified only the restore itself can tell.
+    bool pool_has_room_for(const server_sequence & s) const {
+        if (!params_base.kv_unified) {
             return true;
+        }
+
+        size_t margin = 1;
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                margin++;
+            }
+        }
+
+        return pool_cells_held() + s.prompt.tokens.size() + margin <= (size_t) llama_n_ctx(ctx_tgt);
+    }
+
+    // the processing slots with tokens pending in the batch from `off` on, with how many each
+    std::vector<std::pair<server_slot *, int32_t>> batch_pending_slots(int32_t off) {
+        std::vector<std::pair<server_slot *, int32_t>> res;
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+            int32_t n = 0;
+            for (int32_t i = off; i < batch.size(); i++) {
+                if (batch.tokens[i].seq_id == slot.seq_id) {
+                    n++;
+                }
+            }
+            if (n > 0) {
+                res.emplace_back(&slot, n);
+            }
+        }
+        return res;
+    }
+
+    // a slot's last n_pending batch tokens were never decoded: cut the prompt back so it says what the KV holds
+    // (checkpoints past the cut go with it). false when the cut lands inside a media chunk - keep_first()
+    // refuses before touching anything, so the prompt is as it was.
+    bool slot_drop_pending(server_slot & slot, int32_t n_pending) {
+        const int n_kv = slot.prompt.n_tokens() - n_pending;
+
+        try {
+            slot.prompt.tokens.keep_first(n_kv);
+        } catch (const std::exception & e) {
+            SLT_WRN(slot, "cannot cut the prompt back to %d tokens: %s\n", n_kv, e.what());
+            return false;
+        }
+
+        slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & ckpt) {
+            return ckpt.n_tokens > n_kv;
+        });
+
+        return true;
+    }
+
+    // take a slot's pending tokens out of the batch and remap the batch indices of everyone else
+    void batch_drop_pending(server_slot & slot, int32_t off) {
+        slot.i_batch = -1;
+
+        const auto map = batch.remove_from(slot.seq_id, off);
+
+        for (auto & s : slots) {
+            if (s.i_batch >= 0) {
+                s.i_batch = map[s.i_batch];
+            }
+            for (auto & i : s.spec_i_batch) {
+                i = map[i];
+            }
+        }
+    }
+
+    // rung 0: the batch got some of its tokens in before the wall (off > 0), so the ones after it simply wait
+    // for the next batch. Nothing is copied or failed. It matters for WHO the ladder picks next: n_batch halves
+    // down to 1 on the way here, the last free cells go to whichever slot was batched first, and what is left
+    // pending is then only the slot batched after it - the small innocent one, as a rule. The batch that follows
+    // fails with nothing placed, every sequence in it pending, and rung 2 can choose the largest.
+    bool pool_defer_pending(int32_t off) {
+        if (off == 0) {
+            return false;
+        }
+
+        int n_deferred = 0;
+
+        for (const auto & [slot, n_pending] : batch_pending_slots(off)) {
+            if (!slot_drop_pending(*slot, n_pending)) {
+                continue; // stays pending; the rungs below deal with it
+            }
+
+            if (slot->state == SLOT_STATE_DONE_PROMPT) {
+                // its last prompt chunk was in the pending part: it is a prompt in progress again
+                slot->state = SLOT_STATE_PROCESSING_PROMPT;
+            }
+            if (slot->state == SLOT_STATE_GENERATING) {
+                // the sampled token stays in `sampled` and is batched again; the draft is drawn again
+                slot->spec_draft.clear();
+                slot->spec_i_batch.clear();
+            }
+
+            batch_drop_pending(*slot, off);
+
+            SLT_DBG(*slot, "KV pool full after %d of this batch's tokens: %d pending tokens wait for the next batch\n", off, n_pending);
+
+            n_deferred++;
+        }
+
+        return n_deferred > 0;
+    }
+
+    // rung 2: the largest RUNNING generation with tokens pending gives up its seat and its cells (seat_release,
+    // then the offload copy); the resume pass brings it back when there is room. Only with company: alone in the
+    // batch there is nobody to make room for - it would be restored into the same full pool and suspended again,
+    // forever - and that is rung 3's case. A prefill cannot be suspended (half its prompt is in the KV;
+    // seat_release() refuses), nor a parent or child (shared cells, not explored): they fall through.
+    bool pool_suspend_running(int32_t off) {
+        // test hook: LLAMA_SERVER_POOL_NO_SUSPEND skips this rung so the terminal rung stays reachable by a
+        // test. With two or more live sequences every exhaustion otherwise has a rung 0-2 move.
+        static const bool disabled = std::getenv("LLAMA_SERVER_POOL_NO_SUSPEND") != nullptr;
+
+        if (disabled || !params_base.kv_unified) {
+            return false;
+        }
+
+        const auto pending = batch_pending_slots(off);
+        if (pending.size() < 2) {
+            return false;
+        }
+
+        server_slot * victim    = nullptr;
+        int32_t       n_pending = 0;
+
+        for (const auto & [slot, n] : pending) {
+            if (slot->state != SLOT_STATE_GENERATING || !slot->task) {
+                continue;
+            }
+            if (slot->task->is_parent() || slot->task->is_child()) {
+                continue;
+            }
+            if (!victim || slot->prompt.n_tokens() > victim->prompt.n_tokens()) {
+                victim    = slot;
+                n_pending = n;
+            }
+        }
+
+        if (!victim) {
+            return false;
+        }
+
+        server_slot & slot = *victim;
+
+        if (!slot_drop_pending(slot, n_pending)) {
+            return false;
+        }
+
+        slot.spec_draft.clear();
+        slot.spec_i_batch.clear();
+
+        batch_drop_pending(slot, off);
+
+        SLT_WRN(slot, "KV pool full: suspending the largest running generation with a copy (%d tokens in the KV, %d pending, %zu sequences in the batch)\n",
+                slot.prompt.n_tokens(), n_pending, pending.size());
+
+        server_sequence * s = slot.seq;
+
+        const bool released = slot.seat_release();
+        GGML_ASSERT(released);
+
+        seq_offload(*s);
+
+        SRV_DBG("%s", "__TEST_TAG_POOL_SUSPEND__\n");
+
+        return true;
+    }
+
+    // [seq] the restore side of the ladder: an offloaded generation's state comes back under `id` once the pool
+    // has room for it. Finished residents are evicted to make that room (rung 1; a refused save is forced on the
+    // second pass, as everywhere). false: not restored, the record untouched, the id left free. `may_wait` says
+    // whether the room can still appear on its own - something is running, or a resident yielded generation is
+    // waiting for a seat and will finish - as opposed to a state that does not fit an empty pool.
+    bool seq_restore_with_room(server_sequence & s, llama_seq_id id, bool & may_wait) {
+        GGML_ASSERT(s.offloaded() && s.mid_flight());
+
+        for (int pass = 0; pass < 2; ++pass) {
+            for (;;) {
+                if (pool_has_room_for(s) && seq_restore(s, id)) {
+                    return true;
+                }
+                if (!pool_evict_resident(/*force*/ pass == 1, "resuming a suspended generation")) {
+                    break;
+                }
+            }
+        }
+
+        may_wait = false;
+        for (const auto & slot : slots) {
+            may_wait |= slot.is_processing();
+        }
+        for (const auto & o : seqs) {
+            may_wait |= &o != &s && o.mid_flight() && !o.seated() && !o.offloaded();
         }
 
         return false;
@@ -4034,70 +4276,93 @@ private:
         // by setting --slot-resume-after to 0 (always resume) or a large value
         // (never preempt the newcomers).
         for (;;) {
-            auto waiting = seq_mid_flight(/*resident_only*/ false);
-            if (waiting.empty()) {
-                break;
-            }
+            bool progressed = false;
 
-            server_sequence & s = *waiting.front();
+            for (auto * sp : seq_mid_flight(/*resident_only*/ false)) {
+                server_sequence & s = *sp;
 
-            const bool     nobody_new = queue_tasks.queue_tasks_deferred_size() == 0;
-            const int64_t  waited_ms  = ggml_time_ms() - s.t_suspended_ms;
-            const bool     aged       = params_base.slot_resume_after_ms >= 0 &&
-                                        waited_ms >= params_base.slot_resume_after_ms;
+                const bool     nobody_new = queue_tasks.queue_tasks_deferred_size() == 0;
+                const int64_t  waited_ms  = ggml_time_ms() - s.t_suspended_ms;
+                const bool     aged       = params_base.slot_resume_after_ms >= 0 &&
+                                            waited_ms >= params_base.slot_resume_after_ms;
 
-            if (!nobody_new && !aged) {
-                break;
-            }
-
-            // an idle seat: one holding nothing first, else the least recently used
-            server_slot * slot = nullptr;
-            for (auto & cand : slots) {
-                if (cand.is_processing()) {
-                    continue;
-                }
-                if (slot == nullptr ||
-                    (!cand.bound() && slot->bound()) ||
-                    (cand.bound() == slot->bound() && cand.t_last_used < slot->t_last_used)) {
-                    slot = &cand;
-                }
-            }
-            if (slot == nullptr) {
-                break;
-            }
-
-            const int n_gen_at = s.n_decoded_at_suspend;
-
-            if (s.offloaded()) {
-                // it needs an id back: a free one, one more from the model, or a finished conversation's (saved
-                // first) - never another yielded generation's, that would only move the problem along
-                const llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "resuming a suspended generation");
-                if (id < 0) {
+                // oldest suspension first: if this one has not aged, the younger ones have not either
+                if (!nobody_new && !aged) {
                     break;
                 }
-                if (!seq_restore(s, id)) {
-                    // the usual cause is the pool: the other sequences grew while this one waited and its cells
-                    // no longer fit. One retry on a later pass covers room freeing up; after that the task is
-                    // answered, because a dropped entry is a client waiting forever for a generation nobody is running.
-                    if (s.n_resume_failures++ == 0) {
-                        SLT_WRN(*slot, "failed to resume a suspended generation (%d tokens in), will retry once\n", n_gen_at);
-                        break;
+
+                // an idle seat: one holding nothing first, else the least recently used
+                server_slot * slot = nullptr;
+                for (auto & cand : slots) {
+                    if (cand.is_processing()) {
+                        continue;
                     }
-                    SLT_ERR(*slot, "failed to resume a suspended generation (%d tokens in), giving up\n", n_gen_at);
-                    send_error(*s.task, "failed to resume the suspended generation: no room in the KV cache", ERROR_TYPE_SERVER);
-                    seq_erase(s);
-                    continue;
+                    if (slot == nullptr ||
+                        (!cand.bound() && slot->bound()) ||
+                        (cand.bound() == slot->bound() && cand.t_last_used < slot->t_last_used)) {
+                        slot = &cand;
+                    }
                 }
+                if (slot == nullptr) {
+                    break;
+                }
+
+                const int n_gen_at = s.n_decoded_at_suspend;
+
+                if (s.offloaded()) {
+                    // it needs an id back: a free one, one more from the model, or a finished conversation's (saved
+                    // first) - never another yielded generation's, that would only move the problem along. Without
+                    // one, a RESIDENT generation further down the list still has its id and can take the seat.
+                    const llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "resuming a suspended generation");
+                    if (id < 0) {
+                        continue;
+                    }
+
+                    // [seq] T2.5, the restore side of the ladder: room first. Finished residents are evicted for it
+                    // (rung 1); a pool held by RUNNING sequences means waiting, not failing - they finish or are
+                    // suspended themselves, and the room appears. This one is skipped, not the list: a resident
+                    // generation behind it may be holding exactly the cells it waits for, and has to run to free them.
+                    bool may_wait = false;
+                    if (!seq_restore_with_room(s, id, may_wait)) {
+                        if (may_wait) {
+                            if (s.n_resume_failures++ == 0) {
+                                SLT_WRN(*slot, "failed to resume a suspended generation (%d tokens in): no room in the KV pool yet, waiting\n", n_gen_at);
+                            }
+                            continue;
+                        }
+
+                        // nothing runs and nothing can be evicted, so the state does not fit an empty pool. One retry
+                        // on a later pass; after that the task is answered, because a dropped entry is a client waiting
+                        // forever for a generation nobody is running. (T1.4)
+                        if (s.n_resume_failures++ == 0) {
+                            SLT_WRN(*slot, "failed to resume a suspended generation (%d tokens in), will retry once\n", n_gen_at);
+                            continue;
+                        }
+                        SLT_ERR(*slot, "failed to resume a suspended generation (%d tokens in), giving up\n", n_gen_at);
+                        send_error(*s.task, "failed to resume the suspended generation: no room in the KV cache", ERROR_TYPE_SERVER);
+                        seq_erase(s);
+                        continue;
+                    }
+
+                    s.n_resume_failures = 0;
+                }
+
+                if (slot->bound()) {
+                    slot->seat_release(); // its idle sequence stays resident
+                }
+                slot->seat_acquire(s);
+
+                if (aged && !nobody_new) {
+                    SLT_INF(*slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
+                            waited_ms, queue_tasks.queue_tasks_deferred_size());
+                }
+
+                progressed = true;
+                break; // the list changed: start over
             }
 
-            if (slot->bound()) {
-                slot->seat_release(); // its idle sequence stays resident
-            }
-            slot->seat_acquire(s);
-
-            if (aged && !nobody_new) {
-                SLT_INF(*slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
-                        waited_ms, queue_tasks.queue_tasks_deferred_size());
+            if (!progressed) {
+                break;
             }
         }
 
@@ -5014,8 +5279,15 @@ private:
             if (n_batch == 1 && ret == 1) {
                 SRV_ERR("Context size has been exceeded. off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
 
-                // this used to error, release and clear EVERY processing slot. only one has to go.
-                if (fail_slot_under_pressure(off, "Context size has been exceeded.")) {
+                // [seq] T2.5: the pool has no cell for a single token. The ladder, one move per retry; rung 1
+                // ran on the way down (below), so here it only catches what finished since. This used to
+                // error, release and clear EVERY processing slot; then one; now one only when nothing else can go.
+                if (pool_defer_pending(off)                    ||
+                    pool_evict_resident(false, "KV pool full") ||
+                    pool_offload_waiting()                     ||
+                    pool_suspend_running(off)                  ||
+                    pool_evict_resident(true,  "KV pool full") ||
+                    fail_slot_under_pressure(off, "Context size has been exceeded.")) {
                     return false; // retry the rest of the batch
                 }
             }
@@ -5057,8 +5329,9 @@ private:
                 }
             }
 
-            // retry with half the batch size to try to find a free slot in the KV cache
-            if (!try_evict_resident()) {
+            // retry with half the batch size to try to find a free slot in the KV cache. A finished conversation
+            // goes first (rung 1, cheap and due anyway); the copies wait until halving has proved them necessary
+            if (!pool_evict_resident(false, "KV pool full")) {
                 n_batch /= 2;
             }
 
