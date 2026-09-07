@@ -443,6 +443,8 @@ struct server_slot_suspended {
 
     int64_t t_suspended_ms = 0;
     int     n_decoded_at_suspend = 0;
+
+    uint64_t next_yield_at = 0;
 };
 
 struct server_slot {
@@ -575,6 +577,12 @@ struct server_slot {
     int64_t t_print_last = 0;
     int32_t n_gen_last = 0;
 
+    // [preempt] n_gen at which the --slot-quantum trigger next considers
+    // yielding. A threshold, not `n_gen % quantum == 0`: a speculative step
+    // advances n_gen by 1 + n_accepted, which steps over multiples of the
+    // quantum. 0 = not yet armed for this generation.
+    uint64_t next_yield_at = 0;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -603,6 +611,7 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        next_yield_at = 0;
 
         n_predict_max = -1;
 
@@ -820,6 +829,7 @@ struct server_slot {
         st->n_accepted_per_pos     = n_accepted_per_pos;
         st->lora                   = lora;
         st->n_decoded_at_suspend   = (int) stats.n_gen;
+        st->next_yield_at          = next_yield_at;
         st->t_suspended_ms         = ggml_time_ms();
         st->task                   = std::move(task);
 
@@ -876,6 +886,7 @@ struct server_slot {
         stats                  = st->stats;
         n_accepted_per_pos     = st->n_accepted_per_pos;
         lora                   = st->lora;
+        next_yield_at          = st->next_yield_at;
 
         smpl = std::move(st->smpl);
         task = std::move(st->task);
@@ -4268,6 +4279,7 @@ private:
                         batch.set_output(batch.size() - 1, true);
 
                         slot.stats.n_gen = 0;
+                        slot.next_yield_at = 0;
                         slot.i_batch     = batch.size() - 1;
 
                         slot.init_sampler();
@@ -4599,22 +4611,7 @@ private:
                 }
             }
 
-            // [preempt] P3: the real trigger. Yield ONLY while other work is
-            // waiting - with an empty queue this costs nothing, which is the
-            // whole point ("when agents count and slots number match we better
-            // not yield"). Never during prefill: suspend() enforces that.
-            if (params_base.slot_quantum > 0 &&
-                slot.state == SLOT_STATE_GENERATING &&
-                slot.stats.n_gen > 0 &&
-                slot.stats.n_gen % (uint64_t) params_base.slot_quantum == 0 &&
-                queue_tasks.queue_tasks_deferred_size() > 0) {
-                auto st = slot.suspend();
-                if (st) {
-                    SLT_INF(slot, "yielded the slot after %d tokens, %zu waiting\n",
-                            st->n_decoded_at_suspend, queue_tasks.queue_tasks_deferred_size());
-                    queue_suspended.push_back(std::move(st));
-                }
-            }
+            slot_maybe_yield(slot);
         });
 
         // speculative decoding - main model sample and accept
@@ -4743,7 +4740,58 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+
+            // [preempt] same tail as the non-speculative path above. This slot
+            // returned early from that lambda (it had a draft), so the trigger
+            // there never saw it - measured: 0 yields over a 1500-token
+            // generation with draft-simple while a request waited the whole time.
+            slot_maybe_yield(slot);
         });
+    }
+
+    // [preempt] P3: the real trigger, reached once per decode step by BOTH the
+    // plain and the speculative accept paths. Yield ONLY while other work is
+    // waiting - with an empty queue this costs nothing, which is the whole
+    // point ("when agents count and slots number match we better not yield").
+    // Never during prefill: suspend() enforces that.
+    //
+    // Threshold rather than `n_gen % quantum == 0`: a speculative step advances
+    // n_gen by 1 + n_accepted (measured 9 per step with an 8-token draft), so a
+    // modulo test only lands when the jump happens to hit a multiple. The
+    // threshold is crossed by any jump and re-armed one quantum past wherever
+    // n_gen actually is.
+    void slot_maybe_yield(server_slot & slot) {
+        const uint64_t quantum = (uint64_t) params_base.slot_quantum;
+
+        if (quantum == 0 || slot.state != SLOT_STATE_GENERATING || slot.stats.n_gen == 0) {
+            return;
+        }
+
+        if (slot.next_yield_at == 0) {
+            slot.next_yield_at = quantum;
+        }
+
+        if (slot.stats.n_gen < slot.next_yield_at) {
+            return;
+        }
+
+        // re-arm whether or not we yield: the quantum is a check cadence, and
+        // an empty queue at this check means the next look is a quantum away
+        slot.next_yield_at = slot.stats.n_gen + quantum;
+
+        // read BEFORE suspend(): it releases the slot, which pops a deferred
+        // task into the main queue, so the count reads 0 afterwards
+        const size_t n_waiting = queue_tasks.queue_tasks_deferred_size();
+        if (n_waiting == 0) {
+            return;
+        }
+
+        auto st = slot.suspend();
+        if (st) {
+            SLT_INF(slot, "yielded the slot after %d tokens, %zu waiting\n",
+                    st->n_decoded_at_suspend, n_waiting);
+            queue_suspended.push_back(std::move(st));
+        }
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
