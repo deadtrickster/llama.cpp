@@ -706,6 +706,10 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
+    // [l2-spill] tokens held by the entries that still count toward limit_size - the ones the token
+    // limit is about. n_tokens() also counts the spilled ones, which are the disk budget's business.
+    size_t n_tokens_resident() const;
+
     // true when some entry already holds `prompt` in full - the same test alloc()
     // uses to skip a save, exposed so a caller can tell "already cached" (fine)
     // from "refused for size" (a conversation about to be lost)

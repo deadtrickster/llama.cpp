@@ -2333,6 +2333,18 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+size_t server_prompt_cache::n_tokens_resident() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (!state.spilled()) {
+            res += state.prompt.n_tokens();
+        }
+    }
+
+    return res;
+}
+
 bool server_prompt_cache::contains(const server_prompt & prompt) const {
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -2579,19 +2591,27 @@ void server_prompt_cache::update() {
         ? std::max<size_t>(limit_tokens, limit_size/size_per_token)
         : std::numeric_limits<size_t>::max();
 
+    // [l2-spill] The token limit is the RAM tier's: it is derived from limit_size (the bytes the RESIDENT
+    // entries may hold) and exists so a misjudged size_per_token cannot let them outgrow it. The disk
+    // tier has its own budget, limit_disk in bytes, enforced by trim_disk() above - so spilled entries
+    // must not be counted here, or the RAM budget bounds the disk tier as well. Measured 2026-09-07 on
+    // GLM-5.3-Flash: 80 GiB of --cache-ram and 256 GiB of --cache-disk, and still
+    //   cache token limit (327680, est: 1676406) reached, removing least-recently-used entry
+    // five times in one run, destroying spilled entries the disk had room for, because n_tokens() summed
+    // both tiers. And an entry the RAM tier cannot keep goes to disk, as everywhere else in this cache;
+    // it is destroyed only when it cannot be spilled.
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            auto it = lru_find(states, [](const server_prompt_cache_state &) { return true; });
+        while (!states.empty() && n_tokens_resident() > limit_tokens_cur) {
+            auto it = lru_find(states, [](const server_prompt_cache_state & st) { return !st.spilled(); });
             if (it == states.end()) {
                 break;
             }
 
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing least-recently-used entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, it->size_total() / (1024.0 * 1024.0));
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached for the resident tier (%zu tokens), %s least-recently-used entry (size = %.3f MiB)\n",
+                    limit_tokens, limit_tokens_cur, n_tokens_resident(), disk_dir.empty() ? "removing" : "spilling", it->size_total() / (1024.0 * 1024.0));
 
-            // [l2-spill] this entry is being destroyed for good -- drop its file too
-            if (it->spilled()) {
-                std::remove(it->spill_path.c_str());
+            if (spill(*it)) {
+                continue;
             }
 
             states.erase(it);
