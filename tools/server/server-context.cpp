@@ -3293,14 +3293,18 @@ private:
     }
 
     // rung 1: a finished conversation with cells leaves the pool - the shallowest first, cells being what is
-    // short here (SEQ_NEED_CELLS, see seq_evictable). A refused save keeps it unless `force`
-    bool pool_evict_resident(bool force, const char * why) {
+    // short here (SEQ_NEED_CELLS, see seq_evictable). A refused save keeps it unless `force`. `keep` is a seat
+    // being prepared for a task, whose own sequence is not a candidate (the restore drops its cells anyway)
+    bool pool_evict_resident(bool force, const char * why, const server_slot * keep = nullptr) {
         if (!params_base.kv_unified) {
             return false;
         }
 
         for (auto * s : seq_evictable(SEQ_NEED_CELLS)) {
             if (seq_prompt(*s).tokens.empty()) {
+                continue;
+            }
+            if (keep != nullptr && s->slot == keep) {
                 continue;
             }
             if (seq_evict(*s, force, why, SEQ_NEED_CELLS)) {
@@ -3554,6 +3558,68 @@ private:
         return false;
     }
 
+    // [pool-restore] the prompt-cache restore side of the ladder, defect (b) of the 2026-09-07 incident: a cached
+    // conversation about to be loaded into `slot` (prompt_load -> state_seq_set_data -> state_read_meta) needs
+    // its cells BEFORE state_read_meta asks for them - it finds them all or fails, and the fallback is a full
+    // prefill (141k tokens, 8.4 minutes on GLM, past the client's timeout, looping). pool_admit, pool_grow_pending
+    // and seq_restore_with_room were pool-grow hooks; this path was not. Room is made the way the ladder makes
+    // it: the pool grown from the device (idle ids given back first when the device says no - pool_grow's two
+    // passes), then finished residents evicted for their cells, the shallowest first; a refused save is forced
+    // on the second pass, as for a suspended generation coming back. The seat's own cells count as room: the
+    // restore replaces them (state_read_meta seq_rm's the destination first). The entry is looked up again
+    // after every step - an eviction's save can reshape the cache. false: the conversation will be prefilled,
+    // and the log says why.
+    bool pool_room_for_restore(server_slot & slot, const server_tokens & tokens_new) {
+        if (!pool_elastic() || !prompt_cache) {
+            return true; // static pool: the restore is attempted as before
+        }
+
+        const char * why = "a cached conversation coming back";
+
+        auto need_more = [&](size_t & n_tokens) -> size_t {
+            const server_prompt_cache_state * cand = prompt_cache->find(slot.prompt, tokens_new);
+            if (cand == nullptr) {
+                n_tokens = 0;
+                return 0;
+            }
+            n_tokens = cand->prompt.tokens.size();
+            const size_t need = n_tokens + 1 + slots.size();
+            const size_t have = pool_cells_free() + (slot.bound() ? (size_t) slot.prompt.n_tokens() : 0);
+            return need > have ? need - have : 0;
+        };
+
+        size_t n_tokens = 0;
+        size_t n_more   = need_more(n_tokens);
+        if (n_more == 0) {
+            return true;
+        }
+
+        SRV_INF("[pool] %s: %zu tokens, %zu more cells than the pool has free\n", why, n_tokens, n_more);
+
+        for (int pass = 0; pass < 2; ++pass) {
+            for (;;) {
+                if (pool_grow(n_more, /*urgent*/ false, why)) {
+                    n_more = need_more(n_tokens);
+                    if (n_more == 0) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (!pool_evict_resident(/*force*/ pass == 1, why, &slot)) {
+                    break;
+                }
+                n_more = need_more(n_tokens);
+                if (n_more == 0) {
+                    return true;
+                }
+            }
+        }
+
+        SRV_WRN("[pool] %s: %zu tokens do not fit and the pool cannot grow (%u cells, %zu held, %zu free); it will be prefilled\n",
+                why, n_tokens, pool_size(), pool_cells_held(), pool_cells_free());
+        return false;
+    }
+
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
         if (cmpl_id.empty()) {
             return nullptr;
@@ -3759,6 +3825,12 @@ private:
 
                 if (do_save) {
                     ret->prompt_save(*prompt_cache);
+                }
+
+                // [pool-restore] the cells first, then the restore; a restore that cannot have them is
+                // still attempted, so that its failure is the KV cache's own line in the log
+                if (do_load) {
+                    pool_room_for_restore(*ret, task.tokens);
                 }
 
                 if (do_load && !ret->prompt_load(*prompt_cache, task.tokens)) {
