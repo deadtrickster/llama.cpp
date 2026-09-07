@@ -214,6 +214,41 @@ struct server_batch {
         batch_rendered = true;
     }
 
+    // remove the tokens of a slot from index `from` on, then re-render
+    // returns old index -> new index, -1 for removed tokens, so the caller can remap slot batch indices
+    std::vector<int32_t> remove_from(int32_t id_slot, int32_t from) {
+        GGML_ASSERT(batch_rendered);
+
+        std::vector<int32_t> map(tokens.size(), -1);
+        std::vector<token>   kept;
+        std::vector<float>   embd_kept;
+
+        kept.reserve(tokens.size());
+        for (int32_t i = 0; i < size(); i++) {
+            if (i >= from && tokens[i].id_slot == id_slot) {
+                continue;
+            }
+            map[i] = (int32_t) kept.size();
+            kept.push_back(tokens[i]);
+            if (has_embd) {
+                embd_kept.insert(embd_kept.end(), embd.begin() + i*n_embd, embd.begin() + (i + 1)*n_embd);
+            }
+        }
+
+        tokens = std::move(kept);
+        embd   = std::move(embd_kept);
+
+        // same as clear(): render() writes through batch.token
+        if (batch.token == nullptr) {
+            batch.token = tokens_ptr;
+            batch.embd  = nullptr;
+        }
+        batch_rendered = false;
+        render();
+
+        return map;
+    }
+
     llama_batch get_view(int32_t off, int32_t n_tokens) const {
         GGML_ASSERT(batch.pos != nullptr);
         GGML_ASSERT(batch_rendered);
@@ -2131,6 +2166,77 @@ private:
         }
 
         return res;
+    }
+
+    // the pool has no room for even one token (n_batch == 1, ret == 1). fail ONE slot and let the others retry.
+    // returns false if no processing slot has tokens pending in the batch
+    bool fail_slot_under_pressure(int32_t off, const std::string & err) {
+        // every pending token is unplaceable, so "the one that did not fit" is not defined by position:
+        // batch.tokens[off] is just whichever slot was batched first. free the most room instead.
+        server_slot * victim = nullptr;
+        for (int32_t i = off; i < batch.size(); i++) {
+            for (auto & slot : slots) {
+                if (slot.id == batch.tokens[i].id_slot && slot.is_processing()) {
+                    if (!victim || slot.prompt.n_tokens() > victim->prompt.n_tokens()) {
+                        victim = &slot;
+                    }
+                }
+            }
+        }
+
+        if (!victim) {
+            return false;
+        }
+
+        server_slot & slot = *victim;
+
+        int32_t n_pending = 0;
+        for (int32_t i = off; i < batch.size(); i++) {
+            if (batch.tokens[i].id_slot == slot.id) {
+                n_pending++;
+            }
+        }
+
+        SLT_ERR(slot, "%s n_tokens = %d, n_pending = %d\n", err.c_str(), slot.prompt.n_tokens(), n_pending);
+
+        send_error(slot, err);
+
+        // the KV holds everything up to the pending tokens. spill that, do not destroy it.
+        if (prompt_cache && slot.task->type == SERVER_TASK_TYPE_COMPLETION) {
+            const int n_kv = slot.prompt.n_tokens() - n_pending;
+            try {
+                slot.prompt.tokens.keep_first(n_kv);
+                slot.prompt.checkpoints.remove_if([&](const common_prompt_checkpoint & ckpt) {
+                    return ckpt.n_tokens > n_kv;
+                });
+
+                if (slot.prompt_save(*prompt_cache)) {
+                    prompt_cache->update();
+                    SLT_WRN(slot, "spilled %d tokens to the prompt cache\n", n_kv);
+                    SLT_DBG(slot, "%s", "__TEST_TAG_POOL_EXHAUSTED_SPILL__\n");
+                }
+            } catch (const std::exception & e) {
+                // keep_first() refuses to cut inside a media chunk
+                SLT_WRN(slot, "cannot spill: %s\n", e.what());
+            }
+        }
+
+        slot.release();
+        slot.prompt_clear();
+        slot.i_batch = -1;
+
+        const auto map = batch.remove_from(slot.id, off);
+
+        for (auto & s : slots) {
+            if (s.i_batch >= 0) {
+                s.i_batch = map[s.i_batch];
+            }
+            for (auto & i : s.spec_i_batch) {
+                i = map[i];
+            }
+        }
+
+        return true;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -4181,12 +4287,19 @@ private:
         });
 
         if (ret != 0) {
+            if (n_batch == 1 && ret == 1) {
+                SRV_ERR("Context size has been exceeded. off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
+
+                // this used to error, release and clear EVERY processing slot. only one has to go.
+                if (fail_slot_under_pressure(off, "Context size has been exceeded.")) {
+                    return false; // retry the rest of the batch
+                }
+            }
+
             {
                 std::string err;
 
                 if (n_batch == 1 && ret == 1) {
-                    // TODO: try to terminate only the largest active slot/sequence and continue with the rest
-                    //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
                 }
 
