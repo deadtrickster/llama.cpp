@@ -2502,6 +2502,15 @@ private:
             return id;
         }
 
+        // an id holding nothing (a cleared or erased conversation) costs nothing to take back, and less than a raise
+        for (auto * s : seq_evictable()) {
+            if (seq_prompt(*s).tokens.empty()) {
+                id = s->seq_id;
+                seq_evict(*s, /*force*/ true, why);
+                return id;
+            }
+        }
+
         if (seq_ceiling_raise()) {
             id = seq_id_free();
             GGML_ASSERT(id >= 0);
@@ -2618,7 +2627,8 @@ private:
 
         // find the sequence that has at least n% prompt similarity: any finished one nobody is decoding, seated
         // or not - never a yielded generation, whose prompt is a task in progress. A requested slot pins the
-        // conversation to that seat (slot save/restore relies on it), so only its own sequence qualifies then.
+        // conversation to that seat (slot save/restore relies on it), so another seat's sequence does not
+        // qualify then; one that has no seat does, it was pushed off some seat and is nobody's.
         if (slot_prompt_similarity != 0.0f) {
             float f_sim_best = 0;
 
@@ -2626,7 +2636,7 @@ private:
                 if (s.offloaded() || s.mid_flight() || seq_running(s)) {
                     continue;
                 }
-                if (task.id_slot != -1 && s.slot != ret) {
+                if (task.id_slot != -1 && s.slot != nullptr && s.slot != ret) {
                     continue;
                 }
 
