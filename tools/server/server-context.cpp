@@ -3080,6 +3080,17 @@ private:
                             break;
                         }
                     }
+                    // [preempt] or the task is suspended rather than in a slot. Left
+                    // there it resumes into a dead connection and holds a slot, and
+                    // its KV, for the rest of a generation nobody will read.
+                    for (auto it = queue_suspended.begin(); it != queue_suspended.end(); ++it) {
+                        if ((*it)->task->id == task.id_target) {
+                            SRV_INF("cancel: dropping suspended task %d (%d tokens in)\n",
+                                    task.id_target, (*it)->n_decoded_at_suspend);
+                            queue_suspended.erase(it);
+                            break;
+                        }
+                    }
                 } break;
             case SERVER_TASK_TYPE_CONTROL:
                 {
@@ -3393,6 +3404,13 @@ private:
                 slot.release();
             }
         }
+        // [preempt] suspended generations were waiting on these same slots; the
+        // failure that emptied them is theirs too, and a dropped entry would be
+        // a client waiting forever
+        for (auto & st : queue_suspended) {
+            send_error(*st->task, reason, ERROR_TYPE_SERVER);
+        }
+        queue_suspended.clear();
     }
 
     // @ngxson : for debugging only
