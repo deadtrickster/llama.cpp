@@ -1254,6 +1254,42 @@ private:
         mctx = nullptr;
     }
 
+    // [l2-spill] save what the SLOTS are holding into the prompt cache, then
+    // spill the cache to disk. spill_all() writes only what the cache already
+    // contains, and a slot's conversation is copied into the cache lazily - on
+    // a later get_available_slot() pass. A conversation that has had no
+    // successor is therefore still only in its slot, and a spill without this
+    // walk correctly writes nothing and loses it. Runs on both the exit path
+    // (clean_up) and the sleep path (handle_sleeping_state), before destroy()
+    // frees the context the slots' state lives in.
+    void flush_prompt_cache() {
+        if (!prompt_cache) {
+            return;
+        }
+
+        int n_saved = 0;
+        int n_live  = 0;
+        for (auto & slot : slots) {
+            const int nt = slot.prompt.n_tokens();
+            if (nt > 0) {
+                n_live++;
+                if (slot.prompt_save(*prompt_cache)) {
+                    n_saved++;
+                } else {
+                    SRV_WRN("flush: slot %d holds %d tokens but prompt_save() refused it\n", slot.id, nt);
+                }
+            }
+        }
+        SRV_INF("flush: %d slot(s) with tokens, %d saved, cache now %zu entries / %.1f MiB\n",
+                n_live, n_saved, prompt_cache->states.size(),
+                prompt_cache->size() / 1048576.0);
+        if (n_saved > 0) {
+            prompt_cache->update();
+        }
+
+        prompt_cache->spill_all();
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
@@ -1262,6 +1298,9 @@ private:
                 // note: for sleeping == false, event is emitted by load_model()
             }
             SRV_INF("%s", "server is entering sleeping state\n");
+            // the slots are rebuilt empty on reload, so anything still only in
+            // a slot has to reach the cache now or it is gone
+            flush_prompt_cache();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -4686,38 +4725,11 @@ void server_context::terminate() {
 }
 
 void server_context::flush_prompt_cache() {
-    if (!impl || !impl->prompt_cache) {
+    if (!impl) {
         return;
     }
 
-    // Save what the SLOTS are holding before spilling. spill_all() writes only
-    // what the cache already contains, and a slot's conversation is copied into
-    // the cache lazily - on a later get_available_slot() pass. A model that
-    // served one turn and was then evicted has therefore never been cached, so
-    // the spill would correctly write nothing and the conversation would be lost.
-    // That is the common shape in router mode: load, one turn, evicted by
-    // --models-max.
-    int n_saved = 0;
-    int n_live  = 0;
-    for (auto & slot : impl->slots) {
-        const int nt = slot.prompt.n_tokens();
-        if (nt > 0) {
-            n_live++;
-            if (slot.prompt_save(*impl->prompt_cache)) {
-                n_saved++;
-            } else {
-                SRV_WRN("flush: slot %d holds %d tokens but prompt_save() refused it\n", slot.id, nt);
-            }
-        }
-    }
-    SRV_INF("flush: %d slot(s) with tokens, %d saved, cache now %zu entries / %.1f MiB\n",
-            n_live, n_saved, impl->prompt_cache->states.size(),
-            impl->prompt_cache->size() / 1048576.0);
-    if (n_saved > 0) {
-        impl->prompt_cache->update();
-    }
-
-    impl->prompt_cache->spill_all();
+    impl->flush_prompt_cache();
 }
 
 llama_context * server_context::get_llama_context() const {
