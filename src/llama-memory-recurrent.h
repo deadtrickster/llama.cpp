@@ -61,6 +61,10 @@ public:
 
     bool get_can_shift() const override;
 
+    // [seq-max] grow or shrink the number of cells (= sequence ids), keeping every live state
+    bool seq_max_resize(uint32_t n_seq_max) override;
+    std::map<ggml_backend_buffer_type_t, size_t> seq_max_cost(uint32_t n_seq_max) const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -118,7 +122,7 @@ private:
     //const llama_model & model;
     const llama_hparams & hparams;
 
-    const uint32_t n_seq_max = 1;
+    uint32_t n_seq_max = 1; // [seq-max] == size; both move together in seq_max_resize()
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

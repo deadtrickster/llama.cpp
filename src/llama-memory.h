@@ -100,6 +100,17 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    // [seq-max] the number of sequence ids this memory is sized for (the ceiling). Growing allocates
+    // room for the new ids; shrinking requires every id being dropped to hold nothing. Returns false
+    // and leaves the memory exactly as it was when the request cannot be honoured: an unsupported
+    // memory type, a non-unified attention cache (one stream per id), a live sequence above the new
+    // ceiling, or an allocation failure.
+    virtual bool seq_max_resize(uint32_t n_seq_max) { GGML_UNUSED(n_seq_max); return false; }
+
+    // [seq-max] bytes, per buffer type, that seq_max_resize(n_seq_max) would ADD: the per-sequence
+    // state this memory holds, exact. Growth only - a shrink frees and reports nothing.
+    virtual std::map<ggml_backend_buffer_type_t, size_t> seq_max_cost(uint32_t n_seq_max) const { GGML_UNUSED(n_seq_max); return {}; }
+
     //
     // ops
     //

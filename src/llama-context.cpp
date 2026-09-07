@@ -599,6 +599,8 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
+    backend_buf_seq_cost_valid = false; // [seq-max] measured against the reserve below
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
@@ -788,6 +790,173 @@ uint32_t llama_context::n_ubatch() const {
 
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
+}
+
+// [seq-max] The ceiling is not fixed for the life of the context: llama_memory_recurrent charges every id
+// its full state at allocation (GLM-5.3-Flash: 436.7 MiB per id, measured), so a startup ceiling pays for
+// sequences that may never exist and a low one caps how many can be resident. This grows or shrinks the
+// per-sequence memory and re-reserves the worst-case compute graph for the new n_seqs - now, not at the
+// next decode, so an allocation failure is rolled back and reported here instead of surfacing as a
+// compute error on somebody's batch. Only with a unified KV cache: one stream per id would need every
+// K/V tensor reallocated. The caller guarantees no batch is in flight.
+bool llama_context::set_n_seq_max(uint32_t n_seq_max_new) {
+    const uint32_t n_seq_max_cur = cparams.n_seq_max;
+
+    if (n_seq_max_new == n_seq_max_cur) {
+        return true;
+    }
+
+    if (n_seq_max_new < 1 || n_seq_max_new > LLAMA_MAX_SEQ) {
+        LLAMA_LOG_ERROR("%s: n_seq_max = %u is out of range [1, %d]\n", __func__, n_seq_max_new, LLAMA_MAX_SEQ);
+        return false;
+    }
+
+    if (!cparams.kv_unified) {
+        LLAMA_LOG_ERROR("%s: the sequence ceiling can only change with a unified KV cache\n", __func__);
+        return false;
+    }
+
+    if (!memory) {
+        LLAMA_LOG_ERROR("%s: no memory module\n", __func__);
+        return false;
+    }
+
+    synchronize();
+
+    if (!memory->seq_max_resize(n_seq_max_new)) {
+        LLAMA_LOG_ERROR("%s: the memory module refused n_seq_max = %u\n", __func__, n_seq_max_new);
+        return false;
+    }
+
+    cparams.n_seq_max = n_seq_max_new;
+
+    // output_reserve() asserts max(n_outputs, n_seq_max) <= n_outputs_max, and callers size n_outputs_max
+    // by the ceiling they started with (the server: n_seq_max * outputs per sequence). Widen it with the
+    // ceiling; the output buffer grows on demand in output_reserve() and the reserve below covers the graph.
+    const uint32_t n_outputs_max_cur = cparams.n_outputs_max;
+    cparams.n_outputs_max = std::max(cparams.n_outputs_max, n_seq_max_new * std::max(1u, cparams.n_outputs_max_per_seq));
+
+    sched_need_reserve = true;
+    try {
+        sched_reserve();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: reserving compute buffers for n_seq_max = %u failed (%s), rolling back to %u\n",
+                __func__, n_seq_max_new, e.what(), n_seq_max_cur);
+
+        cparams.n_seq_max     = n_seq_max_cur;
+        cparams.n_outputs_max = n_outputs_max_cur;
+
+        if (!memory->seq_max_resize(n_seq_max_cur)) {
+            // the new ids are empty, so this cannot refuse for state; only an allocation can fail here,
+            // and then the module has already rebuilt its previous buffers or thrown
+            LLAMA_LOG_ERROR("%s: the memory module could not return to %u ids\n", __func__, n_seq_max_cur);
+        }
+
+        // this configuration fitted before the call; if it does not now, that is the caller's problem to hear
+        sched_need_reserve = true;
+        sched_reserve();
+
+        return false;
+    }
+
+    LLAMA_LOG_INFO("%s: n_seq_max %u -> %u\n", __func__, n_seq_max_cur, n_seq_max_new);
+
+    return true;
+}
+
+// [seq-max] ggml_gallocr_reserve_n_impl(no_alloc = true) frees a live buffer it finds too small, so the
+// dry run goes through a scheduler of its own. graph_reserve() works on this->sched, hence the swap.
+// Valid for n_seqs <= the memory's current ceiling: the reserve graph views the memory's state rows
+// for n_seqs sequences and cannot be built for more rows than exist.
+bool llama_context::compute_size_at(uint32_t n_seqs, std::vector<size_t> & sizes) {
+    if (!memory || n_seqs < 1 || n_seqs > cparams.n_seq_max) {
+        return false;
+    }
+
+    synchronize();
+
+    const uint32_t n_tokens  = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const size_t   max_nodes = this->graph_max_nodes(n_tokens);
+
+    ggml_backend_sched_ptr sched_tmp(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (!sched_tmp) {
+        return false;
+    }
+
+    std::swap(sched, sched_tmp);
+
+    bool ok = false;
+    try {
+        auto mctx = memory->init_full();
+        if (!mctx) {
+            throw std::runtime_error("failed to initialize memory module");
+        }
+
+        const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+        std::vector<size_t> sizes_pp(backend_ptrs.size(), 0);
+        std::vector<size_t> sizes_tg(backend_ptrs.size(), 0);
+
+        ok = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes_pp.data()) != nullptr &&
+             graph_reserve(n_seqs,   n_seqs, n_seqs,       mctx.get(), true, sizes_tg.data()) != nullptr;
+
+        if (ok) {
+            sizes.resize(backend_ptrs.size());
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                sizes[i] = std::max(sizes_pp[i], sizes_tg[i]);
+            }
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+        ok = false;
+    }
+
+    std::swap(sched, sched_tmp);
+
+    // graph_reserve() reset gf_res_prev: the next decode rebuilds its graph once, nothing else is affected
+    return ok;
+}
+
+// [seq-max] What one more sequence costs, asked of THIS model: the per-sequence memory exactly (the
+// recurrent module knows its rows; a unified attention cache adds nothing), plus the compute buffer's
+// marginal cost measured here - the reserved size against a dry run one sequence below. Unknown, and
+// reported as nothing, at a ceiling of 1 or when the dry run cannot be made.
+std::map<ggml_backend_buffer_type_t, size_t> llama_context::seq_max_cost(uint32_t n_seq_max_new, bool & ok) {
+    std::map<ggml_backend_buffer_type_t, size_t> res;
+
+    const uint32_t n_seq_max_cur = cparams.n_seq_max;
+
+    // n_outputs_max is no bound here: set_n_seq_max() widens it with the ceiling
+    ok = memory && cparams.kv_unified && n_seq_max_new >= 1 && n_seq_max_new <= LLAMA_MAX_SEQ;
+    if (!ok || n_seq_max_new <= n_seq_max_cur) {
+        return res;
+    }
+
+    res = memory->seq_max_cost(n_seq_max_new);
+
+    if (n_seq_max_cur >= 2 && !model.hparams.no_alloc) {
+        if (!backend_buf_seq_cost_valid) {
+            std::vector<size_t> sizes;
+            if (compute_size_at(n_seq_max_cur - 1, sizes)) {
+                backend_buf_seq_cost.assign(backend_ptrs.size(), 0);
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    if (backend_buf_exp_size[i] > sizes[i]) {
+                        backend_buf_seq_cost[i] = backend_buf_exp_size[i] - sizes[i];
+                    }
+                }
+                backend_buf_seq_cost_valid = true;
+            }
+        }
+        if (backend_buf_seq_cost_valid) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (backend_buf_seq_cost[i] > 0) {
+                    res[backend_buft[i]] += backend_buf_seq_cost[i] * (n_seq_max_new - n_seq_max_cur);
+                }
+            }
+        }
+    }
+
+    return res;
 }
 
 uint32_t llama_context::n_threads() const {
@@ -3808,6 +3977,29 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
+}
+
+bool llama_set_n_seq_max(llama_context * ctx, uint32_t n_seq_max) {
+    return ctx->set_n_seq_max(n_seq_max);
+}
+
+int32_t llama_seq_max_cost(llama_context * ctx, uint32_t n_seq_max, ggml_backend_buffer_type_t * bufts, size_t * sizes, int32_t n_max) {
+    bool ok = false;
+    const auto cost = ctx->seq_max_cost(n_seq_max, ok);
+    if (!ok) {
+        return -1;
+    }
+
+    int32_t n = 0;
+    for (const auto & [buft, size] : cost) {
+        if (n < n_max) {
+            bufts[n] = buft;
+            sizes[n] = size;
+        }
+        n++;
+    }
+
+    return n;
 }
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {

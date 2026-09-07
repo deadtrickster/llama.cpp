@@ -256,6 +256,16 @@ bool llama_kv_cache_iswa::get_can_shift() const {
            kv_base->get_size() == kv_swa->get_size();
 }
 
+bool llama_kv_cache_iswa::seq_max_resize(uint32_t n_seq_max) {
+    // check both before touching either, so a refusal by the second half never leaves the first resized
+    if (kv_base->get_n_stream() != 1 || kv_swa->get_n_stream() != 1) {
+        LLAMA_LOG_ERROR("%s: the sequence ceiling can only change with a unified KV cache\n", __func__);
+        return false;
+    }
+
+    return kv_base->seq_max_resize(n_seq_max) && kv_swa->seq_max_resize(n_seq_max);
+}
+
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         kv_base->state_write(io, seq_id, flags);

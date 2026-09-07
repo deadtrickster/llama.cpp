@@ -140,6 +140,26 @@ bool llama_memory_hybrid_iswa::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+// [seq-max] attention first: under a unified cache it only changes a number, so undoing it costs nothing if the recurrent half refuses
+bool llama_memory_hybrid_iswa::seq_max_resize(uint32_t n_seq_max) {
+    const uint32_t n_seq_max_old = mem_recr->size;
+
+    if (!mem_attn->seq_max_resize(n_seq_max)) {
+        return false;
+    }
+
+    if (!mem_recr->seq_max_resize(n_seq_max)) {
+        mem_attn->seq_max_resize(n_seq_max_old);
+        return false;
+    }
+
+    return true;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::seq_max_cost(uint32_t n_seq_max) const {
+    return mem_recr->seq_max_cost(n_seq_max);
+}
+
 void llama_memory_hybrid_iswa::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

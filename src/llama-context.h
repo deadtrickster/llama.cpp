@@ -68,6 +68,13 @@ struct llama_context {
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
 
+    // [seq-max] change the sequence ceiling of this live context; false = refused, nothing changed
+    bool set_n_seq_max(uint32_t n_seq_max);
+
+    // [seq-max] extra bytes per buffer type that raising the ceiling to n_seq_max would need.
+    // ok = false when the ceiling cannot change at all (non-unified cache, no memory, out of range)
+    std::map<ggml_backend_buffer_type_t, size_t> seq_max_cost(uint32_t n_seq_max, bool & ok);
+
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
 
@@ -363,6 +370,14 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+
+    // [seq-max] worst-case compute size at n_seqs, measured on a throwaway scheduler (no allocation)
+    bool compute_size_at(uint32_t n_seqs, std::vector<size_t> & sizes);
+
+    // [seq-max] marginal compute bytes per sequence, per backend, measured against the last reserve;
+    // valid until the next sched_reserve()
+    std::vector<size_t> backend_buf_seq_cost;
+    bool                backend_buf_seq_cost_valid = false;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
