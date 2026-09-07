@@ -706,6 +706,11 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
+    // true when some entry already holds `prompt` in full - the same test alloc()
+    // uses to skip a save, exposed so a caller can tell "already cached" (fine)
+    // from "refused for size" (a conversation about to be lost)
+    bool contains(const server_prompt & prompt) const;
+
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);

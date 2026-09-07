@@ -580,6 +580,28 @@ struct server_slot {
         mbatch.reset();
     }
 
+    // Bind the backend sampler for `t`, or unbind it. reset() nulls the binding,
+    // so both a fresh launch and resume() have to redo it - a resumed slot that
+    // skipped this silently fell back to CPU sampling under --backend-sampling.
+    void sampler_bind(const server_task & t) const {
+        llama_sampler * backend = nullptr;
+
+        if (t.need_sampling() && smpl) {
+            const bool need_pre_sample_logits = t.params.sampling.n_probs > 0 && !t.params.post_sampling_probs;
+
+            bool use_backend_sampling = t.params.sampling.backend_sampling;
+
+            // TODO: getting pre sampling logits is not yet supported with backend sampling
+            use_backend_sampling &= !need_pre_sample_logits;
+
+            if (use_backend_sampling) {
+                backend = common_sampler_get(smpl.get());
+            }
+        }
+
+        llama_set_sampler(ctx_tgt, id, backend);
+    }
+
     void init_sampler() const {
         common_sampler_reset(smpl.get());
 
@@ -764,15 +786,16 @@ struct server_slot {
         st->lora                   = lora;
         st->n_decoded_at_suspend   = (int) stats.n_gen;
         st->t_suspended_ms         = ggml_time_ms();
-        st->task                   = std::move(const_cast<std::unique_ptr<const server_task> &>(task));
+        st->task                   = std::move(task);
 
         SLT_INF(*this, "suspended after %d generated tokens (%.1f MiB target + %.1f MiB draft state)\n",
                 st->n_decoded_at_suspend, sz_tgt / 1048576.0, sz_dft / 1048576.0);
 
-        // hand the slot back WITHOUT the usual reset(): task has already moved out
+        // hand the slot back WITHOUT release(): task has already moved out, and
+        // callback_on_reset() must NOT run - it publishes a FINISHED generation's
+        // stats. resume() restores `stats`; the final release() counts them once.
         state = SLOT_STATE_IDLE;
         t_last_used = ggml_time_us();
-        callback_on_reset(*this);
         reset();
         callback_on_release(id);
 
@@ -820,7 +843,10 @@ struct server_slot {
         lora                   = st->lora;
 
         smpl = std::move(st->smpl);
-        const_cast<std::unique_ptr<const server_task> &>(task) = std::move(st->task);
+        task = std::move(st->task);
+
+        // reset() unbound the backend sampler; bind the restored one
+        sampler_bind(*task);
 
         has_next_token = true;
         state          = SLOT_STATE_GENERATING;
@@ -2207,19 +2233,8 @@ private:
                 return false;
             }
 
-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
-
-            bool use_backend_sampling = task.params.sampling.backend_sampling;
-
-            // TODO: getting pre sampling logits is not yet supported with backend sampling
-            use_backend_sampling &= !need_pre_sample_logits;
-
             // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
-            } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
-            }
+            slot.sampler_bind(task);
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -4697,21 +4712,27 @@ void server_context::flush_prompt_cache() {
     // the spill would correctly write nothing and the conversation would be lost.
     // That is the common shape in router mode: load, one turn, evicted by
     // --models-max.
-    int n_saved = 0;
-    int n_live  = 0;
+    int n_saved  = 0;
+    int n_cached = 0;
+    int n_live   = 0;
     for (auto & slot : impl->slots) {
         const int nt = slot.prompt.n_tokens();
         if (nt > 0) {
             n_live++;
             if (slot.prompt_save(*impl->prompt_cache)) {
                 n_saved++;
+            } else if (impl->prompt_cache->contains(slot.prompt)) {
+                // the normal case: the idle-slot purge already copied this
+                // conversation into the cache, so there is nothing to lose
+                n_cached++;
+                SRV_DBG("flush: slot %d holds %d tokens, already in the cache\n", slot.id, nt);
             } else {
-                SRV_WRN("flush: slot %d holds %d tokens but prompt_save() refused it\n", slot.id, nt);
+                SRV_WRN("flush: slot %d holds %d tokens but prompt_save() refused it (state over the cache size limit?)\n", slot.id, nt);
             }
         }
     }
-    SRV_INF("flush: %d slot(s) with tokens, %d saved, cache now %zu entries / %.1f MiB\n",
-            n_live, n_saved, impl->prompt_cache->states.size(),
+    SRV_INF("flush: %d slot(s) with tokens, %d saved, %d already cached, cache now %zu entries / %.1f MiB\n",
+            n_live, n_saved, n_cached, impl->prompt_cache->states.size(),
             impl->prompt_cache->size() / 1048576.0);
     if (n_saved > 0) {
         impl->prompt_cache->update();
