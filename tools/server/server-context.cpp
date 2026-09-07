@@ -357,6 +357,58 @@ static bool slot_aux_load(
     return true;
 }
 
+// [preempt] Everything a mid-flight generation needs to be put down and picked
+// up again producing an IDENTICAL continuation. That equality is the whole
+// correctness argument for preemption, so this must mirror reset() exactly:
+// anything reset() clears and resume() does not restore is silent corruption,
+// visible only as a subtly different completion.
+//
+// Deliberately NOT routed through the prompt cache. A suspended task's state
+// must not be evictable - if the cache drops it the task can never resume - and
+// a dedicated buffer keeps that impossible rather than merely unlikely.
+struct server_slot_suspended {
+    std::unique_ptr<const server_task> task;
+
+    // prompt + KV
+    server_prompt        prompt;
+    std::vector<uint8_t> data_tgt;
+    std::vector<uint8_t> data_dft;
+
+    // sampler: repetition penalties, grammar position, RNG
+    common_sampler_ptr smpl;
+
+    // generation progress - mirrors reset()
+    size_t       last_nl_pos = 0;
+    std::string  generated_text;
+    bool         has_new_line = false;
+    bool         truncated    = false;
+    stop_type    stop         = STOP_TYPE_NONE;
+    std::string  stopping_word;
+    size_t       n_sent_text  = 0;
+    llama_tokens generated_tokens;
+    std::vector<completion_token_output> generated_token_probs;
+    json         json_schema;
+    llama_token  sampled = 0;
+    int32_t      n_predict_max = -1;
+    int32_t      alora_invocation_start = -1;
+
+    // speculative decoding
+    bool                     spec_is_replay = false;
+    llama_tokens             spec_draft;
+    llama_tokens             spec_prompt;
+    std::vector<int32_t>     spec_i_batch;
+    common_prompt_checkpoint spec_ckpt;
+    std::mt19937             spec_synth_rng;
+
+    server_slot_stats     stats;
+    std::vector<uint64_t> n_accepted_per_pos;
+
+    std::vector<common_adapter_lora_info> lora;
+
+    int64_t t_suspended_ms = 0;
+    int     n_decoded_at_suspend = 0;
+};
+
 struct server_slot {
     int id;
 
@@ -660,6 +712,122 @@ struct server_slot {
 
         prompt.tokens.push_back(sampled);
         prompt.tokens.insert(spec_draft);
+    }
+
+    // [preempt] Put this generation down mid-flight. Returns nullptr if the slot
+    // is not generating - preemption during prefill is never correct, the prompt
+    // is only half in the KV.
+    std::unique_ptr<server_slot_suspended> suspend() {
+        if (state != SLOT_STATE_GENERATING || !task) {
+            return nullptr;
+        }
+
+        auto st = std::make_unique<server_slot_suspended>();
+
+        const size_t sz_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        st->data_tgt.resize(sz_tgt);
+        llama_state_seq_get_data_ext(ctx_tgt, st->data_tgt.data(), sz_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (sz_dft > 0) {
+            st->data_dft.resize(sz_dft);
+            llama_state_seq_get_data_ext(ctx_dft, st->data_dft.data(), sz_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        // the sampler carries repetition penalties, grammar position and RNG;
+        // without it the resumed continuation diverges even with identical KV
+        st->smpl.reset(common_sampler_clone(smpl.get()));
+
+        st->prompt                 = std::move(prompt);   // move-only: server_tokens deletes copy-assign
+        st->last_nl_pos            = last_nl_pos;
+        st->generated_text         = generated_text;
+        st->has_new_line           = has_new_line;
+        st->truncated              = truncated;
+        st->stop                   = stop;
+        st->stopping_word          = stopping_word;
+        st->n_sent_text            = n_sent_text;
+        st->generated_tokens       = generated_tokens;
+        st->generated_token_probs  = generated_token_probs;
+        st->json_schema            = json_schema;
+        st->sampled                = sampled;
+        st->n_predict_max          = n_predict_max;
+        st->alora_invocation_start = alora_invocation_start;
+        st->spec_is_replay         = spec_is_replay;
+        st->spec_draft             = spec_draft;
+        st->spec_prompt            = spec_prompt;
+        st->spec_i_batch           = spec_i_batch;
+        st->spec_ckpt              = spec_ckpt;
+        st->spec_synth_rng         = spec_synth_rng;
+        st->stats                  = stats;
+        st->n_accepted_per_pos     = n_accepted_per_pos;
+        st->lora                   = lora;
+        st->n_decoded_at_suspend   = (int) stats.n_gen;
+        st->t_suspended_ms         = ggml_time_ms();
+        st->task                   = std::move(const_cast<std::unique_ptr<const server_task> &>(task));
+
+        SLT_INF(*this, "suspended after %d generated tokens (%.1f MiB target + %.1f MiB draft state)\n",
+                st->n_decoded_at_suspend, sz_tgt / 1048576.0, sz_dft / 1048576.0);
+
+        // hand the slot back WITHOUT the usual reset(): task has already moved out
+        state = SLOT_STATE_IDLE;
+        t_last_used = ggml_time_us();
+        callback_on_reset(*this);
+        reset();
+        callback_on_release(id);
+
+        return st;
+    }
+
+    // [preempt] inverse of suspend(). The slot must be idle and empty.
+    bool resume(std::unique_ptr<server_slot_suspended> st) {
+        if (!st) {
+            return false;
+        }
+
+        if (llama_state_seq_set_data_ext(ctx_tgt, st->data_tgt.data(), st->data_tgt.size(),
+                                         id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+            SLT_ERR(*this, "%s", "resume: failed to restore target KV state\n");
+            return false;
+        }
+        if (ctx_dft && !st->data_dft.empty()) {
+            llama_state_seq_set_data_ext(ctx_dft, st->data_dft.data(), st->data_dft.size(),
+                                         id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        prompt                 = std::move(st->prompt);
+        last_nl_pos            = st->last_nl_pos;
+        generated_text         = st->generated_text;
+        has_new_line           = st->has_new_line;
+        truncated              = st->truncated;
+        stop                   = st->stop;
+        stopping_word          = st->stopping_word;
+        n_sent_text            = st->n_sent_text;
+        generated_tokens       = st->generated_tokens;
+        generated_token_probs  = st->generated_token_probs;
+        json_schema            = st->json_schema;
+        sampled                = st->sampled;
+        n_predict_max          = st->n_predict_max;
+        alora_invocation_start = st->alora_invocation_start;
+        spec_is_replay         = st->spec_is_replay;
+        spec_draft             = st->spec_draft;
+        spec_prompt            = st->spec_prompt;
+        spec_i_batch           = st->spec_i_batch;
+        spec_ckpt              = st->spec_ckpt;
+        spec_synth_rng         = st->spec_synth_rng;
+        stats                  = st->stats;
+        n_accepted_per_pos     = st->n_accepted_per_pos;
+        lora                   = st->lora;
+
+        smpl = std::move(st->smpl);
+        const_cast<std::unique_ptr<const server_task> &>(task) = std::move(st->task);
+
+        has_next_token = true;
+        state          = SLOT_STATE_GENERATING;
+
+        SLT_INF(*this, "resumed at %d generated tokens after %" PRId64 " ms suspended\n",
+                st->n_decoded_at_suspend, ggml_time_ms() - st->t_suspended_ms);
+
+        return true;
     }
 
     void release() {
@@ -4155,6 +4323,31 @@ private:
             }
 
             slot.print_timings_tg();
+
+            // [preempt] P1 correctness harness. Not a scheduling policy - it
+            // suspends and IMMEDIATELY resumes the same slot, which exercises the
+            // full state capture/restore with nothing else changed. If the output
+            // of a run with LLAMA_SERVER_PREEMPT_SELFTEST=N set is not identical
+            // to one without it (temp 0, fixed seed), suspend() is losing state
+            // and no trigger policy built on top can be correct.
+            // Replaced by the real yield in P2/P3.
+            {
+                static const int selftest_every = []() {
+                    const char * e = std::getenv("LLAMA_SERVER_PREEMPT_SELFTEST");
+                    return e ? std::atoi(e) : 0;
+                }();
+                if (selftest_every > 0 &&
+                    slot.state == SLOT_STATE_GENERATING &&
+                    slot.stats.n_gen > 0 &&
+                    slot.stats.n_gen % (uint64_t) selftest_every == 0) {
+                    auto st = slot.suspend();
+                    if (st) {
+                        if (!slot.resume(std::move(st))) {
+                            SLT_ERR(slot, "%s", "preempt selftest: resume FAILED\n");
+                        }
+                    }
+                }
+            }
         });
 
         // speculative decoding - main model sample and accept
