@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -447,6 +448,10 @@ struct server_slot_suspended {
     int     n_decoded_at_suspend = 0;
 
     uint64_t next_yield_at = 0;
+
+    // how many times resume() has refused this state. The resume pass retries
+    // once and then answers the task instead of dropping it.
+    int n_resume_failures = 0;
 };
 
 struct server_slot {
@@ -854,19 +859,32 @@ struct server_slot {
     }
 
     // [preempt] inverse of suspend(). The slot must be idle and empty.
-    bool resume(std::unique_ptr<server_slot_suspended> st) {
+    //
+    // Takes the state by reference and consumes it only on success, so a failed
+    // restore leaves `st` intact for the caller to retry or answer. The restore
+    // itself is not transactional: state_read_meta() does seq_rm(dest) BEFORE
+    // it reads, so after a failure this slot's cells are gone whatever `prompt`
+    // says. prompt_clear() makes the two agree again - without it the next
+    // task on this slot reuses a prefix that is not in the KV.
+    bool resume(std::unique_ptr<server_slot_suspended> & st) {
         if (!st) {
             return false;
         }
 
         if (llama_state_seq_set_data_ext(ctx_tgt, st->data_tgt.data(), st->data_tgt.size(),
                                          seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
-            SLT_ERR(*this, "%s", "resume: failed to restore target KV state\n");
+            SLT_ERR(*this, "resume: failed to restore target KV state (%zu bytes)\n", st->data_tgt.size());
+            prompt_clear();
             return false;
         }
         if (ctx_dft && !st->data_dft.empty()) {
-            llama_state_seq_set_data_ext(ctx_dft, st->data_dft.data(), st->data_dft.size(),
-                                         seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (llama_state_seq_set_data_ext(ctx_dft, st->data_dft.data(), st->data_dft.size(),
+                                             seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+                // the target half is already in; half a state is worse than none
+                SLT_ERR(*this, "resume: failed to restore draft KV state (%zu bytes)\n", st->data_dft.size());
+                prompt_clear();
+                return false;
+            }
         }
 
         prompt                 = std::move(st->prompt);
@@ -1345,6 +1363,36 @@ private:
             return;
         }
 
+        // [preempt] a suspended generation is in no slot, and its KV state is
+        // already a byte blob in exactly the shape the cache stores, so it can
+        // be materialised without a context - which is why this runs before the
+        // context check below. The entries stay in the deque: on the exit path
+        // nothing reads them again, and on the sleep path a task still waiting
+        // for a slot is not this function's to drop.
+        int n_susp_saved  = 0;
+        int n_susp_cached = 0;
+        for (auto & st : queue_suspended) {
+            auto * cur = prompt_cache->alloc(st->prompt, st->data_tgt.size(), st->data_dft.size());
+            if (cur == nullptr) {
+                if (prompt_cache->contains(st->prompt)) {
+                    n_susp_cached++;
+                } else {
+                    SRV_WRN("flush: suspended task %d holds %d tokens but the cache refused it (state over the cache size limit?)\n",
+                            st->task->id, st->prompt.n_tokens());
+                }
+                continue;
+            }
+            std::memcpy(cur->data.main.data(), st->data_tgt.data(), st->data_tgt.size());
+            if (!st->data_dft.empty()) {
+                std::memcpy(cur->data.drft.data(), st->data_dft.data(), st->data_dft.size());
+            }
+            n_susp_saved++;
+        }
+        if (!queue_suspended.empty()) {
+            SRV_INF("flush: %zu suspended task(s), %d saved, %d already cached\n",
+                    queue_suspended.size(), n_susp_saved, n_susp_cached);
+        }
+
         // destroy() frees the context but leaves the slots populated - they are
         // only rebuilt by load_model(). A shutdown while sleeping therefore
         // arrives here with slots that still claim tokens and a ctx_tgt that
@@ -1353,6 +1401,9 @@ private:
         // free. The spill below is context-free and still runs.
         if (ctx_tgt == nullptr) {
             SRV_INF("flush: context is gone (%s), skipping slot walk\n", sleeping ? "sleeping" : "not loaded");
+            if (n_susp_saved > 0) {
+                prompt_cache->update();
+            }
             prompt_cache->spill_all();
             return;
         }
@@ -1380,7 +1431,7 @@ private:
         SRV_INF("flush: %d slot(s) with tokens, %d saved, %d already cached, cache now %zu entries / %.1f MiB\n",
                 n_live, n_saved, n_cached, prompt_cache->states.size(),
                 prompt_cache->size() / 1048576.0);
-        if (n_saved > 0) {
+        if (n_saved > 0 || n_susp_saved > 0) {
             prompt_cache->update();
         }
 
@@ -3115,6 +3166,17 @@ private:
                             break;
                         }
                     }
+                    // [preempt] or the task is suspended rather than in a slot. Left
+                    // there it resumes into a dead connection and holds a slot, and
+                    // its KV, for the rest of a generation nobody will read.
+                    for (auto it = queue_suspended.begin(); it != queue_suspended.end(); ++it) {
+                        if ((*it)->task->id == task.id_target) {
+                            SRV_INF("cancel: dropping suspended task %d (%d tokens in)\n",
+                                    task.id_target, (*it)->n_decoded_at_suspend);
+                            queue_suspended.erase(it);
+                            break;
+                        }
+                    }
                 } break;
             case SERVER_TASK_TYPE_CONTROL:
                 {
@@ -3428,6 +3490,13 @@ private:
                 slot.release();
             }
         }
+        // [preempt] suspended generations were waiting on these same slots; the
+        // failure that emptied them is theirs too, and a dropped entry would be
+        // a client waiting forever
+        for (auto & st : queue_suspended) {
+            send_error(*st->task, reason, ERROR_TYPE_SERVER);
+        }
+        queue_suspended.clear();
     }
 
     // @ngxson : for debugging only
@@ -3504,8 +3573,20 @@ private:
                     auto st = std::move(queue_suspended.front());
                     queue_suspended.pop_front();
                     const int n_gen_at = st->n_decoded_at_suspend;
-                    if (!slot.resume(std::move(st))) {
-                        SLT_ERR(slot, "failed to resume a suspended generation (%d tokens in)\n", n_gen_at);
+                    if (!slot.resume(st)) {
+                        // resume() left `st` intact and this slot cleared. The usual cause
+                        // is the pool: the other slots grew while this one waited and its
+                        // cells no longer fit. One retry at the FRONT covers another slot
+                        // freeing up (the loop goes on to it right now if one is idle);
+                        // after that the task is answered, because a dropped entry is a
+                        // client waiting forever for a generation nobody is running.
+                        if (st->n_resume_failures++ == 0) {
+                            SLT_WRN(slot, "failed to resume a suspended generation (%d tokens in), will retry once\n", n_gen_at);
+                            queue_suspended.push_front(std::move(st));
+                            continue;
+                        }
+                        SLT_ERR(slot, "failed to resume a suspended generation (%d tokens in), giving up\n", n_gen_at);
+                        send_error(*st->task, "failed to resume the suspended generation: no room in the KV cache", ERROR_TYPE_SERVER);
                     } else if (aged && !nobody_new) {
                         SLT_INF(slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
                                 waited_ms, queue_tasks.queue_tasks_deferred_size());
@@ -4629,8 +4710,9 @@ private:
                     slot.stats.n_gen > 0 &&
                     slot.stats.n_gen % (uint64_t) selftest_every == 0) {
                     auto st = slot.suspend();
-                    if (st && !slot.resume(std::move(st))) {
+                    if (st && !slot.resume(st)) {
                         SLT_ERR(slot, "%s", "preempt selftest: resume FAILED\n");
+                        send_error(*st->task, "preempt selftest: resume failed", ERROR_TYPE_SERVER);
                     }
                 }
             }
