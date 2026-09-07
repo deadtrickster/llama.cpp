@@ -2790,6 +2790,36 @@ private:
         return true;
     }
 
+    // [seq] the restore side of the ladder: an offloaded generation's state comes back under `id` once the pool
+    // has room for it. Finished residents are evicted to make that room (rung 1; a refused save is forced on the
+    // second pass, as everywhere). false: not restored, the record untouched, the id left free. `may_wait` says
+    // whether the room can still appear on its own - something is running, or a resident yielded generation is
+    // waiting for a seat and will finish - as opposed to a state that does not fit an empty pool.
+    bool seq_restore_with_room(server_sequence & s, llama_seq_id id, bool & may_wait) {
+        GGML_ASSERT(s.offloaded() && s.mid_flight());
+
+        for (int pass = 0; pass < 2; ++pass) {
+            for (;;) {
+                if (pool_has_room_for(s) && seq_restore(s, id)) {
+                    return true;
+                }
+                if (!pool_evict_resident(/*force*/ pass == 1, "resuming a suspended generation")) {
+                    break;
+                }
+            }
+        }
+
+        may_wait = false;
+        for (const auto & slot : slots) {
+            may_wait |= slot.is_processing();
+        }
+        for (const auto & o : seqs) {
+            may_wait |= &o != &s && o.mid_flight() && !o.seated() && !o.offloaded();
+        }
+
+        return false;
+    }
+
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
         if (cmpl_id.empty()) {
             return nullptr;
@@ -4236,70 +4266,93 @@ private:
         // by setting --slot-resume-after to 0 (always resume) or a large value
         // (never preempt the newcomers).
         for (;;) {
-            auto waiting = seq_mid_flight(/*resident_only*/ false);
-            if (waiting.empty()) {
-                break;
-            }
+            bool progressed = false;
 
-            server_sequence & s = *waiting.front();
+            for (auto * sp : seq_mid_flight(/*resident_only*/ false)) {
+                server_sequence & s = *sp;
 
-            const bool     nobody_new = queue_tasks.queue_tasks_deferred_size() == 0;
-            const int64_t  waited_ms  = ggml_time_ms() - s.t_suspended_ms;
-            const bool     aged       = params_base.slot_resume_after_ms >= 0 &&
-                                        waited_ms >= params_base.slot_resume_after_ms;
+                const bool     nobody_new = queue_tasks.queue_tasks_deferred_size() == 0;
+                const int64_t  waited_ms  = ggml_time_ms() - s.t_suspended_ms;
+                const bool     aged       = params_base.slot_resume_after_ms >= 0 &&
+                                            waited_ms >= params_base.slot_resume_after_ms;
 
-            if (!nobody_new && !aged) {
-                break;
-            }
-
-            // an idle seat: one holding nothing first, else the least recently used
-            server_slot * slot = nullptr;
-            for (auto & cand : slots) {
-                if (cand.is_processing()) {
-                    continue;
-                }
-                if (slot == nullptr ||
-                    (!cand.bound() && slot->bound()) ||
-                    (cand.bound() == slot->bound() && cand.t_last_used < slot->t_last_used)) {
-                    slot = &cand;
-                }
-            }
-            if (slot == nullptr) {
-                break;
-            }
-
-            const int n_gen_at = s.n_decoded_at_suspend;
-
-            if (s.offloaded()) {
-                // it needs an id back: a free one, one more from the model, or a finished conversation's (saved
-                // first) - never another yielded generation's, that would only move the problem along
-                const llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "resuming a suspended generation");
-                if (id < 0) {
+                // oldest suspension first: if this one has not aged, the younger ones have not either
+                if (!nobody_new && !aged) {
                     break;
                 }
-                if (!seq_restore(s, id)) {
-                    // the usual cause is the pool: the other sequences grew while this one waited and its cells
-                    // no longer fit. One retry on a later pass covers room freeing up; after that the task is
-                    // answered, because a dropped entry is a client waiting forever for a generation nobody is running.
-                    if (s.n_resume_failures++ == 0) {
-                        SLT_WRN(*slot, "failed to resume a suspended generation (%d tokens in), will retry once\n", n_gen_at);
-                        break;
+
+                // an idle seat: one holding nothing first, else the least recently used
+                server_slot * slot = nullptr;
+                for (auto & cand : slots) {
+                    if (cand.is_processing()) {
+                        continue;
                     }
-                    SLT_ERR(*slot, "failed to resume a suspended generation (%d tokens in), giving up\n", n_gen_at);
-                    send_error(*s.task, "failed to resume the suspended generation: no room in the KV cache", ERROR_TYPE_SERVER);
-                    seq_erase(s);
-                    continue;
+                    if (slot == nullptr ||
+                        (!cand.bound() && slot->bound()) ||
+                        (cand.bound() == slot->bound() && cand.t_last_used < slot->t_last_used)) {
+                        slot = &cand;
+                    }
                 }
+                if (slot == nullptr) {
+                    break;
+                }
+
+                const int n_gen_at = s.n_decoded_at_suspend;
+
+                if (s.offloaded()) {
+                    // it needs an id back: a free one, one more from the model, or a finished conversation's (saved
+                    // first) - never another yielded generation's, that would only move the problem along. Without
+                    // one, a RESIDENT generation further down the list still has its id and can take the seat.
+                    const llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "resuming a suspended generation");
+                    if (id < 0) {
+                        continue;
+                    }
+
+                    // [seq] T2.5, the restore side of the ladder: room first. Finished residents are evicted for it
+                    // (rung 1); a pool held by RUNNING sequences means waiting, not failing - they finish or are
+                    // suspended themselves, and the room appears. This one is skipped, not the list: a resident
+                    // generation behind it may be holding exactly the cells it waits for, and has to run to free them.
+                    bool may_wait = false;
+                    if (!seq_restore_with_room(s, id, may_wait)) {
+                        if (may_wait) {
+                            if (s.n_resume_failures++ == 0) {
+                                SLT_WRN(*slot, "failed to resume a suspended generation (%d tokens in): no room in the KV pool yet, waiting\n", n_gen_at);
+                            }
+                            continue;
+                        }
+
+                        // nothing runs and nothing can be evicted, so the state does not fit an empty pool. One retry
+                        // on a later pass; after that the task is answered, because a dropped entry is a client waiting
+                        // forever for a generation nobody is running. (T1.4)
+                        if (s.n_resume_failures++ == 0) {
+                            SLT_WRN(*slot, "failed to resume a suspended generation (%d tokens in), will retry once\n", n_gen_at);
+                            continue;
+                        }
+                        SLT_ERR(*slot, "failed to resume a suspended generation (%d tokens in), giving up\n", n_gen_at);
+                        send_error(*s.task, "failed to resume the suspended generation: no room in the KV cache", ERROR_TYPE_SERVER);
+                        seq_erase(s);
+                        continue;
+                    }
+
+                    s.n_resume_failures = 0;
+                }
+
+                if (slot->bound()) {
+                    slot->seat_release(); // its idle sequence stays resident
+                }
+                slot->seat_acquire(s);
+
+                if (aged && !nobody_new) {
+                    SLT_INF(*slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
+                            waited_ms, queue_tasks.queue_tasks_deferred_size());
+                }
+
+                progressed = true;
+                break; // the list changed: start over
             }
 
-            if (slot->bound()) {
-                slot->seat_release(); // its idle sequence stays resident
-            }
-            slot->seat_acquire(s);
-
-            if (aged && !nobody_new) {
-                SLT_INF(*slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
-                        waited_ms, queue_tasks.queue_tasks_deferred_size());
+            if (!progressed) {
+                break;
             }
         }
 
