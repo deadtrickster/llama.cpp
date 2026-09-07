@@ -97,6 +97,8 @@ class ServerProcess:
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
     spec_type: str | None = None
+    slot_quantum: int | None = None
+    slot_resume_after: int | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
     spec_synth_len: float | None = None
@@ -243,6 +245,10 @@ class ServerProcess:
             server_args.append("--context-shift")
         if self.spec_type:
             server_args.extend(["--spec-type", self.spec_type])
+        if self.slot_quantum is not None:
+            server_args.extend(["--slot-quantum", self.slot_quantum])
+        if self.slot_resume_after is not None:
+            server_args.extend(["--slot-resume-after", self.slot_resume_after])
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:

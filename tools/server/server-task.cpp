@@ -2333,15 +2333,23 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
+bool server_prompt_cache::contains(const server_prompt & prompt) const {
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+            return true;
         }
+    }
+
+    return false;
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    // first check if the current state is contained fully in the cache
+    if (contains(prompt)) {
+        SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+        return nullptr;
     }
 
     // calculate checkpoints size to see if it will fit with the prompt
