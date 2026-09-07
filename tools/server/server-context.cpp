@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <cinttypes>
 #include <exception>
@@ -1902,6 +1903,10 @@ private:
         if (pool_elastic()) {
             SRV_INF("[pool] elastic: starts at %u cells, one conversation always has room for one id and %u cells (%s)\n",
                     pool_size(), pool_min_ctx(), params_base.pool_min_ctx > 0 ? "--pool-min-ctx" : "derived from n_batch");
+            if (pool_selftest().on) {
+                SRV_WRN("[pool] SELF-TEST: buffer types without a device are priced at %.2f MiB with %.2f MiB per id (LLAMA_SERVER_POOL_SELFTEST) - never in production\n",
+                        pool_selftest().budget / 1048576.0, pool_selftest().id_bytes / 1048576.0);
+            }
         } else if (params_base.kv_unified) {
             SRV_INF("[pool] static: %u cells for the life of the server (%s)\n", pool_size(),
                     params_base.pool_static ? "--pool-static" : "the draft shares the target's KV tensors");
@@ -2492,6 +2497,7 @@ private:
                 need[bufts[i]] += sizes[i];
             }
         }
+        pool_selftest_id_cost(need);
 
         // [pool] the raise must leave the floor: one more id after this one (this one takes the free id) and
         // --pool-min-ctx cells. When the device says no, cells nobody holds are given back and it is asked again;
@@ -2617,6 +2623,88 @@ private:
         return llama_n_ctx(ctx_tgt);
     }
 
+    // [pool] SELF-TEST. The id trade - a raise refused by the device, cells given back, the raise asked
+    // again - cannot be driven in the CPU suite: the CPU buffer type reports no device (ggml-backend.cpp,
+    // ".device = NULL // FIXME"), so pool_fits() has nobody to ask and never says no, and a plain-KV model
+    // prices an id at nothing (a unified attention cache adds no per-sequence rows). Until 2026-09-07 that
+    // path had run on CUDA only, and the production log is where its first defect was found.
+    //
+    // LLAMA_SERVER_POOL_SELFTEST=<budget_mib>:<id_mib> prices a buffer type WITHOUT a device as one with
+    // <budget_mib> in total, of which the pool's cells (at the pool's own per-cell cost, the same number
+    // pool_shrink_for uses) and <id_mib> per id of the ceiling are spent; the id charge is added to what the
+    // model reports. Buffer types with a real device are untouched, so this is inert on CUDA. Test scaffolding
+    // only (tools/server/tests/unit/test_pool_elastic.py), never set in production.
+    struct pool_selftest_t {
+        bool   on       = false;
+        size_t budget   = 0;
+        size_t id_bytes = 0;
+    };
+
+    static const pool_selftest_t & pool_selftest() {
+        static const pool_selftest_t st = []() {
+            pool_selftest_t res;
+            const char * e = std::getenv("LLAMA_SERVER_POOL_SELFTEST");
+            if (e == nullptr) {
+                return res;
+            }
+            double budget = 0.0;
+            double id     = 0.0;
+            if (sscanf(e, "%lf:%lf", &budget, &id) == 2 && budget >= 0.0 && id >= 0.0) {
+                res.on       = true;
+                res.budget   = (size_t) (budget * 1048576.0);
+                res.id_bytes = (size_t) (id     * 1048576.0);
+            }
+            return res;
+        }();
+        return st;
+    }
+
+    // bytes one cell costs on `buft`, from what one padding step would add; 0 when the cells live elsewhere
+    size_t pool_cell_bytes(ggml_backend_buffer_type_t buft) const {
+        pool_cost_t step;
+        if (!pool_grow_cost(pool_pad(pool_size() + 256), step)) {
+            return 0;
+        }
+        return step.count(buft) ? step.at(buft) / 256 : 0;
+    }
+
+    // what `buft` has free: its device's answer, or under the self-test a priced answer for a buffer type
+    // that has no device. false: nobody to ask (the resize will attempt and see)
+    bool pool_buft_free(ggml_backend_buffer_type_t buft, size_t & free) const {
+        auto * dev = ggml_backend_buft_get_device(buft);
+        if (dev != nullptr) {
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            return true;
+        }
+        const auto & st = pool_selftest();
+        if (!st.on) {
+            return false;
+        }
+        const size_t spent = pool_cell_bytes(buft) * pool_size() + st.id_bytes * seq_ceiling();
+        free = spent >= st.budget ? 0 : st.budget - spent;
+        return true;
+    }
+
+    // the self-test's charge for one more id, on every device-less buffer type that holds cells
+    void pool_selftest_id_cost(pool_cost_t & need) const {
+        const auto & st = pool_selftest();
+        if (!st.on || st.id_bytes == 0) {
+            return;
+        }
+        pool_cost_t step;
+        if (!pool_grow_cost(pool_pad(pool_size() + 256), step)) {
+            return;
+        }
+        for (const auto & [buft, bytes] : step) {
+            if (ggml_backend_buft_get_device(buft) == nullptr) {
+                need[buft] += st.id_bytes;
+            }
+            GGML_UNUSED(bytes);
+        }
+    }
+
+
     size_t pool_cells_free() const {
         const size_t held = pool_cells_held();
         const size_t n    = pool_size();
@@ -2625,6 +2713,35 @@ private:
 
     uint32_t pool_min_ctx() const {
         return params_base.pool_min_ctx > 0 ? (uint32_t) params_base.pool_min_ctx : (uint32_t) llama_n_batch(ctx_tgt);
+    }
+
+    // [pool-restore] the cells a shrink must leave FREE beyond what is held. --pool-min-ctx, or what the largest
+    // conversation the prompt cache could hand back needs to come back - its tokens plus the batch margin -
+    // whichever is more. `n_largest` says which entry set it (0: --pool-min-ctx did).
+    //
+    // Why an entry at all: unheld cells are not idle. They are the capacity a cached conversation needs to
+    // return, and a restore is all-or-nothing - state_read_meta finds every one of its cells or fails, and the
+    // conversation is then prefilled from scratch (GLM, 2026-09-07: 141k tokens, 8.4 minutes, past the client's
+    // timeout, looping). The shrink that caused it looked at 157 cache entries' worth of capacity and saw idle.
+    //
+    // Why the LARGEST single entry and not the sum: a shrink leaves room for any ONE of them to come back, which
+    // is what a restore is; the sum would pin the pool at the size of everything ever cached and undo the trade.
+    // Why the RAM tier only: --cache-ram is the operator's statement of what is hot, LRU-bounded, so the floor
+    // moves with the workload; the disk tier is bounded only by --cache-disk (1 TiB in production) and adopts
+    // files from previous runs, so "largest on disk" is the deepest conversation this model has ever seen on
+    // this machine - a permanent pin. An entry that comes back from disk still gets its cells: the restore path
+    // grows the pool for it (pool_room_for_restore), so the cost of being outside the floor is a resize plus
+    // idle ids given back, not a reprefill. The floor is per device by construction: a cell count is one span
+    // across every device that holds cells, so keeping N cells keeps their bytes on each of them.
+    uint32_t pool_restore_floor(size_t & n_largest) const {
+        n_largest = prompt_cache ? prompt_cache->n_tokens_largest_resident() : 0;
+
+        const size_t min_ctx = pool_min_ctx();
+        if (n_largest == 0) {
+            return (uint32_t) min_ctx;
+        }
+
+        return (uint32_t) std::max<size_t>(min_ctx, n_largest + 1 + slots.size());
     }
 
     static uint32_t pool_pad(size_t n) {
@@ -2678,6 +2795,7 @@ private:
                 need[bufts[i]] += sizes[i];
             }
         }
+        pool_selftest_id_cost(need);
         return true;
     }
 
@@ -2707,16 +2825,13 @@ private:
         str.clear();
         for (const auto & [buft, bytes] : all) {
             const size_t res = reserve.count(buft) ? reserve.at(buft) : 0;
-            auto * dev = ggml_backend_buft_get_device(buft);
-            if (dev == nullptr) {
+            size_t free = 0;
+            if (!pool_buft_free(buft, free)) {
                 // no device to ask (the CPU buffer type reports none): attempt and see, as the resize does
                 str += string_format("%s%s %.1f MiB + %.1f MiB reserve (no device to ask)", str.empty() ? "" : ", ",
                         ggml_backend_buft_name(buft), bytes / 1048576.0, res / 1048576.0);
                 continue;
             }
-            size_t free  = 0;
-            size_t total = 0;
-            ggml_backend_dev_memory(dev, &free, &total);
             str += string_format("%s%s %.1f MiB + %.1f MiB reserve (%.1f MiB free)", str.empty() ? "" : ", ",
                     ggml_backend_buft_name(buft), bytes / 1048576.0, res / 1048576.0, free / 1048576.0);
             if (bytes + res + headroom > free) {
@@ -2798,15 +2913,22 @@ private:
             return false;
         }
 
-        const uint32_t n_cur   = pool_size();
-        const size_t   held    = pool_cells_held();
-        const uint32_t min_ctx = pool_min_ctx();
+        const uint32_t n_cur    = pool_size();
+        const size_t   held     = pool_cells_held();
         const size_t   headroom = (size_t) params_base.seq_max_headroom_mib * 1024 * 1024;
 
-        if (n_cur <= held + min_ctx) {
+        // [pool-restore] what stays free: --pool-min-ctx, or the largest cached conversation's way back
+        size_t n_largest = 0;
+        const uint32_t floor = pool_restore_floor(n_largest);
+        const std::string floor_str = n_largest > 0
+            ? string_format("the floor of %u: a %zu-token cached conversation plus the batch margin", floor, n_largest)
+            : string_format("the floor of %u: --pool-min-ctx", floor);
+
+        if (n_cur <= held + floor) {
+            SRV_INF("[pool] stays at %u cells: %zu held, nothing idle beyond %s (%s)\n", n_cur, held, floor_str.c_str(), why);
             return false;
         }
-        const size_t idle = n_cur - held - min_ctx; // cells that could go
+        const size_t idle = n_cur - held - floor; // cells that could go
 
         // per-cell cost per device, from what one padding step would add
         pool_cost_t step;
@@ -2817,13 +2939,10 @@ private:
         // cells to give back so every device gains what it lacks
         size_t n_give = 0;
         for (const auto & [buft, bytes] : need) {
-            auto * dev = ggml_backend_buft_get_device(buft);
-            if (dev == nullptr) {
+            size_t free = 0;
+            if (!pool_buft_free(buft, free)) {
                 continue;
             }
-            size_t free  = 0;
-            size_t total = 0;
-            ggml_backend_dev_memory(dev, &free, &total);
             if (bytes + headroom <= free) {
                 continue;
             }
@@ -2839,7 +2958,7 @@ private:
             return false;
         }
         if (n_give > idle) {
-            SRV_INF("[pool] stays at %u cells: %zu would have to go and only %zu are idle beyond --pool-min-ctx %u (%s)\n", n_cur, n_give, idle, min_ctx, why);
+            SRV_INF("[pool] stays at %u cells: %zu would have to go and only %zu are idle beyond %s (%s)\n", n_cur, n_give, idle, floor_str.c_str(), why);
             return false;
         }
 
@@ -2851,7 +2970,17 @@ private:
             return false;
         }
 
-        return pool_resize(n_new, why);
+        if (!pool_resize(n_new, why)) {
+            return false;
+        }
+        {
+            std::string bytes_str;
+            for (const auto & [buft, per_cell] : step) {
+                bytes_str += string_format("%s%s %.1f MiB", bytes_str.empty() ? "" : ", ", ggml_backend_buft_name(buft), (n_cur - n_new) * (per_cell / 256) / 1048576.0);
+            }
+            SRV_INF("[pool] gave back %u cells (%s) for %s, keeping %zu held and %s\n", n_cur - n_new, bytes_str.c_str(), why, held, floor_str.c_str());
+        }
+        return true;
     }
 
     // [pool] admission asks whether the WHOLE conversation fits - its id (if none is free) and its cells (if the
@@ -3164,14 +3293,18 @@ private:
     }
 
     // rung 1: a finished conversation with cells leaves the pool - the shallowest first, cells being what is
-    // short here (SEQ_NEED_CELLS, see seq_evictable). A refused save keeps it unless `force`
-    bool pool_evict_resident(bool force, const char * why) {
+    // short here (SEQ_NEED_CELLS, see seq_evictable). A refused save keeps it unless `force`. `keep` is a seat
+    // being prepared for a task, whose own sequence is not a candidate (the restore drops its cells anyway)
+    bool pool_evict_resident(bool force, const char * why, const server_slot * keep = nullptr) {
         if (!params_base.kv_unified) {
             return false;
         }
 
         for (auto * s : seq_evictable(SEQ_NEED_CELLS)) {
             if (seq_prompt(*s).tokens.empty()) {
+                continue;
+            }
+            if (keep != nullptr && s->slot == keep) {
                 continue;
             }
             if (seq_evict(*s, force, why, SEQ_NEED_CELLS)) {
@@ -3425,6 +3558,68 @@ private:
         return false;
     }
 
+    // [pool-restore] the prompt-cache restore side of the ladder, defect (b) of the 2026-09-07 incident: a cached
+    // conversation about to be loaded into `slot` (prompt_load -> state_seq_set_data -> state_read_meta) needs
+    // its cells BEFORE state_read_meta asks for them - it finds them all or fails, and the fallback is a full
+    // prefill (141k tokens, 8.4 minutes on GLM, past the client's timeout, looping). pool_admit, pool_grow_pending
+    // and seq_restore_with_room were pool-grow hooks; this path was not. Room is made the way the ladder makes
+    // it: the pool grown from the device (idle ids given back first when the device says no - pool_grow's two
+    // passes), then finished residents evicted for their cells, the shallowest first; a refused save is forced
+    // on the second pass, as for a suspended generation coming back. The seat's own cells count as room: the
+    // restore replaces them (state_read_meta seq_rm's the destination first). The entry is looked up again
+    // after every step - an eviction's save can reshape the cache. false: the conversation will be prefilled,
+    // and the log says why.
+    bool pool_room_for_restore(server_slot & slot, const server_tokens & tokens_new) {
+        if (!pool_elastic() || !prompt_cache) {
+            return true; // static pool: the restore is attempted as before
+        }
+
+        const char * why = "a cached conversation coming back";
+
+        auto need_more = [&](size_t & n_tokens) -> size_t {
+            const server_prompt_cache_state * cand = prompt_cache->find(slot.prompt, tokens_new);
+            if (cand == nullptr) {
+                n_tokens = 0;
+                return 0;
+            }
+            n_tokens = cand->prompt.tokens.size();
+            const size_t need = n_tokens + 1 + slots.size();
+            const size_t have = pool_cells_free() + (slot.bound() ? (size_t) slot.prompt.n_tokens() : 0);
+            return need > have ? need - have : 0;
+        };
+
+        size_t n_tokens = 0;
+        size_t n_more   = need_more(n_tokens);
+        if (n_more == 0) {
+            return true;
+        }
+
+        SRV_INF("[pool] %s: %zu tokens, %zu more cells than the pool has free\n", why, n_tokens, n_more);
+
+        for (int pass = 0; pass < 2; ++pass) {
+            for (;;) {
+                if (pool_grow(n_more, /*urgent*/ false, why)) {
+                    n_more = need_more(n_tokens);
+                    if (n_more == 0) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (!pool_evict_resident(/*force*/ pass == 1, why, &slot)) {
+                    break;
+                }
+                n_more = need_more(n_tokens);
+                if (n_more == 0) {
+                    return true;
+                }
+            }
+        }
+
+        SRV_WRN("[pool] %s: %zu tokens do not fit and the pool cannot grow (%u cells, %zu held, %zu free); it will be prefilled\n",
+                why, n_tokens, pool_size(), pool_cells_held(), pool_cells_free());
+        return false;
+    }
+
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
         if (cmpl_id.empty()) {
             return nullptr;
@@ -3630,6 +3825,12 @@ private:
 
                 if (do_save) {
                     ret->prompt_save(*prompt_cache);
+                }
+
+                // [pool-restore] the cells first, then the restore; a restore that cannot have them is
+                // still attempted, so that its failure is the KV cache's own line in the log
+                if (do_load) {
+                    pool_room_for_restore(*ret, task.tokens);
                 }
 
                 if (do_load && !ret->prompt_load(*prompt_cache, task.tokens)) {

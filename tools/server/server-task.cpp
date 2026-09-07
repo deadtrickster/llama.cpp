@@ -2457,11 +2457,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+size_t server_prompt_cache::n_tokens_largest_resident() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (!state.spilled()) {
+            res = std::max(res, state.prompt.tokens.size());
+        }
+    }
+
+    return res;
+}
+
+// the entry that beats the slot's own prompt on BOTH f_keep and f_sim, or end(); the two figures come back
+// so load() can log the choice it is about to act on
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_it(const server_prompt & prompt, const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+    f_sim_best  = float(lcp_best) / tokens_new.size();
 
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -2488,6 +2502,24 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             it_best = it;
         }
     }
+
+    return it_best;
+}
+
+const server_prompt_cache_state * server_prompt_cache::find(const server_prompt & prompt, const server_tokens & tokens_new) {
+    float f_keep = 0.0f;
+    float f_sim  = 0.0f;
+
+    const auto it = find_it(prompt, tokens_new, f_keep, f_sim);
+
+    return it == states.end() ? nullptr : &*it;
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    float f_keep_best = 0.0f;
+    float f_sim_best  = 0.0f;
+
+    auto it_best = find_it(prompt, tokens_new, f_keep_best, f_sim_best);
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);

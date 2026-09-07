@@ -715,11 +715,24 @@ struct server_prompt_cache {
     // from "refused for size" (a conversation about to be lost)
     bool contains(const server_prompt & prompt) const;
 
+    // [pool-restore] tokens of the largest entry in the RAM tier: what a shrink of the KV pool must leave
+    // room for, a restore being all-or-nothing. The disk tier is not counted - see pool_restore_floor()
+    size_t n_tokens_largest_resident() const;
+
+    // [pool-restore] the entry load() would restore for `tokens_new` into a slot holding `prompt`, or nullptr:
+    // the same choice load() makes, exposed so the caller can make room for it BEFORE load() asks the KV
+    // cache for the cells (state_read_meta finds them all or fails, and then the conversation is prefilled)
+    const server_prompt_cache_state * find(const server_prompt & prompt, const server_tokens & tokens_new);
+
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+private:
+    std::list<server_prompt_cache_state>::iterator find_it(const server_prompt & prompt, const server_tokens & tokens_new, float & f_keep_best, float & f_sim_best);
+
 };
 
 // used exclusively by router mode
