@@ -2550,13 +2550,18 @@ private:
         return 1 + std::max(0, common_speculative_n_max(&params_base.speculative));
     }
 
-    // the most seats there can be: no more than there can be ids, and no more than fit one n_batch view when all
-    // of them generate at once (a seat's tokens straddling a view boundary is not a case the decode loop handles).
-    // The floor always exists, as it always did, whatever the batch says.
+    // the most seats there can be: no more than there can be ids, no more than fit one n_batch view when all of
+    // them generate at once (a seat's tokens straddling a view boundary is not a case the decode loop handles),
+    // and no more than --parallel-max when someone wants the batch held narrower than the pool. The floor always
+    // exists, as it always did, whatever the batch says.
     uint32_t seat_cap() const {
-        const int32_t  n_batch = llama_n_batch(ctx_tgt);
+        const int32_t  n_batch  = llama_n_batch(ctx_tgt);
         const uint32_t by_batch = (uint32_t) std::max<int32_t>(1, n_batch / seat_tokens_per_batch());
-        return std::max(seat_floor(), std::min(seq_ceiling_cap(), by_batch));
+        uint32_t cap = std::min(seq_ceiling_cap(), by_batch);
+        if (params_base.n_parallel_max > 0) {
+            cap = std::min(cap, (uint32_t) params_base.n_parallel_max);
+        }
+        return std::max(seat_floor(), cap);
     }
 
     // an idle seat: one holding nothing first, else the least recently used. nullptr when all are processing

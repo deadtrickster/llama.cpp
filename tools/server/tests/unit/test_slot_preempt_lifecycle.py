@@ -43,6 +43,9 @@ DISCONNECT_POLL_S = 1.0
 def _mk(log, quantum, n_slots=1, n_ctx=2048, n_threads=None, kv_unified=False):
     sp = ServerPreset.tinyllama2()
     sp.n_slots = n_slots
+    # [seats] these tests are about what happens to a SUSPENDED task, and a task is only suspended when the
+    # seats are contended: hold the seat count where the test was written (seats follow the pool otherwise)
+    sp.parallel_max = n_slots
     sp.n_ctx = n_ctx
     sp.n_threads = n_threads
     # [seq] with a unified cache the server grows the sequence ceiling on demand, so a yielded

@@ -9,7 +9,9 @@ def configure_worker_port(request):
     worker_id = getattr(request.config, "workerinput", {}).get("workerid", "master")
     if worker_id != "master":
         worker_num = int(worker_id[2:])
-        os.environ["PORT"] = str(8080 + worker_num * 10)
+        # the base is PORT when set: 8080 is the production server on this box, and a run that lands there is void
+        base = int(os.environ.get("PORT", "8080"))
+        os.environ["PORT"] = str(base + worker_num * 10)
 
 
 # ref: https://stackoverflow.com/questions/22627659/run-code-before-and-after-each-test-in-py-test

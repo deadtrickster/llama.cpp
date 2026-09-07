@@ -2626,6 +2626,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.seq_max_headroom_mib = value;
             }
         ).set_env("LLAMA_ARG_SEQ_MAX_HEADROOM").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--parallel-max"}, "N",
+            string_format(
+                "the most server slots there may be (default: %d, 0 = derive: as many as the pool holds sequences, up to the sequence ceiling's cap)\n"
+                "slots follow residency: --parallel is the floor that always exists, and a slot is added for every resident sequence with work while the model says one more fits;\n"
+                "set this only to hold the batch narrower than the pool - a yielded generation then stays resident and waits for a slot instead of being copied out",
+                params.n_parallel_max),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("error: invalid value for --parallel-max\n");
+                }
+                params.n_parallel_max = value;
+            }
+        ).set_env("LLAMA_ARG_N_PARALLEL_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

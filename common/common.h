@@ -459,6 +459,7 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_seq_max             =     0; // number of sequence ids the context is allocated for (0 = n_parallel); a residency ceiling, NOT free - see --seq-max
+    int32_t n_parallel_max        =     0; // [seats] the most batch seats the server may add on top of --parallel (0 = derive from the pool); see --parallel-max
     int32_t seq_max_headroom_mib  =     0; // [seq-max] free device memory to keep when raising the ceiling at runtime, see --seq-max-headroom
 
     // the n_seq_max the context is actually created with. llama sizes per-sequence state (recurrent memory,

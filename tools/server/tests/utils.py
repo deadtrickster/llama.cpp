@@ -88,6 +88,7 @@ class ServerProcess:
     kv_unified: bool | None = False
     kv_unified_per_slot: int | None = None
     seq_max: int | None = None
+    parallel_max: int | None = None
     swa_full: bool | None = False
     server_slots: bool | None = False
     pooling: str | None = None
@@ -214,6 +215,8 @@ class ServerProcess:
             server_args.extend(["--kv-unified-per-slot", self.kv_unified_per_slot])
         if self.seq_max is not None:
             server_args.extend(["--seq-max", self.seq_max])
+        if self.parallel_max is not None:
+            server_args.extend(["--parallel-max", self.parallel_max])
         if self.swa_full:
             server_args.append("--swa-full")
         if self.server_slots:

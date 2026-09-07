@@ -37,9 +37,12 @@ PROMPT_B = "In a small village by the sea an old fisherman mended his nets every
 PROMPT_C = "The mountain pass was closed by snow and the travellers waited in the inn"
 
 
-def _mk(log, n_slots=1, seq_max=None, cache_ram=0, quantum=None, n_ctx=2048, kv_unified=True):
+def _mk(log, n_slots=1, seq_max=None, cache_ram=0, quantum=None, n_ctx=2048, kv_unified=True, parallel_max=None):
     sp = ServerPreset.tinyllama2()
     sp.n_slots = n_slots
+    # [seats] seats follow the pool now, so "one seat, two ids" needs the cap said out loud (--parallel-max);
+    # the tests that leave it unset are the ones asserting that seats follow
+    sp.parallel_max = parallel_max
     sp.n_ctx = n_ctx
     sp.n_predict = None           # the preset's --n-predict 64 is not a cap we want
     sp.temperature = 0.0
@@ -288,7 +291,7 @@ def _contend(sp: ServerProcess, prompt_a: str, prompt_b: str):
 
 def _yield_run(seq_max, prompt_b=PROMPT_B, kv_unified=True, n_ctx=2048):
     log = os.path.join(tempfile.mkdtemp(), "srv.log")
-    sp = _mk(log, n_slots=1, seq_max=seq_max, quantum=8, kv_unified=kv_unified, n_ctx=n_ctx)
+    sp = _mk(log, n_slots=1, seq_max=seq_max, quantum=8, kv_unified=kv_unified, n_ctx=n_ctx, parallel_max=1)
     sp.start(timeout_seconds=120)
     try:
         _wait_ready(sp)
