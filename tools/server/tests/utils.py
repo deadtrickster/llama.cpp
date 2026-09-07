@@ -127,6 +127,7 @@ class ServerProcess:
     no_cache_idle_slots: bool = False
     pool_min_ctx: int | None = None   # [pool] --pool-min-ctx
     pool_static: bool = False         # [pool] --pool-static
+    env: dict[str, str] | None = None # extra environment for the server process (a self-test hook, say)
     log_path: str | None = None
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
@@ -156,6 +157,8 @@ class ServerProcess:
         }
         if "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
+        if self.env:
+            env.update(self.env)
         if self.external_server:
             print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
             return

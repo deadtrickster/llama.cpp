@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <cinttypes>
 #include <exception>
@@ -1902,6 +1903,10 @@ private:
         if (pool_elastic()) {
             SRV_INF("[pool] elastic: starts at %u cells, one conversation always has room for one id and %u cells (%s)\n",
                     pool_size(), pool_min_ctx(), params_base.pool_min_ctx > 0 ? "--pool-min-ctx" : "derived from n_batch");
+            if (pool_selftest().on) {
+                SRV_WRN("[pool] SELF-TEST: buffer types without a device are priced at %.2f MiB with %.2f MiB per id (LLAMA_SERVER_POOL_SELFTEST) - never in production\n",
+                        pool_selftest().budget / 1048576.0, pool_selftest().id_bytes / 1048576.0);
+            }
         } else if (params_base.kv_unified) {
             SRV_INF("[pool] static: %u cells for the life of the server (%s)\n", pool_size(),
                     params_base.pool_static ? "--pool-static" : "the draft shares the target's KV tensors");
@@ -2492,6 +2497,7 @@ private:
                 need[bufts[i]] += sizes[i];
             }
         }
+        pool_selftest_id_cost(need);
 
         // [pool] the raise must leave the floor: one more id after this one (this one takes the free id) and
         // --pool-min-ctx cells. When the device says no, cells nobody holds are given back and it is asked again;
@@ -2617,6 +2623,88 @@ private:
         return llama_n_ctx(ctx_tgt);
     }
 
+    // [pool] SELF-TEST. The id trade - a raise refused by the device, cells given back, the raise asked
+    // again - cannot be driven in the CPU suite: the CPU buffer type reports no device (ggml-backend.cpp,
+    // ".device = NULL // FIXME"), so pool_fits() has nobody to ask and never says no, and a plain-KV model
+    // prices an id at nothing (a unified attention cache adds no per-sequence rows). Until 2026-09-07 that
+    // path had run on CUDA only, and the production log is where its first defect was found.
+    //
+    // LLAMA_SERVER_POOL_SELFTEST=<budget_mib>:<id_mib> prices a buffer type WITHOUT a device as one with
+    // <budget_mib> in total, of which the pool's cells (at the pool's own per-cell cost, the same number
+    // pool_shrink_for uses) and <id_mib> per id of the ceiling are spent; the id charge is added to what the
+    // model reports. Buffer types with a real device are untouched, so this is inert on CUDA. Test scaffolding
+    // only (tools/server/tests/unit/test_pool_elastic.py), never set in production.
+    struct pool_selftest_t {
+        bool   on       = false;
+        size_t budget   = 0;
+        size_t id_bytes = 0;
+    };
+
+    static const pool_selftest_t & pool_selftest() {
+        static const pool_selftest_t st = []() {
+            pool_selftest_t res;
+            const char * e = std::getenv("LLAMA_SERVER_POOL_SELFTEST");
+            if (e == nullptr) {
+                return res;
+            }
+            double budget = 0.0;
+            double id     = 0.0;
+            if (sscanf(e, "%lf:%lf", &budget, &id) == 2 && budget >= 0.0 && id >= 0.0) {
+                res.on       = true;
+                res.budget   = (size_t) (budget * 1048576.0);
+                res.id_bytes = (size_t) (id     * 1048576.0);
+            }
+            return res;
+        }();
+        return st;
+    }
+
+    // bytes one cell costs on `buft`, from what one padding step would add; 0 when the cells live elsewhere
+    size_t pool_cell_bytes(ggml_backend_buffer_type_t buft) const {
+        pool_cost_t step;
+        if (!pool_grow_cost(pool_pad(pool_size() + 256), step)) {
+            return 0;
+        }
+        return step.count(buft) ? step.at(buft) / 256 : 0;
+    }
+
+    // what `buft` has free: its device's answer, or under the self-test a priced answer for a buffer type
+    // that has no device. false: nobody to ask (the resize will attempt and see)
+    bool pool_buft_free(ggml_backend_buffer_type_t buft, size_t & free) const {
+        auto * dev = ggml_backend_buft_get_device(buft);
+        if (dev != nullptr) {
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            return true;
+        }
+        const auto & st = pool_selftest();
+        if (!st.on) {
+            return false;
+        }
+        const size_t spent = pool_cell_bytes(buft) * pool_size() + st.id_bytes * seq_ceiling();
+        free = spent >= st.budget ? 0 : st.budget - spent;
+        return true;
+    }
+
+    // the self-test's charge for one more id, on every device-less buffer type that holds cells
+    void pool_selftest_id_cost(pool_cost_t & need) const {
+        const auto & st = pool_selftest();
+        if (!st.on || st.id_bytes == 0) {
+            return;
+        }
+        pool_cost_t step;
+        if (!pool_grow_cost(pool_pad(pool_size() + 256), step)) {
+            return;
+        }
+        for (const auto & [buft, bytes] : step) {
+            if (ggml_backend_buft_get_device(buft) == nullptr) {
+                need[buft] += st.id_bytes;
+            }
+            GGML_UNUSED(bytes);
+        }
+    }
+
+
     size_t pool_cells_free() const {
         const size_t held = pool_cells_held();
         const size_t n    = pool_size();
@@ -2678,6 +2766,7 @@ private:
                 need[bufts[i]] += sizes[i];
             }
         }
+        pool_selftest_id_cost(need);
         return true;
     }
 
@@ -2707,16 +2796,13 @@ private:
         str.clear();
         for (const auto & [buft, bytes] : all) {
             const size_t res = reserve.count(buft) ? reserve.at(buft) : 0;
-            auto * dev = ggml_backend_buft_get_device(buft);
-            if (dev == nullptr) {
+            size_t free = 0;
+            if (!pool_buft_free(buft, free)) {
                 // no device to ask (the CPU buffer type reports none): attempt and see, as the resize does
                 str += string_format("%s%s %.1f MiB + %.1f MiB reserve (no device to ask)", str.empty() ? "" : ", ",
                         ggml_backend_buft_name(buft), bytes / 1048576.0, res / 1048576.0);
                 continue;
             }
-            size_t free  = 0;
-            size_t total = 0;
-            ggml_backend_dev_memory(dev, &free, &total);
             str += string_format("%s%s %.1f MiB + %.1f MiB reserve (%.1f MiB free)", str.empty() ? "" : ", ",
                     ggml_backend_buft_name(buft), bytes / 1048576.0, res / 1048576.0, free / 1048576.0);
             if (bytes + res + headroom > free) {
@@ -2817,13 +2903,10 @@ private:
         // cells to give back so every device gains what it lacks
         size_t n_give = 0;
         for (const auto & [buft, bytes] : need) {
-            auto * dev = ggml_backend_buft_get_device(buft);
-            if (dev == nullptr) {
+            size_t free = 0;
+            if (!pool_buft_free(buft, free)) {
                 continue;
             }
-            size_t free  = 0;
-            size_t total = 0;
-            ggml_backend_dev_memory(dev, &free, &total);
             if (bytes + headroom <= free) {
                 continue;
             }
