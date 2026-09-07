@@ -3,6 +3,7 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-cparams.h" // LLAMA_MAX_SEQ
 
 #include <array>
 #include <cassert>
@@ -178,7 +179,7 @@ common_device_memory_data_vec common_get_device_memory_data(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, int32_t n_seq_reserve, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -225,6 +226,7 @@ static void common_params_fit_impl(
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    uint32_t n_seq_extra = 0;  // sequence ceiling that memory was measured at
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
@@ -233,13 +235,18 @@ static void common_params_fit_impl(
             return;
         }
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
+        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx || n_seq_extra != cparams->n_seq_max) {
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
             uint32_t nct_extra = 0;
             uint32_t nex_extra = 0;
 
-            extra->cparams->n_ctx = cparams->n_ctx;
+            extra->cparams->n_ctx     = cparams->n_ctx;
+            extra->cparams->n_seq_max = cparams->n_seq_max; // its per-sequence state (MTP rollback rows) is part of a sequence's cost
+            if (extra->cparams->n_outputs_max != 0) {
+                extra->cparams->n_outputs_max = std::max(extra->cparams->n_outputs_max,
+                    cparams->n_seq_max * std::max(1u, extra->cparams->n_outputs_max_per_seq));
+            }
 
             LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
                 __func__, cparams->n_ctx);
@@ -253,6 +260,7 @@ static void common_params_fit_impl(
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
                 dmds_extra = dmds_t(devs.size() + 1);
                 n_ctx_extra = cparams->n_ctx;
+                n_seq_extra = cparams->n_seq_max;
                 return;
             }
 
@@ -275,6 +283,7 @@ static void common_params_fit_impl(
             }
 
             n_ctx_extra = cparams->n_ctx;
+            n_seq_extra = cparams->n_seq_max;
         }
 
         for (size_t id = 0; id < dmds.size(); id++) {
@@ -516,6 +525,59 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("context size, tensor_split and layer placement all set by user, nothing left to adjust, abort");
     }
 
+    // The reserve: device memory held back for sequences that have not arrived yet, so the next conversation can be
+    // seated without evicting one. One sequence's worth by default - the context starts with cparams->n_seq_max ids
+    // and the reserve is for id n+1; everything above that is pool, and moving it between cells and ids at runtime is
+    // the server's business, not a startup ratio. Per device and measured, never a constant: a sequence's recurrent
+    // state lands on whichever device holds each recurrent layer (GLM-5.3-Flash: 256.9 MiB on CUDA0, 180.1 on CUDA1,
+    // and CUDA0 binds), so a scalar would be wrong on any uneven split.
+    const uint32_t n_seq_start = cparams->n_seq_max;
+    uint32_t n_seq_res = n_seq_reserve < 0 ? 1 : uint32_t(n_seq_reserve);
+    if (n_seq_res > 0 && !cparams->kv_unified) {
+        LOG_TRC("%s: the KV cache is not unified, the sequence ceiling cannot grow at runtime -> no sequence reserve\n", __func__);
+        n_seq_res = 0;
+    }
+    if (n_seq_start + n_seq_res > LLAMA_MAX_SEQ) {
+        n_seq_res = LLAMA_MAX_SEQ - std::min<uint32_t>(n_seq_start, LLAMA_MAX_SEQ);
+    }
+    std::vector<int64_t> reserve(nd, 0); // per device, for the placement last measured
+
+    // measures memory at (n_ctx, n_seq_start) and at (n_ctx, n_seq_start + n_seq_res) for the placement in mparams:
+    // returns the former, and leaves the difference in `reserve`. cparams->n_seq_max is restored: the context must be
+    // created with the ids it starts with, the reserve is memory left FREE for the ids to come.
+    auto measure_with_reserve = [&](const char * func_name, uint32_t n_ctx) -> std::vector<int64_t> {
+        std::vector<int64_t> base(nd, 0);
+        cparams->n_ctx     = n_ctx;
+        cparams->n_seq_max = n_seq_start;
+        {
+            dmds_t dmds = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            add_extra_memory(dmds);
+            for (size_t id = 0; id < nd; id++) {
+                base[id] = dmds[id].mb.total();
+            }
+        }
+        std::fill(reserve.begin(), reserve.end(), 0);
+        if (n_seq_res > 0) {
+            // llama_context::output_reserve() asserts n_seq_max <= n_outputs_max, and a server sizes n_outputs_max by the
+            // ceiling it starts with; widen it for the measurement the way llama_set_n_seq_max() does, then put it back
+            const uint32_t n_outputs_max_cur = cparams->n_outputs_max;
+            cparams->n_seq_max = n_seq_start + n_seq_res;
+            if (cparams->n_outputs_max != 0) {
+                cparams->n_outputs_max = std::max(cparams->n_outputs_max, cparams->n_seq_max * std::max(1u, cparams->n_outputs_max_per_seq));
+            }
+            dmds_t dmds = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            add_extra_memory(dmds);
+            cparams->n_seq_max     = n_seq_start;
+            cparams->n_outputs_max = n_outputs_max_cur;
+            for (size_t id = 0; id < nd; id++) {
+                reserve[id] = std::max<int64_t>(0, int64_t(dmds[id].mb.total()) - base[id]);
+                LOG_TRC("%s:   - %s: %" PRIu32 " more sequence(s) beyond the %" PRIu32 " the context starts with cost %.1f MiB\n",
+                    func_name, dev_names[id].c_str(), n_seq_res, n_seq_start, double(reserve[id])/MiB);
+            }
+        }
+        return base;
+    };
+
     // utility: the largest context at which every device meets its target, for the placement currently in mparams.
     //   - a per-device search: the binding device is the one with the least room per token of context, and a sum over
     //     devices cannot see it (device 0 short by 500 MiB and device 1 with 2 GiB spare is a surplus that OOMs)
@@ -523,7 +585,9 @@ static void common_params_fit_impl(
     //   - the search is seeded with the current n_ctx (the sum-based estimate from above), which is usually close
     //   - returns false if the placement does not fit even at the minimum context
     const uint32_t n_ctx_align = 256 * n_streams;
-    auto fit_ctx_per_device = [&](const char * func_name, const std::vector<int64_t> & targets_local) -> bool {
+    auto fit_ctx_per_device = [&](const char * func_name, const std::vector<int64_t> & targets_in) -> bool {
+        std::vector<int64_t> targets_local(nd); // targets_in minus the reserve measured for this placement, filled below
+
         auto measure = [&](uint32_t n_ctx) -> std::vector<int64_t> {
             cparams->n_ctx = n_ctx;
             dmds_t dmds = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
@@ -547,10 +611,18 @@ static void common_params_fit_impl(
             return n_ctx - n_ctx % n_ctx_align;
         };
 
-        if (!n_ctx_auto || n_ctx_max <= n_ctx_min_total) {
+        // the reserve for this placement, measured at the context the search starts from; it comes off the targets
+        const bool nothing_to_size = !n_ctx_auto || n_ctx_max <= n_ctx_min_total;
+        const uint32_t n_ctx_base = nothing_to_size ? cparams->n_ctx : n_ctx_min_total;
+        const std::vector<int64_t> mem_base = measure_with_reserve(func_name, n_ctx_base);
+        for (size_t id = 0; id < nd; id++) {
+            targets_local[id] = targets_in[id] - reserve[id];
+        }
+
+        if (nothing_to_size) {
             // nothing to size: the user pinned the context, asked for the full one, or the model's is at the minimum;
             // the answer is still whether what is left fits
-            const std::vector<int64_t> mem = measure(cparams->n_ctx);
+            const std::vector<int64_t> & mem = mem_base;
             const bool ok = fits(mem);
             if (!ok) {
                 for (size_t id = 0; id < nd; id++) {
@@ -572,7 +644,7 @@ static void common_params_fit_impl(
             LOG_TRC("%s: full context of %" PRIu32 " fits on every device\n", func_name, hi);
             return true;
         }
-        std::vector<int64_t> mem_lo = measure(lo);
+        std::vector<int64_t> mem_lo = mem_base; // measured at lo above
         if (!fits(mem_lo)) {
             cparams->n_ctx = lo;
             for (size_t id = 0; id < nd; id++) {
@@ -625,6 +697,9 @@ static void common_params_fit_impl(
         targets.push_back(dmds_full[id].free - margins[id]);
         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
+    // the ctx sizing measures its own reserve on the final placement and takes it off these; the placement search
+    // below works on `targets` with a provisional reserve already taken off
+    const std::vector<int64_t> targets_full = targets;
 
     // utility: one line per device of what the fit arrived at, at a level the operator sees without -v
     auto log_result = [&](const char * func_name) {
@@ -634,24 +709,38 @@ static void common_params_fit_impl(
         for (const llama_model_tensor_buft_override * o = mparams->tensor_buft_overrides + n_tbo_user; o->pattern != nullptr; ++o) {
             n_tbo_fit++;
         }
-        LOG_INF("%s: fit result: n_ctx = %" PRIu32 ", n_gpu_layers = %d, %zu user + %zu fitted tensor overrides%s\n",
-            func_name, cparams->n_ctx, mparams->n_gpu_layers, n_tbo_user, n_tbo_fit,
+        LOG_INF("%s: fit result: n_ctx = %" PRIu32 ", n_gpu_layers = %d, %zu user + %zu fitted tensor overrides, "
+            "%" PRIu32 " sequence(s) to start and room held for %" PRIu32 " more%s\n",
+            func_name, cparams->n_ctx, mparams->n_gpu_layers, n_tbo_user, n_tbo_fit, n_seq_start, n_seq_res,
             placement_pinned ? " (placement pinned by user)" : "");
         for (size_t id = 0; id < nd; id++) {
             const int64_t used = dmds[id].mb.total();
-            LOG_INF("%s:   - %s: %6" PRId64 " MiB projected (model %" PRId64 " + context %" PRId64 " + compute %" PRId64 "), %6" PRId64 " MiB left vs. margin of %" PRId64 "%s\n",
+            const int64_t left = dmds[id].free - used;
+            LOG_INF("%s:   - %s: %6" PRId64 " MiB projected (model %" PRId64 " + context %" PRId64 " + compute %" PRId64 "), "
+                "%6" PRId64 " MiB left = %.1f reserved for %" PRIu32 " sequence(s) + %" PRId64 " margin + %" PRId64 " spare%s\n",
                 func_name, dev_names[id].c_str(), used/MiB, int64_t(dmds[id].mb.model)/MiB, int64_t(dmds[id].mb.context)/MiB,
-                int64_t(dmds[id].mb.compute)/MiB, (dmds[id].free - used)/MiB, margins[id]/MiB,
+                int64_t(dmds[id].mb.compute)/MiB, left/MiB, double(reserve[id])/MiB, n_seq_res, margins[id]/MiB, (left - reserve[id] - margins[id])/MiB,
                 (nd > 1 && mparams->tensor_split) ? (", split " + std::to_string(int(mparams->tensor_split[id]))).c_str() : "");
         }
     };
 
     if (placement_pinned) {
-        if (!fit_ctx_per_device(__func__, targets)) {
+        if (!fit_ctx_per_device(__func__, targets_full)) {
             throw common_params_fit_exception("the placement set by user does not fit within the margins at a context size of " + std::to_string(cparams->n_ctx) + ", abort");
         }
         log_result(__func__);
         return;
+    }
+
+    // the placement search below fills devices up to `targets`; take the reserve off first, measured on the placement
+    // we arrived with, so the layers it chooses leave room for the next sequence. It is measured again on the final
+    // placement in fit_ctx_per_device, where the recurrent layers may have moved.
+    if (n_seq_res > 0) {
+        measure_with_reserve(__func__, cparams->n_ctx);
+        for (size_t id = 0; id < nd; id++) {
+            targets[id] -= reserve[id];
+            LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB after the sequence reserve\n", __func__, id, targets[id]/MiB);
+        }
     }
 
     // step 3: iteratively fill the back to front with "dense" layers
@@ -891,7 +980,7 @@ static void common_params_fit_impl(
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
-        if (!fit_ctx_per_device(__func__, targets)) {
+        if (!fit_ctx_per_device(__func__, targets_full)) {
             throw common_params_fit_exception("the fitted placement does not fit within the margins at a context size of " + std::to_string(cparams->n_ctx) + ", abort");
         }
         log_result(__func__);
@@ -1040,7 +1129,7 @@ static void common_params_fit_impl(
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
-    if (!fit_ctx_per_device(__func__, targets)) {
+    if (!fit_ctx_per_device(__func__, targets_full)) {
         throw common_params_fit_exception("the fitted placement does not fit within the margins at a context size of " + std::to_string(cparams->n_ctx) + ", abort");
     }
     log_result(__func__);
@@ -1054,12 +1143,13 @@ enum common_params_fit_status common_fit_params(
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
         uint32_t n_ctx_min,
+        int32_t n_seq_reserve,
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, n_seq_reserve, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

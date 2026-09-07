@@ -13,6 +13,7 @@
 #   3. with everything pinned and nothing fitting, the fitter says so and fails - it does not report success
 #   4. -ngl N is an upper bound
 #   5. the pure-auto shape still fits
+#   6. one sequence's worth is held in reserve by default, measured per device; --fit-seq N pins the count
 #
 #   test-fit-rpc.sh <ggml-rpc-server> <llama-fit-params> <test-llama-archs>
 set -euo pipefail
@@ -137,10 +138,27 @@ ctx=$(sed -E 's/^-c ([0-9]+).*/\1/' "$test_dir/pinned_split.out")
 [ "$ctx" -ge 4096 ] && [ "$ctx" -le 16384 ] || fail "context $ctx outside [4096, 16384]"
 [ $(( ctx % 256 )) -eq 0 ] || fail "context $ctx not aligned"
 # the derived context must project within the margin on every device
-if ! grep -oE '[0-9]+ MiB left vs. margin of [0-9]+' "$test_dir/pinned_split.log" | awk '{ if ($1 + 0 < $7 + 0) bad = 1 } END { exit bad + 0 }'; then
+if ! grep -oE '[-0-9]+ spare' "$test_dir/pinned_split.log" | awk '{ if ($1 + 0 < 0) bad = 1 } END { exit bad + 0 }'; then
     cat "$test_dir/pinned_split.log" >&2
     fail "derived context projects over the margin"
 fi
+
+# 6. the sequence reserve: one more sequence's worth held back by default, measured per device; more when asked,
+#    none when told, and the pool is what is left - monotone in the count
+run_fit reserve_default 0 --fit-target "$targets_weights" -ngl 999 --n-cpu-moe 6 --tensor-split 1,1 --kv-unified --parallel 1
+grep -q "1 sequence(s) to start and room held for 1 more" "$test_dir/reserve_default.log" || fail "default reserve is not one sequence"
+grep -qE "[0-9.]+ reserved for 1 sequence" "$test_dir/reserve_default.log" || fail "reserve not reported per device"
+grep -oE '[-0-9]+ spare' "$test_dir/reserve_default.log" | awk '{ if ($1 + 0 < 0) bad = 1 } END { exit bad + 0 }' || fail "reserve pushed a device over its margin"
+run_fit reserve_none 0 --fit-target "$targets_weights" -ngl 999 --n-cpu-moe 6 --tensor-split 1,1 --kv-unified --parallel 1 --fit-seq 0
+run_fit reserve_eight 0 --fit-target "$targets_weights" -ngl 999 --n-cpu-moe 6 --tensor-split 1,1 --kv-unified --parallel 1 --fit-seq 8
+ctx_none=$(sed -E 's/^-c ([0-9]+).*/\1/' "$test_dir/reserve_none.out")
+ctx_one=$(sed -E 's/^-c ([0-9]+).*/\1/' "$test_dir/reserve_default.out")
+ctx_eight=$(sed -E 's/^-c ([0-9]+).*/\1/' "$test_dir/reserve_eight.out")
+[ "$ctx_none" -ge "$ctx_one" ] && [ "$ctx_one" -ge "$ctx_eight" ] || fail "pool not monotone in the reserve: none $ctx_none, one $ctx_one, eight $ctx_eight"
+[ "$ctx_none" -gt "$ctx_eight" ] || fail "reserving eight sequences left the pool unchanged ($ctx_none): the reserve is not being measured"
+# without a unified KV cache the ceiling cannot grow, so nothing is reserved
+run_fit reserve_split_kv 0 --fit-target "$targets_weights" -ngl 999 --n-cpu-moe 6 --tensor-split 1,1 --no-kv-unified --parallel 1 --fit-seq 8
+grep -q "room held for 0 more" "$test_dir/reserve_split_kv.log" || fail "a reserve was kept without a unified KV cache"
 
 # 3. everything pinned and nothing fits: a failure, said plainly
 run_fit all_pinned 1 --fit-target "$targets_half" -ngl 999 --tensor-split 1,1 -c 16384
