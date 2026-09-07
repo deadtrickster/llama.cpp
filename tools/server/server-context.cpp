@@ -2082,8 +2082,6 @@ private:
     // return true if at least one slot has been cleared
     // TODO: improve logic
     //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
         bool res = false;
 
@@ -2097,7 +2095,31 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                // an idle slot is a finished conversation waiting for its next turn.
+                // making room for a live request by dropping it is a SPILL, not a
+                // deletion: save it to the prompt cache first, exactly like the
+                // launch-time clear in get_available_slot() [TAG_IDLE_SLOT_CLEAR].
+                // this used to call prompt_clear() outright, and the only trace of
+                // the lost conversation was the "purging slot" line below.
+                if (prompt_cache) {
+                    const bool saved = slot.prompt_save(*prompt_cache);
+                    if (saved) {
+                        prompt_cache->update();
+                    } else {
+                        // prompt_save() refuses states above the cache limit. clearing
+                        // anyway would destroy the conversation, so leave this slot
+                        // alone and try the next idle one.
+                        SLT_WRN(slot, "%s", "state exceeds the prompt cache limit - keeping its context instead of purging it\n");
+                        continue;
+                    }
+
+                    SRV_WRN("purging slot %d with %zu tokens (saved to the prompt cache)\n", slot.id, slot.prompt.tokens.size());
+                } else {
+                    // no prompt cache to spill into. the idle conversation is complete
+                    // and the one asking for room is mid-request, so losing the idle
+                    // one is still the lesser evil - but it IS lost, say so.
+                    SRV_WRN("purging slot %d with %zu tokens (no prompt cache, conversation lost)\n", slot.id, slot.prompt.tokens.size());
+                }
 
                 slot.prompt_clear();
 
