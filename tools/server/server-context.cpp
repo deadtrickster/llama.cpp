@@ -1346,6 +1346,11 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    // the target memory holds state that is a function of the token history rather than
+    // per-token entries (a recurrent or hybrid model). such state cannot be shifted along
+    // with the KV: after an edit it is only valid up to the point the old and new prompts share
+    bool ctx_tgt_has_recurrent_state = false;
+
     // slots / clients
     std::vector<server_slot> slots;
 
@@ -1821,6 +1826,15 @@ private:
         }
 
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+
+        ctx_tgt_has_recurrent_state = llama_model_is_recurrent(model_tgt) || llama_model_is_hybrid(model_tgt);
+
+        if (ctx_tgt_has_recurrent_state && params_base.n_cache_reuse > 0) {
+            SRV_INF("cache_reuse = %d on a model with recurrent state: a chunk that matches past an edit is not shifted into place, "
+                    "because the recurrent state that goes with it was computed over the old history and cannot be moved; "
+                    "the prompt is rebuilt from the edit instead, which regenerates the attention KV the shift would have kept\n",
+                    params_base.n_cache_reuse);
+        }
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -4801,6 +4815,10 @@ private:
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
                                 }
 
+                                // the divergence: the old and new prompts agree on content up to here and nowhere
+                                // past it. everything the reuse loop below moves came from past this point.
+                                const int n_past_div = n_past;
+
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
                                     GGML_ASSERT(!slot.prompt.tokens.has_media());
@@ -4821,6 +4839,21 @@ private:
                                         }
 
                                         if (n_match >= (size_t) n_cache_reuse) {
+                                            if (ctx_tgt_has_recurrent_state) {
+                                                // the KV for these tokens could be moved, but the recurrent state cannot: it is
+                                                // one accumulator over the whole history, so it still contains everything
+                                                // between the divergence and here. keeping it (or a checkpoint taken past the
+                                                // divergence) had the model answering from tokens the client had deleted
+                                                // (measured on glm5next: "4 document parts" for a truth of "three", GLM-TODO
+                                                // T3.5). the state has to be rebuilt from the divergence, and rebuilding it
+                                                // runs the full stack over the same tokens, which regenerates their KV anyway -
+                                                // so a shift here is memory churn with nothing to show for it. leave n_past at
+                                                // the divergence; the checkpoint search below rolls back from there.
+                                                SLT_INF(slot, "chunk of %zu tokens matches at [%zu, %zu) -> [%zu, %zu) but the recurrent state past the divergence at %d cannot be shifted with it; rebuilding from %d\n",
+                                                        n_match, head_c, head_c + n_match, head_p, head_p + n_match, n_past_div, n_past_div);
+                                                break;
+                                            }
+
                                             SLT_TRC(slot, "reusing chunk with size %zu, shifting KV cache [%zu, %zu) -> [%zu, %zu)\n", n_match, head_c, head_c + n_match, head_p, head_p + n_match);
                                             //for (size_t i = head_p; i < head_p + n_match; i++) {
                                             //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
@@ -4844,6 +4877,26 @@ private:
                                     }
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
+
+                                    // content invalidation. a checkpoint is a snapshot of the memory after the first
+                                    // n_tokens of the OLD prompt. the shift above moved tokens from past the divergence
+                                    // to new positions, so a checkpoint taken past the divergence describes content the
+                                    // new prompt does not have - while its positions may now sit inside [0, pos_next),
+                                    // which is all the position-based search and prune further down can see. the
+                                    // context-shift path drops every checkpoint after it shifts (slot.prompt.clear());
+                                    // this is the same rule, keeping the ones that stay valid. the prune has to run
+                                    // before the search, not after it, or the stale snapshot is what gets restored.
+                                    if (n_past > n_past_div) {
+                                        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                            if (it->n_tokens > n_past_div) {
+                                                SLT_INF(slot, "erased context checkpoint taken past the divergence (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", divergence = %d, size = %.3f MiB)\n",
+                                                        it->pos_min, it->pos_max, it->n_tokens, n_past_div, (float) it->size() / 1024 / 1024);
+                                                it = slot.prompt.checkpoints.erase(it);
+                                            } else {
+                                                ++it;
+                                            }
+                                        }
+                                    }
                                 }
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
