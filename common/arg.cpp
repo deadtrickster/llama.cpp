@@ -1723,6 +1723,28 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--slot-quantum"}, "N",
+        string_format("[preempt] number of generated tokens after which a slot yields to waiting work, "
+            "snapshotting its state so it resumes producing an identical continuation "
+            "(default: %d, 0 = disabled). Only fires while other requests are queued, so an idle "
+            "server pays nothing", params.slot_quantum),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-quantum must be >= 0");
+            }
+            params.slot_quantum = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_QUANTUM"));
+    add_opt(common_arg(
+        {"--slot-resume-after"}, "N",
+        string_format("[preempt] resume a suspended generation even when new work is queued, once it has "
+            "waited this many ms (default: %d). Prevents a long generation from being starved by a "
+            "stream of short ones", params.slot_resume_after_ms),
+        [](common_params & params, int value) {
+            params.slot_resume_after_ms = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SLOT_RESUME_AFTER"));
+    add_opt(common_arg(
         {"--cache-disk"}, "N",
         string_format("[l2-spill] max size in MiB of the level-2 (disk) prompt cache, 0 = no limit "
             "(default: %d). Requires --slot-save-path; evicted prompt-cache entries are spilled there "

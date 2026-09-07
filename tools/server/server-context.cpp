@@ -1,3 +1,4 @@
+#include <deque>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -1194,6 +1195,12 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+
+    // [preempt] P2: where a yielded generation lives. It is neither queued (it
+    // has partial state that server_task cannot carry) nor running, so it needs
+    // a third place. FIFO: a task that yields goes to the BACK, so a slot that
+    // just yielded cannot immediately reclaim itself.
+    std::deque<std::unique_ptr<server_slot_suspended>> queue_suspended;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -3231,6 +3238,46 @@ private:
         }
 #endif
 
+        // [preempt] P2: put yielded generations back on a free slot.
+        //
+        // Policy: NEW work wins by default. A suspended task has already had a
+        // turn; the tasks in the deferred queue have not. Resuming eagerly would
+        // let the two long generations immediately reclaim both slots and make
+        // the whole mechanism a no-op.
+        //
+        // The ageing bonus is what stops that from becoming starvation: once the
+        // oldest suspended task has waited --slot-resume-after ms, it goes back
+        // regardless of what else is queued. Head-vs-tail re-entry was the open
+        // question here; this is tail-with-ageing, and both ends are measurable
+        // by setting --slot-resume-after to 0 (always resume) or a large value
+        // (never preempt the newcomers).
+        if (!queue_suspended.empty()) {
+            const bool     nobody_new = queue_tasks.queue_tasks_deferred_size() == 0;
+            const int64_t  waited_ms  = ggml_time_ms() - queue_suspended.front()->t_suspended_ms;
+            const bool     aged       = params_base.slot_resume_after_ms >= 0 &&
+                                        waited_ms >= params_base.slot_resume_after_ms;
+
+            if (nobody_new || aged) {
+                for (auto & slot : slots) {
+                    if (queue_suspended.empty()) {
+                        break;
+                    }
+                    if (slot.is_processing()) {
+                        continue;
+                    }
+                    auto st = std::move(queue_suspended.front());
+                    queue_suspended.pop_front();
+                    const int n_gen_at = st->n_decoded_at_suspend;
+                    if (!slot.resume(std::move(st))) {
+                        SLT_ERR(slot, "failed to resume a suspended generation (%d tokens in)\n", n_gen_at);
+                    } else if (aged && !nobody_new) {
+                        SLT_INF(slot, "resumed on the ageing bonus after %" PRId64 " ms, %zu still queued\n",
+                                waited_ms, queue_tasks.queue_tasks_deferred_size());
+                    }
+                }
+            }
+        }
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -4324,13 +4371,10 @@ private:
 
             slot.print_timings_tg();
 
-            // [preempt] P1 correctness harness. Not a scheduling policy - it
-            // suspends and IMMEDIATELY resumes the same slot, which exercises the
-            // full state capture/restore with nothing else changed. If the output
-            // of a run with LLAMA_SERVER_PREEMPT_SELFTEST=N set is not identical
-            // to one without it (temp 0, fixed seed), suspend() is losing state
-            // and no trigger policy built on top can be correct.
-            // Replaced by the real yield in P2/P3.
+            // [preempt] P1 correctness harness, kept: suspends and IMMEDIATELY
+            // resumes the same slot, exercising state capture with no scheduling
+            // involved. A run with LLAMA_SERVER_PREEMPT_SELFTEST=N must produce
+            // output identical to one without it (temp 0, fixed seed).
             {
                 static const int selftest_every = []() {
                     const char * e = std::getenv("LLAMA_SERVER_PREEMPT_SELFTEST");
@@ -4341,11 +4385,26 @@ private:
                     slot.stats.n_gen > 0 &&
                     slot.stats.n_gen % (uint64_t) selftest_every == 0) {
                     auto st = slot.suspend();
-                    if (st) {
-                        if (!slot.resume(std::move(st))) {
-                            SLT_ERR(slot, "%s", "preempt selftest: resume FAILED\n");
-                        }
+                    if (st && !slot.resume(std::move(st))) {
+                        SLT_ERR(slot, "%s", "preempt selftest: resume FAILED\n");
                     }
+                }
+            }
+
+            // [preempt] P3: the real trigger. Yield ONLY while other work is
+            // waiting - with an empty queue this costs nothing, which is the
+            // whole point ("when agents count and slots number match we better
+            // not yield"). Never during prefill: suspend() enforces that.
+            if (params_base.slot_quantum > 0 &&
+                slot.state == SLOT_STATE_GENERATING &&
+                slot.stats.n_gen > 0 &&
+                slot.stats.n_gen % (uint64_t) params_base.slot_quantum == 0 &&
+                queue_tasks.queue_tasks_deferred_size() > 0) {
+                auto st = slot.suspend();
+                if (st) {
+                    SLT_INF(slot, "yielded the slot after %d tokens, %zu waiting\n",
+                            st->n_decoded_at_suspend, queue_tasks.queue_tasks_deferred_size());
+                    queue_suspended.push_back(std::move(st));
                 }
             }
         });

@@ -637,6 +637,14 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_disk_mib =  0; // [l2-spill] level-2 disk cache limit in MiB, 0 = unlimited
 
+    // [preempt] decode quantum: after this many generated tokens a slot yields
+    // to waiting work, snapshotting its state so it resumes identically.
+    // 0 = disabled (run-to-completion, the historical behaviour).
+    int32_t slot_quantum        = 0;
+    // ageing bonus: a suspended task waiting longer than this resumes even when
+    // new work is still queued, so a long generation cannot be starved forever.
+    int32_t slot_resume_after_ms = 30000;
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
