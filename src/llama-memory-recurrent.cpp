@@ -953,13 +953,14 @@ bool llama_memory_recurrent::has_state() const {
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
-    // seq_add moves cell.pos and leaves r_l/s_l untouched. the state of a recurrent layer is a
-    // function of the exact token history it consumed, so after a shift the cache holds state
-    // computed over one history while claiming to sit at the positions of another - and nothing
-    // downstream can tell. the server's --cache-reuse then restores checkpoints and serves
-    // answers that still depend on tokens the client deleted (GLM-TODO T3.5). a shift is only
-    // safe when there is no state to go stale: the MTP draft context with every layer filtered.
-    return !has_state();
+    // the recurrent state is not a function of position: seq_add moves cell.pos and the state
+    // stays exactly what it was, which is right for a context shift (the history is real, the
+    // model may keep remembering it). it IS a function of content, so a caller that shifts because
+    // tokens were REMOVED from the history (the server's cache reuse) holds state computed over a
+    // history the client no longer has; that caller must roll the state back to the last point the
+    // two histories share (tools/server/server-context.cpp, cache reuse). measured on glm5next
+    // before that was done: "4 document parts" where the truth was "three" (GLM-TODO T3.5).
+    return true;
 }
 
 size_t llama_memory_recurrent::total_size() const {

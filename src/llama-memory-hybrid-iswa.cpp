@@ -136,7 +136,7 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * l
 }
 
 bool llama_memory_hybrid_iswa::get_can_shift() const {
-    // the recurrent half refuses while it holds state (see llama_memory_recurrent::get_can_shift)
+    // shifting is trivially supported for recurrent (see llama_memory_recurrent::get_can_shift)
     return mem_attn->get_can_shift() && mem_recr->get_can_shift();
 }
 

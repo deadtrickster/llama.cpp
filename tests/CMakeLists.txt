@@ -241,7 +241,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
     )
 
-    # a cache holding recurrent state must refuse position shifts; an attention-only cache must not
+    # every cache shifts positions (attention-only, recurrent, hybrid) except one that cannot apply a K-shift (M-RoPE)
     foreach(can_shift_model mamba-dense qwen35-dense nemotron_h-dense llama-dense)
         llama_test(
             test-memory-can-shift
