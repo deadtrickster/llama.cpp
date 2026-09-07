@@ -893,7 +893,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
-        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+        // [alloc-probe] a caller trying the larger of two layouts first has said so; do not call its
+        // expected failure an error - somebody grepping the log for OOM would read it as the process dying
+        GGML_LOG_ALLOC_FAIL("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s%s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err),
+                ggml_backend_alloc_is_probe() ? " (probe, expected)" : "");
         return nullptr;
     }
 

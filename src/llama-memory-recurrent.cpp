@@ -73,6 +73,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     r_l.resize(n_layer);
     s_l.resize(n_layer);
     p_l.resize(n_layer);
+    buft_pref_l.assign(n_layer, nullptr);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -90,6 +91,8 @@ llama_memory_recurrent::llama_memory_recurrent(
 
             dev_name = ggml_backend_dev_name(dev);
         }
+
+        buft_pref_l[i] = buft;
 
         LLAMA_LOG_DEBUG("%s, layer %3d: dev = %s\n", __func__, i, dev_name);
 
@@ -145,9 +148,13 @@ llama_memory_recurrent::llama_memory_recurrent(
 // moves. The live rows are staged through host memory. The new buffers are allocated while the old
 // ones still exist when there is room for both; when there is not, the old ones are freed first and
 // the retry needs room for the new size only - which is what makes growing by one row at the edge of
-// a device's memory possible at all. If even that fails the previous buffers are rebuilt from the
-// staging copy and false is returned; a failure of that rebuild is fatal, and is the one moment in
-// this function where the state is not in place somewhere.
+// a device's memory possible at all. Before anything is freed the device is asked what it has: a
+// request that could not fit even in the old buffers' place is refused without touching them, and the
+// side-by-side attempt is skipped (not made and reported as an error) when the device already says it
+// cannot fit. If the in-place allocation fails the previous buffers are rebuilt from the staging copy
+// and false is returned; if THAT fails too they are rebuilt in host memory - slower, but the context
+// stays usable and the next resize tries the device again. Only when host memory refuses under a
+// gigabyte is this a throw, and by then the staging vectors would have thrown first.
 //
 // Shrinking requires the dropped cells to be empty and the dropped ids to own no tail; the caller
 // removes those sequences first. Nothing changes on a refusal.
@@ -181,7 +188,8 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
     const uint32_t n_groups = 1 + n_rs_seq;
     const uint32_t n_copy   = std::min(size, n_new); // cells whose rows survive
 
-    // per layer: where and how the old tensors were allocated, so the new ones match
+    // per layer: where the tensors belong (not necessarily where the old ones are, after a host
+    // fallback) and how they are typed, so the new ones match
     std::vector<ggml_backend_buffer_type_t> buft_l(n_layer, nullptr);
     std::vector<ggml_type> type_r_l(n_layer, GGML_TYPE_F32);
     std::vector<ggml_type> type_s_l(n_layer, GGML_TYPE_F32);
@@ -204,7 +212,7 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
         if (!r_l[il]) {
             continue;
         }
-        buft_l[il]   = ggml_backend_buffer_get_type(r_l[il]->buffer);
+        buft_l[il]   = buft_pref_l[il] ? buft_pref_l[il] : ggml_backend_buffer_get_type(r_l[il]->buffer);
         type_r_l[il] = r_l[il]->type;
         type_s_l[il] = s_l[il]->type;
         st_r[il] = stage(r_l[il]);
@@ -226,7 +234,8 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
 
     using ctxs_bufs_t = std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>>;
 
-    auto build = [&](uint32_t n_cells, ctxs_bufs_t & out, std::vector<ggml_tensor *> & out_r, std::vector<ggml_tensor *> & out_s, std::vector<ggml_tensor *> & out_p) -> bool {
+    auto build = [&](uint32_t n_cells, ctxs_bufs_t & out, std::vector<ggml_tensor *> & out_r, std::vector<ggml_tensor *> & out_s, std::vector<ggml_tensor *> & out_p,
+                     ggml_backend_buffer_type_t buft_override = nullptr) -> bool {
         std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
         out.clear();
@@ -240,7 +249,8 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
             if (!buft_l[il]) {
                 continue;
             }
-            auto it = ctx_map.find(buft_l[il]);
+            const ggml_backend_buffer_type_t buft_il = buft_override ? buft_override : buft_l[il];
+            auto it = ctx_map.find(buft_il);
             if (it == ctx_map.end()) {
                 ggml_init_params params = {
                     /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
@@ -251,7 +261,7 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
                 if (!ctx) {
                     return false;
                 }
-                it = ctx_map.emplace(buft_l[il], ctx).first;
+                it = ctx_map.emplace(buft_il, ctx).first;
             }
             ggml_context * ctx = it->second.get();
 
@@ -287,9 +297,67 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
 
     uint32_t n_install = n_new;
 
-    // 3. allocate: next to the old buffers when both fit, otherwise in their place
-    if (!build(n_new, new_ctxs_bufs, new_r, new_s, new_p)) {
-        LLAMA_LOG_WARN("%s: no room for the old and the new state buffers at once (%u -> %u cells), freeing the old ones first\n", __func__, size, n_new);
+    // 3. allocate: next to the old buffers when both fit, otherwise in their place.
+    //
+    // Ask the devices first. Per buffer type the new buffers are the old ones scaled by cells (the rows
+    // are one contiguous 2D tensor per layer, so this is exact up to alignment padding), and the device
+    // reports what it has free. Three answers: room for both (allocate side by side, the state never
+    // leaves the device); room only once the old buffers are gone (free first); or not even that, which
+    // is refused here, before anything is touched - the alternative was to free the old buffers, fail the
+    // new ones, fail to rebuild the old ones and throw with the state in a staging vector.
+    bool room_for_both = true;
+    bool room_in_place = true;
+    {
+        std::map<ggml_backend_buffer_type_t, size_t> old_bytes;
+        for (const auto & [ctx, buf] : ctxs_bufs) {
+            old_bytes[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        }
+        for (const auto & [buft, bytes_old] : old_bytes) {
+            // the preferred buffer type is where the new ones go; after a host fallback that is not the old one
+            ggml_backend_buffer_type_t buft_new = buft;
+            for (int il = 0; il < n_layer; ++il) {
+                if (buft_l[il] && r_l[il] && ggml_backend_buffer_get_type(r_l[il]->buffer) == buft) {
+                    buft_new = buft_l[il];
+                    break;
+                }
+            }
+            const size_t bytes_new = (bytes_old / size) * n_new + (bytes_old % size) * n_new / size;
+            const size_t bytes_back = buft_new == buft ? bytes_old : 0; // freeing the old ones returns memory to the same device only
+
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft_new);
+            if (dev == nullptr) {
+                continue; // no device to ask (the CPU buffer type reports none); attempt and see
+            }
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+
+            if (bytes_new > free) {
+                room_for_both = false;
+            }
+            if (bytes_new > free + bytes_back) {
+                room_in_place = false;
+                LLAMA_LOG_WARN("%s: %u -> %u cells refused: %s needs %.1f MiB, has %.1f MiB free and %.1f MiB to give back\n", __func__,
+                        size, n_new, ggml_backend_buft_name(buft_new), bytes_new / 1048576.0, free / 1048576.0, bytes_back / 1048576.0);
+            }
+        }
+    }
+
+    if (!room_in_place) {
+        return false; // nothing was touched
+    }
+
+    bool built = false;
+    if (room_for_both) {
+        // a probe: the device said yes, but its accounting is not the allocator's, so a failure here is
+        // a fallback and not an error - the backends log it as such (ggml_backend_alloc_probe_begin)
+        ggml_backend_alloc_probe_begin();
+        built = build(n_new, new_ctxs_bufs, new_r, new_s, new_p);
+        ggml_backend_alloc_probe_end();
+    }
+
+    if (!built) {
+        LLAMA_LOG_INFO("%s: no room for the old and the new state buffers at once (%u -> %u cells), freeing the old ones first\n", __func__, size, n_new);
 
         ctxs_bufs.clear();
         std::fill(r_l.begin(), r_l.end(), nullptr);
@@ -298,11 +366,19 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
 
         if (!build(n_new, new_ctxs_bufs, new_r, new_s, new_p)) {
             LLAMA_LOG_ERROR("%s: failed to allocate state buffers for %u cells, restoring the previous %u\n", __func__, n_new, size);
-            if (!build(size, new_ctxs_bufs, new_r, new_s, new_p)) {
-                // the rows are in host memory and nowhere else; nothing here can be continued from
-                throw std::runtime_error("failed to restore the recurrent state buffers after a refused resize");
-            }
             n_install = size;
+            if (!build(size, new_ctxs_bufs, new_r, new_s, new_p)) {
+                // the device gave the old buffers back and then refused their size: something else took
+                // it in between. The rows are in host memory; put them in host buffers, where the context
+                // stays usable (the graph reads them through the scheduler, as with --no-kv-offload), and
+                // the next resize tries the device again.
+                ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
+                LLAMA_LOG_ERROR("%s: could not rebuild the previous %u cells where they were; rebuilding them in %s\n", __func__, size, ggml_backend_buft_name(buft_host));
+                if (!build(size, new_ctxs_bufs, new_r, new_s, new_p, buft_host)) {
+                    // host memory refused a buffer smaller than the staging copy it just gave us
+                    throw std::runtime_error("failed to restore the recurrent state buffers after a refused resize: no device and no host memory for them");
+                }
+            }
         }
     }
 

@@ -1131,7 +1131,7 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
 
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
     if (buffer == NULL) {
-        GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), size);
+        GGML_LOG_ALLOC_FAIL("%s: failed to allocate %s buffer of size %zu%s\n", __func__, ggml_backend_buft_name(buft), size, ggml_backend_alloc_is_probe() ? " (probe, expected)" : "");
         free_buffers(buffers, n_buffers);
         return false;
     }

@@ -122,6 +122,10 @@ GGML_API void ggml_log_callback_default(enum ggml_log_level level, const char * 
 #define GGML_LOG_DEBUG(...) ggml_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define GGML_LOG_CONT(...)  ggml_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
 
+// [alloc-probe] a failed allocation is an error unless the caller said it was a probe (ggml-backend.h)
+GGML_API bool ggml_backend_alloc_is_probe(void);
+#define GGML_LOG_ALLOC_FAIL(...) ggml_log_internal(ggml_backend_alloc_is_probe() ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
+
 #define GGML_DEBUG 0
 
 #if (GGML_DEBUG >= 1)

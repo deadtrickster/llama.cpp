@@ -42,6 +42,18 @@ extern "C" {
     GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
     GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
 
+    // [alloc-probe] An allocation the caller EXPECTS may fail, because it is trying the larger of two
+    // layouts first and has a fallback for the smaller: wrap the attempt in begin/end and the backends
+    // report a failed allocation at GGML_LOG_LEVEL_DEBUG instead of ERROR. Outside a probe nothing
+    // changes. Per thread, nests.
+    GGML_API void ggml_backend_alloc_probe_begin(void);
+    GGML_API void ggml_backend_alloc_probe_end  (void);
+    GGML_API bool ggml_backend_alloc_is_probe   (void);
+
+    // [alloc-probe] test hook: the next n allocations through ggml_backend_buft_alloc_buffer() on this
+    // thread fail as an out-of-memory would, so a fallback path can be driven without exhausting a device
+    GGML_API void ggml_backend_alloc_fail_next(int n);
+
     //
     // Backend buffer
     //

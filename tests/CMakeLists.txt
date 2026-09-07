@@ -254,6 +254,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         )
     endforeach()
 
+    # the sequence ceiling of a live context: raised, lowered, refused without a throw (recurrent and hybrid)
+    foreach(seq_max_model mamba-dense qwen35-dense)
+        llama_test(
+            test-seq-max-resize
+            NAME test-seq-max-resize-${seq_max_model}
+            LABEL main
+            ARGS "${MODEL_DIR}/${seq_max_model}.gguf"
+        )
+        set_tests_properties(test-seq-max-resize-${seq_max_model} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
+
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
         test-save-load-state

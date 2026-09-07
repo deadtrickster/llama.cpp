@@ -9,17 +9,39 @@
 // state rows are reallocated and copied); a pure-attention model exercises the unified-KV path, where
 // the ceiling is a number.
 //
+// Two failure shapes are driven as well, because both killed or would have killed a server:
+//
+//   - the side-by-side allocation a resize tries first is a PROBE with a fallback, and the backends must
+//     not report its failure as an error (the live log carried `cudaMalloc failed: out of memory` on every
+//     ceiling change, and anyone grepping for OOM read a healthy server as dying);
+//   - a resize whose every allocation is refused - the new size next to the old, the new size in the old
+//     one's place, the old size back - used to throw out of llama_set_n_seq_max() with the state in a
+//     staging vector. It must return false, keep the ceiling, and leave every sequence continuing exactly
+//     as before. The refusals are injected (ggml_backend_alloc_fail_next); on CPU the host fallback lands
+//     on the same buffer type, so what this proves is the control flow and the state, not the placement.
+//
 //   test-seq-max-resize <model.gguf>
 //
 // CPU only, so it can run next to a busy GPU.
 
 #include "llama.h"
 #include "common.h"
+#include "ggml-backend.h"
 
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
+
+// log capture: how many lines at each level since the last reset
+static int g_log_n_error = 0;
+static void count_log(enum ggml_log_level level, const char * text, void * user_data) {
+    if (level == GGML_LOG_LEVEL_ERROR) {
+        g_log_n_error++;
+    }
+    fputs(text, stderr);
+    (void) user_data;
+}
 
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); return 1; } } while (0)
 
@@ -95,20 +117,52 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
+    // ---- an allocation that is expected to fail must not be reported as an error ----
+    {
+        llama_log_set(count_log, nullptr);
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        const size_t huge = ((size_t) 1) << 60; // an exabyte: no host refuses to refuse this
+
+        g_log_n_error = 0;
+        ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(buft, huge);
+        CHECK(b == nullptr, "an exabyte allocated");
+        CHECK(g_log_n_error > 0, "a genuine allocation failure logged no error (the guard below would be vacuous)");
+        const int n_genuine = g_log_n_error;
+
+        g_log_n_error = 0;
+        ggml_backend_alloc_probe_begin();
+        b = ggml_backend_buft_alloc_buffer(buft, huge);
+        ggml_backend_alloc_probe_end();
+        CHECK(b == nullptr, "an exabyte allocated under a probe");
+        CHECK(g_log_n_error == 0, "a PROBE allocation failure logged %d error line(s) (%d outside a probe)", g_log_n_error, n_genuine);
+        CHECK(!ggml_backend_alloc_is_probe(), "probe depth did not return to zero");
+        printf("probe: %d error line(s) for a genuine failure, 0 for a probe\n", n_genuine);
+        llama_log_set(nullptr, nullptr);
+    }
+
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 0;
     llama_model * model = llama_model_load_from_file(argv[1], mp);
     CHECK(model, "failed to load %s", argv[1]);
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    const std::vector<llama_token> P = common_tokenize(vocab, "Once upon a time there was a little", true, false);
-    const std::vector<llama_token> Q = common_tokenize(vocab, "The quick brown fox jumps over the lazy", true, false);
-    CHECK(P.size() >= 4 && Q.size() >= 4, "tokenizer gave too few tokens");
+    // fixed token ids rather than text: the generated test models (test-llama-archs) carry a vocab but no
+    // tokenizer, and the test is about state rows, not about words
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    CHECK(n_vocab > 64, "vocab of %d tokens is too small", n_vocab);
+    auto fixed = [&](int seed, int n) {
+        std::vector<llama_token> v;
+        for (int i = 0; i < n; ++i) {
+            v.push_back(3 + (seed * 7919 + i * 104729) % (n_vocab - 3));
+        }
+        return v;
+    };
+    const std::vector<llama_token> P = fixed(1, 9);
+    const std::vector<llama_token> Q = fixed(2, 8);
 
-    const int N1 = 12, N2 = 12, N3 = 8;
+    const int N1 = 12, N2 = 12, N3 = 8, N4 = 6;
 
     // ---- reference: a context sized for two sequences from the start ----
-    std::vector<llama_token> R0, R0b, R1, R0c;
+    std::vector<llama_token> R0, R0b, R1, R0c, R0d, R1d;
     {
         llama_context * ref = make_ctx(model, 2);
         CHECK(ref, "reference context");
@@ -123,8 +177,12 @@ int main(int argc, char ** argv) {
         R0b = g[0];
         R1  = g[1];
         R1.insert(R1.begin(), q_first);
+        // a few more on both: the context under test compares these after a resize that failed every allocation
+        CHECK(generate(ref, {0, 1}, {R0b.back(), R1.back()}, {(llama_pos) (P.size() + N1 + N2), (llama_pos) (Q.size() + N2)}, N4, g) == 0, "ref: gen 0+1 more");
+        R0d = g[0];
+        R1d = g[1];
         CHECK(llama_memory_seq_rm(llama_get_memory(ref), 1, -1, -1), "ref: seq_rm 1");
-        CHECK(generate(ref, {0}, {R0b.back()}, {(llama_pos) (P.size() + N1 + N2)}, N3, g) == 0, "ref: gen 0 alone");
+        CHECK(generate(ref, {0}, {R0d.back()}, {(llama_pos) (P.size() + N1 + N2 + N4)}, N3, g) == 0, "ref: gen 0 alone");
         R0c = g[0];
         llama_free(ref);
     }
@@ -181,6 +239,34 @@ int main(int argc, char ** argv) {
     A1.insert(A1.begin(), q_first);
     CHECK(g[0] == R0b, "seq 0 after the raise diverged:\n  got %s\n  ref %s", show(g[0]).c_str(), show(R0b).c_str());
     CHECK(A1 == R1,    "seq 1 after the raise diverged:\n  got %s\n  ref %s", show(A1).c_str(), show(R1).c_str());
+
+    // ---- a raise whose every allocation is refused: refused, not thrown, and both sequences intact ----
+    // Three refusals cover the side-by-side probe, the in-place retry and the rebuild of the old size where
+    // it was; the fourth attempt (the old size in host memory) is allowed through.
+    {
+        g_log_n_error = 0;
+        llama_log_set(count_log, nullptr);
+        ggml_backend_alloc_fail_next(3);
+        bool threw = false;
+        bool ok    = true;
+        std::string what;
+        try {
+            ok = llama_set_n_seq_max(ctx, 3);
+        } catch (const std::exception & e) {
+            threw = true;
+            what  = e.what();
+        }
+        ggml_backend_alloc_fail_next(0);
+        llama_log_set(nullptr, nullptr);
+        CHECK(!threw, "llama_set_n_seq_max(3) THREW with every allocation refused: %s", what.c_str());
+        CHECK(!ok, "llama_set_n_seq_max(3) succeeded with every allocation refused");
+        CHECK(llama_n_seq_max(ctx) == 2, "a refused raise left n_seq_max at %u", llama_n_seq_max(ctx));
+        printf("refused raise: returned false, %d error line(s) said why\n", g_log_n_error);
+    }
+
+    CHECK(generate(ctx, {0, 1}, {R0b.back(), A1.back()}, {(llama_pos) (P.size() + N1 + N2), (llama_pos) (Q.size() + N2)}, N4, g) == 0, "gen 0+1 after the refused raise");
+    CHECK(g[0] == R0d, "seq 0 after the refused raise diverged:\n  got %s\n  ref %s", show(g[0]).c_str(), show(R0d).c_str());
+    CHECK(g[1] == R1d, "seq 1 after the refused raise diverged:\n  got %s\n  ref %s", show(g[1]).c_str(), show(R1d).c_str());
     const llama_token last0b = g[0].back();
 
     // the cost query at the new ceiling: the compute term can now be measured (ceiling >= 2)
@@ -201,7 +287,7 @@ int main(int argc, char ** argv) {
     CHECK(llama_set_n_seq_max(ctx, 1), "shrink to 1 refused with seq 1 removed");
     CHECK(llama_n_seq_max(ctx) == 1, "n_seq_max is %u after the shrink", llama_n_seq_max(ctx));
 
-    CHECK(generate(ctx, {0}, {last0b}, {(llama_pos) (P.size() + N1 + N2)}, N3, g) == 0, "gen 0 after the shrink");
+    CHECK(generate(ctx, {0}, {last0b}, {(llama_pos) (P.size() + N1 + N2 + N4)}, N3, g) == 0, "gen 0 after the shrink");
     CHECK(g[0] == R0c, "seq 0 after the shrink diverged:\n  got %s\n  ref %s", show(g[0]).c_str(), show(R0c).c_str());
 
     // out-of-range requests are refused without effect

@@ -825,6 +825,21 @@ bool llama_context::set_n_seq_max(uint32_t n_seq_max_new) {
 
     if (!memory->seq_max_resize(n_seq_max_new)) {
         LLAMA_LOG_ERROR("%s: the memory module refused n_seq_max = %u\n", __func__, n_seq_max_new);
+
+        // A refusal can still have MOVED the state: when the module had to free its buffers before it
+        // failed, it rebuilt the previous size in fresh ones (on the device, or in host memory). The graph
+        // kept for reuse holds the old tensor pointers, and the next decode would read freed memory
+        // through them - measured as a SIGSEGV/SIGABRT on the first decode after a refused raise, on
+        // both a recurrent and a hybrid model. Re-reserve: it rebuilds the graph and costs a fraction of
+        // a second on a refusal, which is rare.
+        sched_need_reserve = true;
+        try {
+            sched_reserve();
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: re-reserving compute buffers after the refusal failed (%s); left for the next decode\n", __func__, e.what());
+            sched_need_reserve = true;
+        }
+
         return false;
     }
 
@@ -846,15 +861,29 @@ bool llama_context::set_n_seq_max(uint32_t n_seq_max_new) {
         cparams.n_seq_max     = n_seq_max_cur;
         cparams.n_outputs_max = n_outputs_max_cur;
 
-        if (!memory->seq_max_resize(n_seq_max_cur)) {
-            // the new ids are empty, so this cannot refuse for state; only an allocation can fail here,
-            // and then the module has already rebuilt its previous buffers or thrown
+        bool back = false;
+        try {
+            // the new ids are empty, so this cannot refuse for state; an allocation can fail here, and then
+            // the module has rebuilt its previous buffers (on the device or, failing that, in host memory)
+            back = memory->seq_max_resize(n_seq_max_cur);
+        } catch (const std::exception & e2) {
+            LLAMA_LOG_ERROR("%s: the memory module threw returning to %u ids: %s\n", __func__, n_seq_max_cur, e2.what());
+        }
+        if (!back) {
             LLAMA_LOG_ERROR("%s: the memory module could not return to %u ids\n", __func__, n_seq_max_cur);
         }
 
-        // this configuration fitted before the call; if it does not now, that is the caller's problem to hear
+        // this configuration fitted before the call. If it does not now, say so and leave the reserve
+        // pending: the next decode retries it and reports its own failure - the caller of a REFUSED raise
+        // must never see a throw, that is how a server dies on a ceiling probe.
         sched_need_reserve = true;
-        sched_reserve();
+        try {
+            sched_reserve();
+        } catch (const std::exception & e2) {
+            LLAMA_LOG_ERROR("%s: re-reserving compute buffers for n_seq_max = %u failed after the rollback (%s); left for the next decode\n",
+                    __func__, n_seq_max_cur, e2.what());
+            sched_need_reserve = true;
+        }
 
         return false;
     }

@@ -36,11 +36,37 @@ const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name(buft);
 }
 
+// [alloc-probe] see ggml-backend.h
+static thread_local int g_alloc_probe_depth = 0;
+static thread_local int g_alloc_fail_next   = 0;
+
+void ggml_backend_alloc_probe_begin(void) {
+    g_alloc_probe_depth++;
+}
+
+void ggml_backend_alloc_probe_end(void) {
+    GGML_ASSERT(g_alloc_probe_depth > 0);
+    g_alloc_probe_depth--;
+}
+
+bool ggml_backend_alloc_is_probe(void) {
+    return g_alloc_probe_depth > 0;
+}
+
+void ggml_backend_alloc_fail_next(int n) {
+    g_alloc_fail_next = n;
+}
+
 ggml_backend_buffer_t ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     GGML_ASSERT(buft);
     if (size == 0) {
         // return a dummy buffer for zero-sized allocations
         return ggml_backend_buffer_init(buft, {}, NULL, 0);
+    }
+    if (g_alloc_fail_next > 0) {
+        g_alloc_fail_next--;
+        GGML_LOG_ALLOC_FAIL("%s: injected failure allocating %zu bytes on %s (%d more to go)\n", __func__, size, ggml_backend_buft_name(buft), g_alloc_fail_next);
+        return NULL;
     }
     return buft->iface.alloc_buffer(buft, size);
 }
@@ -2455,7 +2481,7 @@ static ggml_backend_buffer_t ggml_backend_cpu_buffer_type_alloc_buffer(ggml_back
     void * data = ggml_aligned_malloc(size);
 
     if (data == NULL) {
-        GGML_LOG_ERROR("%s: failed to allocate buffer of size %zu\n", __func__, size);
+        GGML_LOG_ALLOC_FAIL("%s: failed to allocate buffer of size %zu%s\n", __func__, size, ggml_backend_alloc_is_probe() ? " (probe, expected)" : "");
         return NULL;
     }
 

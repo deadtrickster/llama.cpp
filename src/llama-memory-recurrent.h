@@ -129,6 +129,11 @@ private:
 
     uint32_t n_seq_max = 1; // [seq-max] == size; both move together in seq_max_resize()
 
+    // [seq-max] per layer, the buffer type its state BELONGS on (the constructor's placement). A resize
+    // rebuilds there; when it cannot even rebuild the previous size there it falls back to host memory,
+    // and the next resize tries the preferred placement again - so the fallback is transient.
+    std::vector<ggml_backend_buffer_type_t> buft_pref_l;
+
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
