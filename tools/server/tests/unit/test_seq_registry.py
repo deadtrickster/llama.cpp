@@ -466,6 +466,7 @@ def _stream(sp: ServerProcess, prompt: str, n_predict: int, out: dict, tag: str)
     r = requests.post(url, json={
         "prompt": prompt, "n_predict": n_predict, "temperature": 0.0, "top_k": 1, "seed": 42,
         "cache_prompt": False, "stream": True, "ignore_eos": True}, stream=True, timeout=600)
+    assert r.status_code == 200, (tag, r.status_code, r.text[:300])
     t_first = None
     t_last = None
     gaps = []
@@ -488,6 +489,7 @@ def _stream(sp: ServerProcess, prompt: str, n_predict: int, out: dict, tag: str)
         text += d.get("content", "")
         if d.get("stop"):
             break
+    assert t_first is not None, (tag, "the stream ended without a token")
     out[tag] = {"status": r.status_code, "t_first": t_first, "t_last": t_last, "n": n,
                 "text": text, "max_gap": max(gaps) if gaps else 0.0}
 
@@ -581,6 +583,7 @@ def test_suspended_generation_gets_compute_within_the_deadline():
     log = os.path.join(tempfile.mkdtemp(), "srv.log")
     sp = _mk(log, n_slots=1, seq_max=1, quantum=8, n_ctx=4096)
     sp.slot_resume_after = bound_ms
+    sp.slot_deadline_preempt = True   # the teeth, default off: without it A only wins a seat that frees on its own
     sp.n_threads = 1              # the model's training context caps a generation at 2048 tokens; slow it instead
     sp.start(timeout_seconds=120)
     try:
@@ -608,3 +611,59 @@ def test_suspended_generation_gets_compute_within_the_deadline():
         f"(all waits: {waits}); B alone takes {t_alone:.0f} ms, so it waited for B to finish")
     # and the time-slicing changed nothing about what was generated
     assert out["r0"]["text"] == alone.body["content"], "A's continuation diverged across the swaps"
+
+
+def _decode_during_prefill(ratio) -> tuple:
+    """A generates 2000 tokens; 0.3 s in, B arrives with a ~1500-token prompt that takes ~47 batches of 32 to
+    prefill. Returns (A tokens that arrived between B's send and B's first token, B's prompt_n)."""
+    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log, n_slots=1, n_ctx=8192)
+    sp.n_batch = 32
+    sp.n_threads = 1
+    sp.decode_per_prefill = ratio
+    sp.start(timeout_seconds=120)
+    try:
+        _wait_ready(sp)
+        long_prompt = " ".join(PROMPTS[1:] * 8)   # ~1500 tokens: under the model's 2048 training context, ~47 batches of 32
+        n_prompt = len(_tokens(sp, long_prompt))
+        assert n_prompt >= 1000, n_prompt
+
+        stamps = []   # A's token arrival times
+        b = {}
+
+        def run_a():
+            url = f"http://{sp.server_host}:{sp.server_port}/completion"
+            r = requests.post(url, json={"prompt": PROMPTS[0], "n_predict": 2000, "temperature": 0.0, "top_k": 1,
+                                         "cache_prompt": False, "stream": True, "ignore_eos": True}, stream=True, timeout=600)
+            for raw in r.iter_lines():
+                if raw and raw.startswith(b"data: "):
+                    stamps.append(time.time())
+                    if json.loads(raw[6:]).get("stop"):
+                        break
+
+        ta = threading.Thread(target=run_a); ta.start()
+        time.sleep(0.3)
+        assert len(stamps) < 1900, "A finished before B was sent"
+        t_sent = time.time()
+        _stream(sp, long_prompt, 8, b, "B")
+        t_first = b["B"]["t_first"]
+        ta.join(timeout=600)
+    finally:
+        sp.stop()
+    n_during = sum(1 for t in stamps if t_sent <= t <= t_first)
+    return n_during, n_prompt
+
+
+def test_decode_keeps_its_own_clock_during_a_long_prefill():
+    """The third resource: positions in the batch loop. Merged (the default), A gets ONE token per prefill batch
+    of B's prompt - its rate is B's batch rate, however many seats and cells there are. --decode-per-prefill 8
+    runs eight decode-only batches between two prefill batches, so A gets ~9 tokens per prefill batch. Asserted
+    on A's tokens that arrived while B was prefilling, both arms on the same box."""
+    greedy, n_prompt = _decode_during_prefill(None)
+    ratio, _ = _decode_during_prefill(8)
+    n_prefill_batches = -(-n_prompt // 32)
+    print(f"A tokens during B's {n_prompt}-token prefill ({n_prefill_batches} batches): merged {greedy}, --decode-per-prefill 8: {ratio}")
+    assert greedy < 4 * n_prefill_batches, f"precondition: merged batching gave A {greedy} tokens over {n_prefill_batches} prefill batches"
+    assert ratio >= 3 * greedy, (
+        f"A got {ratio} tokens during B's prefill with --decode-per-prefill 8 against {greedy} merged "
+        f"({n_prefill_batches} prefill batches): decode did not get its own clock")

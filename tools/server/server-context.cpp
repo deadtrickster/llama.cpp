@@ -1371,6 +1371,9 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // [ratio] decode-only batches run since the last prefill batch, while both kinds of work exist
+    int n_decode_only = 0;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -2247,8 +2250,27 @@ private:
         GGML_ABORT("sequence is not in the registry");
     }
 
-    // finished sequences nobody is decoding, cheapest to give up first: empty ones, then least recently used
-    std::vector<server_sequence *> seq_evictable() {
+    // [evict] what an eviction is FOR decides who goes. A resident sequence has two costs and only one scales
+    // with depth: a FIXED cost per id (its state rows and compute-buffer share, which llama_seq_max_cost prices
+    // per device - ~437 MiB on GLM, the same at 1 token or 250k) and its cells, one per token. Rebuild is linear
+    // in tokens (prefill), so per MiB HELD a deep context is worth ~10x a shallow one: the shallow one pays the
+    // whole fixed cost for a few cells. Hence two orders, by which resource is short:
+    //   SEQ_NEED_ID     every eviction frees the same fixed cost; the only question is who is needed next: LRU
+    //   SEQ_NEED_CELLS  cells are short, the fixed cost is not; the shallowest go first, as many as it takes,
+    //                   rather than one deep victim that costs the most to rebuild
+    // Empty sequences go first either way: they hold an id and nothing else. The inputs are logged at the
+    // eviction (seq_evict) so the choice can be read back and argued with.
+    enum seq_need {
+        SEQ_NEED_ID,
+        SEQ_NEED_CELLS,
+    };
+
+    static const char * seq_need_str(seq_need need) {
+        return need == SEQ_NEED_ID ? "id-bound" : "token-bound";
+    }
+
+    // finished sequences nobody is decoding, cheapest to give up first for `need`
+    std::vector<server_sequence *> seq_evictable(seq_need need = SEQ_NEED_ID) {
         std::vector<server_sequence *> res;
         for (auto & s : seqs) {
             if (s.offloaded() || s.mid_flight() || seq_running(s)) {
@@ -2257,14 +2279,33 @@ private:
             res.push_back(&s);
         }
         std::sort(res.begin(), res.end(), [&](const server_sequence * a, const server_sequence * b) {
-            const bool ea = seq_prompt(*a).tokens.empty();
-            const bool eb = seq_prompt(*b).tokens.empty();
-            if (ea != eb) {
-                return ea;
+            const size_t na = seq_prompt(*a).tokens.size();
+            const size_t nb = seq_prompt(*b).tokens.size();
+            if ((na == 0) != (nb == 0)) {
+                return na == 0;
+            }
+            if (need == SEQ_NEED_CELLS && na != nb) {
+                return na < nb;
             }
             return a->t_last_used < b->t_last_used;
         });
         return res;
+    }
+
+    // the fixed cost of one more id, summed over devices, as the loaded model prices it right now (arithmetic on
+    // a cached measurement, no allocation). -1: the context cannot say
+    double seq_fixed_cost_mib() const {
+        ggml_backend_buffer_type_t bufts[16];
+        size_t sizes[16];
+        const int32_t n = llama_seq_max_cost(ctx_tgt, seq_ceiling() + 1, bufts, sizes, 16);
+        if (n < 0) {
+            return -1.0;
+        }
+        size_t total = 0;
+        for (int32_t i = 0; i < std::min<int32_t>(n, 16); ++i) {
+            total += sizes[i];
+        }
+        return total / 1048576.0;
     }
 
     // yielded generations waiting for a seat, oldest suspension first
@@ -2289,7 +2330,7 @@ private:
     // then its cells go and the record with them. A refused save (state over the cache limit) keeps the
     // sequence unless `force` - the caller decided losing it beats the alternative. No cache at all means
     // the conversation is lost, as it always was, and the log says so.
-    bool seq_evict(server_sequence & s, bool force, const char * why) {
+    bool seq_evict(server_sequence & s, bool force, const char * why, seq_need need = SEQ_NEED_ID) {
         GGML_ASSERT(!s.offloaded() && !s.mid_flight() && !seq_running(s));
 
         const auto & prompt = seq_prompt(s);
@@ -2298,6 +2339,20 @@ private:
         if (nt > 0) {
             const char * where = s.slot != nullptr ? "slot" : "sequence";
             const int    which = s.slot != nullptr ? s.slot->id : s.seq_id;
+
+            // [evict] the inputs to the choice, in one line: what the victim holds, what it costs to bring back at
+            // the measured prefill rate, how long it has been idle, and the regime the pool is in
+            {
+                const double tps     = metrics.prompt.time > 0 ? (double) metrics.prompt.count / metrics.prompt.time * 1e6 : 0.0;
+                const double rebuild = tps > 0 ? nt / tps : -1.0;
+                size_t n_ids = 0;
+                for (const auto & o : seqs) {
+                    n_ids += o.seq_id >= 0;
+                }
+                SRV_INF("evicting sequence %d [%s]: %zu tokens, idle %.1f s, rebuild ~%.1f s at %.0f t/s; pool: %zu ids of %u at ~%.0f MiB fixed each, %zu cells held of %d (%s)\n",
+                        s.seq_id, seq_need_str(need), nt, (ggml_time_us() - s.t_last_used) / 1e6, rebuild, tps,
+                        n_ids, seq_ceiling(), seq_fixed_cost_mib(), pool_cells_held(), llama_n_ctx(ctx_tgt), why);
+            }
 
             if (prompt_cache) {
                 const bool saved = prompt_state_save(*prompt_cache, ctx_tgt, ctx_dft, s.seq_id, prompt);
@@ -2638,9 +2693,8 @@ private:
             if (slot.is_processing()) {
                 break;
             }
-            if (slot.bound()) {
-                const bool released = slot.seat_release();
-                GGML_ASSERT(released);
+            if (slot.bound() && !slot.seat_release()) {
+                break; // an idle seat always releases; if it ever does not, keep it rather than lose its sequence
             }
             slots.pop_back();
         }
@@ -2679,8 +2733,10 @@ private:
                 (int) victim->stats.n_gen, (t_now - victim->t_seated_us) / 1000,
                 waiting.task ? waiting.task->id : -1, why, ggml_time_ms() - waiting.t_suspended_ms);
 
-        const bool released = victim->seat_release();
-        GGML_ASSERT(released);
+        if (!victim->seat_release()) {
+            // a generating seat with a task always releases; if it ever does not, nothing was touched
+            return nullptr;
+        }
 
         if (offload) {
             seq_offload(*v);
@@ -2727,17 +2783,18 @@ private:
     // stream, and one sequence's wall is nobody else's.
     //
 
-    // rung 1: the LRU finished conversation with cells leaves the pool. A refused save keeps it unless `force`
+    // rung 1: a finished conversation with cells leaves the pool - the shallowest first, cells being what is
+    // short here (SEQ_NEED_CELLS, see seq_evictable). A refused save keeps it unless `force`
     bool pool_evict_resident(bool force, const char * why) {
         if (!params_base.kv_unified) {
             return false;
         }
 
-        for (auto * s : seq_evictable()) {
+        for (auto * s : seq_evictable(SEQ_NEED_CELLS)) {
             if (seq_prompt(*s).tokens.empty()) {
                 continue;
             }
-            if (seq_evict(*s, force, why)) {
+            if (seq_evict(*s, force, why, SEQ_NEED_CELLS)) {
                 return true;
             }
         }
@@ -3120,9 +3177,11 @@ private:
                 const llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "a new conversation");
                 if (id >= 0) {
                     ret = seat_add("a new conversation");
-                    GGML_ASSERT(ret != nullptr); // the cap was checked above and nothing in between adds seats
-                    ret->seat_acquire(seq_create(id));
-                    bound_here = true;
+                    if (ret != nullptr) {
+                        ret->seat_acquire(seq_create(id));
+                        bound_here = true;
+                    }
+                    // else: the id stays free, nothing holds it; the task is deferred like any other
                 }
             }
         }
@@ -4466,12 +4525,15 @@ private:
                 const int64_t  waited_ms  = ggml_time_ms() - s.t_suspended_ms;
                 const bool     aged       = params_base.slot_resume_after_ms >= 0 &&
                                             waited_ms >= params_base.slot_resume_after_ms;
+                // the teeth: --slot-deadline-preempt (default off). Without it an aged sequence wins a seat that frees
+                // up on its own and nothing is taken from anyone, as before
+                const bool     force      = aged && params_base.slot_deadline_preempt;
 
                 // can this one be seated at all? an idle seat (when nobody new is waiting for it, or this one has aged
-                // past waiting), a new seat, or - past the deadline - a running generation's
+                // past waiting), a new seat, or - past the deadline, with the teeth on - a running generation's
                 const bool can_seat = ((nobody_new || aged) && seat_idle_pick() != nullptr) ||
                                       slots.size() < seat_cap() ||
-                                      aged;
+                                      force;
                 if (!can_seat) {
                     // oldest suspension first: if this one cannot be seated, the younger ones cannot either
                     break;
@@ -4487,7 +4549,7 @@ private:
                     // first) - never another yielded generation's, that would only move the problem along. Past the
                     // deadline, a running generation's (RULE 1).
                     llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "resuming a suspended generation");
-                    if (id < 0 && aged) {
+                    if (id < 0 && force) {
                         taken = pool_preempt_running(/*offload*/ true, s, "is past its suspension deadline and needs an id");
                         if (taken != nullptr) {
                             id = seq_id_free();
@@ -4504,7 +4566,7 @@ private:
                     // it waits for, and has to run to free them.
                     bool may_wait = false;
                     bool restored = seq_restore_with_room(s, id, may_wait);
-                    while (!restored && aged && may_wait) {
+                    while (!restored && force && may_wait) {
                         server_slot * t = pool_preempt_running(/*offload*/ true, s, "is past its suspension deadline and needs room");
                         if (t == nullptr) {
                             break;
@@ -4548,7 +4610,7 @@ private:
                 if (slot == nullptr) {
                     slot = seat_add("resuming a suspended generation");
                 }
-                if (slot == nullptr && aged) {
+                if (slot == nullptr && force) {
                     slot = pool_preempt_running(/*offload*/ false, s, "is past its suspension deadline and needs a seat");
                 }
                 if (slot == nullptr) {
@@ -4884,6 +4946,38 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // [ratio] the third resource: positions in the batch loop. A batch that carries a prefill chunk AND the
+        // generating slots' tokens gives each generating slot one token per batch, and a prefill batch takes as
+        // long as its chunk (3.1 s per 512 tokens on GLM): the generating slot's rate becomes the prefill's batch
+        // rate. It is seated, it is resident, and it is starving - measured 0.34 t/s against 43. Shrinking n_ubatch
+        // only collapses the prefill. The lever that works is interleaving whole batches: N decode-only batches
+        // between two prefill batches, prefill keeping its full chunk. --decode-per-prefill N; 0 keeps the greedy
+        // merge. A prefill with nothing generating beside it is never held back.
+        bool admit_prefill = true;
+        if (params_base.decode_per_prefill > 0 && !generating.empty()) {
+            bool prefill_pending = false;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    prefill_pending = true;
+                    break;
+                }
+            }
+            if (prefill_pending) {
+                if (n_decode_only < params_base.decode_per_prefill) {
+                    admit_prefill = false;
+                    n_decode_only++;
+                    SRV_DBG("prefill held back: decode-only batch %d of %d (%zu generating)\n",
+                            n_decode_only, params_base.decode_per_prefill, generating.size());
+                } else {
+                    n_decode_only = 0;
+                }
+            } else {
+                n_decode_only = 0;
+            }
+        } else {
+            n_decode_only = 0;
+        }
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
@@ -4905,6 +4999,11 @@ private:
                 // check if this is a child slot
                 if (slot.state == SLOT_STATE_WAIT_OTHER) {
                     SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
+                    return;
+                }
+
+                // [ratio] this batch is decode-only
+                if (!admit_prefill && (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED)) {
                     return;
                 }
 

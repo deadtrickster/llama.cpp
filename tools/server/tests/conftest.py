@@ -31,6 +31,13 @@ def stop_server_after_each_test():
 def load_server_presets(configure_worker_port, tmp_path_factory):
     # this will be run once per test session, before any tests
 
+    # LLAMA_TESTS_SKIP_LOAD_ALL=1: the model cache is already warm (LLAMA_CACHE points at it). load_all() starts
+    # and stops every preset back-to-back on one port; under a loaded box the next bind lands before the previous
+    # process has let the port go, the fixture errors, and every test of that worker errors at setup with
+    # "Server process died" - 367 of 425 verdicts in one run, none of them about the code under test.
+    if os.environ.get("LLAMA_TESTS_SKIP_LOAD_ALL") == "1":
+        return
+
     # serialize model downloads across parallel workers.
     root_tmp_dir = tmp_path_factory.getbasetemp().parent
     with FileLock(str(root_tmp_dir / "load_all.lock")):

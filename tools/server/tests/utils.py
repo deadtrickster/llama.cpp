@@ -102,6 +102,8 @@ class ServerProcess:
     spec_type: str | None = None
     slot_quantum: int | None = None
     slot_resume_after: int | None = None
+    slot_deadline_preempt: bool = False
+    decode_per_prefill: int | None = None
     spec_draft_n_min: int | None = None
     spec_draft_n_max: int | None = None
     spec_synth_len: float | None = None
@@ -260,6 +262,10 @@ class ServerProcess:
             server_args.extend(["--slot-quantum", self.slot_quantum])
         if self.slot_resume_after is not None:
             server_args.extend(["--slot-resume-after", self.slot_resume_after])
+        if self.slot_deadline_preempt:
+            server_args.append("--slot-deadline-preempt")
+        if self.decode_per_prefill is not None:
+            server_args.extend(["--decode-per-prefill", self.decode_per_prefill])
         if self.api_key:
             server_args.extend(["--api-key", self.api_key])
         if self.spec_draft_n_max:

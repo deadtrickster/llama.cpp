@@ -651,6 +651,8 @@ struct common_params {
     // ageing bonus: a suspended task waiting longer than this resumes even when
     // new work is still queued, so a long generation cannot be starved forever.
     int32_t slot_resume_after_ms = 30000;
+    bool    slot_deadline_preempt = false; // [deadline] past --slot-resume-after, take a seat/id/room from a running generation; see --slot-deadline-preempt
+    int32_t decode_per_prefill    = 0;     // [ratio] decode-only batches between two prefill batches while both exist (0 = merge them, the old greedy loop); see --decode-per-prefill
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
