@@ -246,8 +246,10 @@ def test_suspended_task_survives_shutdown(tmp_path, kv_unified):
     assert any(abs(n - n_suspended) <= 1 for n in spilled), \
         f"no spill entry of ~{n_suspended} tokens (A's prompt {n_prompt_a} + {m.group(1)} generated); on disk: {spilled}"
 
-    # fact 2: a new process serves A's conversation from that entry
-    sp2 = _mk(os.path.join(cache_dir, "srv2.log"), quantum=8, n_slots=1)
+    # fact 2: a new process serves A's conversation from that entry. Same KV layout as the first
+    # process: the spill files are keyed by a fingerprint that includes it, so a server started
+    # without --kv-unified indexes none of what a unified one spilled
+    sp2 = _mk(os.path.join(cache_dir, "srv2.log"), quantum=8, n_slots=1, kv_unified=kv_unified)
     sp2.cache_ram = 100
     sp2.slot_save_path = cache_dir
     sp2.start(timeout_seconds=120)
