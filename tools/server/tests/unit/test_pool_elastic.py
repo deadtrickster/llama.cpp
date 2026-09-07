@@ -170,10 +170,12 @@ def test_pool_static_keeps_the_old_refusal():
 # prices an id at nothing), so these run under LLAMA_SERVER_POOL_SELFTEST=<budget_mib>:<id_mib>, which
 # prices the device-less buffer type as a device of that size with that much per id - inert on CUDA. The
 # numbers below are worked from stories260K's 640 bytes per cell, padding of 256 and --pool-min-ctx 256
-# (derived from -b 256): a 3072-cell pool costs 1.875 MiB; one id 1.25 MiB; a raise needs the id plus one
-# more in reserve, 2.5 MiB, and the fake device has 5.5 - 3.125 = 2.375 MiB free, so the first raise is
-# refused by 0.125 MiB and the shrink gives back at least half the idle cells: 3072 -> 1792, below a
-# ~1,900-token entry. With the floor it stops at 2560, and the raise still fits.
+# (derived from -b 256). llama_n_ctx_cost prices a cell at 1,152 bytes here (640 of KV plus the compute
+# buffer's share), so a 3072-cell pool costs 3.375 MiB; one id 1.25 MiB; a raise needs the id plus one more
+# in reserve, 2.5 MiB, and the fake device of 6.5 MiB has 1.875 MiB free, so the first raise is refused by
+# 0.625 MiB (569 cells) and the shrink gives back at least half the idle cells: 3072 -> 1792, below a
+# ~1,940-token entry. With the floor it gives back the 569 and stops at 2560; the raise is asked again
+# from there and the seat goes to C when B is done.
 #
 # What is asserted is the LOG LINE (the state_read_meta error must not appear) and the TOKEN COUNTS
 # (prompt_n 1, cache_n the conversation): a silent full prefill answers correctly, and a test that only
@@ -186,11 +188,15 @@ PROMPT_B = "In a small village by the sea an old fisherman mended his nets every
 PROMPT_C = "The mountain pass was closed by snow and the travellers waited in the inn"
 
 POOL_R    = 3072
-SELFTEST  = "5.5:1.25"
+SELFTEST  = "6.5:1.25"
 N_A       = 1900       # tokens in the cached conversation; n_ctx_train of tinyllama2 is 2048
 
 
 def _mk_r(log_path: str, cache_dir: str, selftest: bool) -> ServerProcess:
+    # LLAMA_TESTS_KEEP_LOGS=<dir>: keep the server logs there instead of the temp dir, to read after a run
+    keep = os.environ.get("LLAMA_TESTS_KEEP_LOGS")
+    if keep:
+        log_path = os.path.join(keep, f"{os.getpid()}-{os.path.basename(os.path.dirname(log_path))}-{os.path.basename(log_path)}")
     sp = _mk(log_path)
     sp.n_ctx = POOL_R
     sp.n_threads = 1               # slow enough that B is still generating when C arrives
@@ -200,17 +206,6 @@ def _mk_r(log_path: str, cache_dir: str, selftest: bool) -> ServerProcess:
     if selftest:
         sp.env = {"LLAMA_SERVER_POOL_SELFTEST": SELFTEST}
     return sp
-
-
-def _wait_ready(sp: ServerProcess, timeout_s: int = 180):
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        r = sp.make_request("POST", "/completion", data={
-            "prompt": "a", "n_predict": 1, "temperature": 0.0, "cache_prompt": False})
-        if r.status_code == 200:
-            return
-        time.sleep(0.5)
-    raise AssertionError("server never became ready")
 
 
 def _gen(sp: ServerProcess, prompt: str, n_predict: int):
@@ -229,15 +224,10 @@ def _shrink_lines(log: str):
     return res
 
 
-def _cache_a_then_pressure(sp: ServerProcess, prompt_a: str):
-    """A is served in full and pushed into the prompt cache by B. Then B holds the only seat with a long
-    generation and C arrives while it runs: C needs an id, the fake device cannot pay for it without
-    cells, and the pool is asked to shrink - the trade the production log shows. Returns A's token count."""
-    r = _gen(sp, prompt_a, 4)
-    assert r.status_code == 200, r.body
-    n_a = r.body["tokens_evaluated"]
-    assert n_a >= N_A
-
+def _pressure(sp: ServerProcess):
+    """B holds the only seat with a long generation and C arrives while it runs: C needs an id, the fake
+    device cannot pay for it without cells, and the pool is asked to shrink - the trade the production
+    log shows. Whoever is in the prompt cache at that moment is what the shrink has to leave room for."""
     res = {}
 
     def go(k, prompt, n):
@@ -253,7 +243,30 @@ def _cache_a_then_pressure(sp: ServerProcess, prompt_a: str):
     for k in "BC":
         assert res[k].status_code == 200, (k, res[k].body)
 
+
+def _cache_a_then_pressure(sp: ServerProcess, prompt_a: str):
+    """A is served in full on the one id there is and stays resident. B arrives and needs that id: the raise
+    is asked first - the pool gives back what is idle beyond A's HELD cells, the id still does not fit -
+    and A is evicted into the prompt cache for it. Then the pressure phase, with A in the cache. No request
+    may precede A here: a sequence left by one would hold the id and make A's arrival the raise.
+    Returns A's token count."""
+    r = _gen(sp, prompt_a, 4)
+    assert r.status_code == 200, r.body
+    n_a = r.body["tokens_evaluated"]
+    assert n_a >= N_A
+
+    _pressure(sp)
+
     return n_a
+
+
+def _after_a_is_cached(log: str, n_a: int) -> str:
+    """the log from the moment A entered the prompt cache. Before it A is resident and its cells are HELD,
+    so a shrink there is judged against --pool-min-ctx, correctly; the floor is about entries in the cache"""
+    for m in re.finditer(r"purging (?:slot|sequence) \d+ with (\d+) tokens \(saved to the prompt cache", log):
+        if int(m.group(1)) >= n_a:
+            return log[m.start():]
+    raise AssertionError(f"the {n_a}-token conversation never entered the prompt cache: nothing is proven")
 
 
 def _return_of_a(sp: ServerProcess, prompt_a: str):
@@ -273,11 +286,10 @@ def test_shrink_keeps_room_for_the_largest_cached_conversation():
         sp = _mk_r(log, cache_dir, selftest=True)
         sp.start(timeout_seconds=180)
         try:
-            _wait_ready(sp)
             prompt_a = _prompt_of(sp, N_A)
             n_a = _cache_a_then_pressure(sp, prompt_a)
 
-            text = _log(log)
+            text = _after_a_is_cached(_log(sp.log_path), n_a)
             shrinks = _shrink_lines(text)
             refused = "idle beyond the floor" in text
             assert shrinks or refused, \
@@ -287,7 +299,7 @@ def test_shrink_keeps_room_for_the_largest_cached_conversation():
                     f"[pool] {n_from} -> {n_to} with {held} held leaves no room for the {n_a}-token cached conversation"
 
             t = _return_of_a(sp, prompt_a)
-            text = _log(log)
+            text = _log(sp.log_path)
             assert "failed to find" not in text, "state_read_meta could not place the cached conversation"
             assert "failed to load prompt from cache" not in text
             assert t["prompt_n"] == 1 and t["cache_n"] == n_a - 1, \
@@ -308,7 +320,6 @@ def test_cached_conversation_larger_than_the_pool_grows_it_back():
         sp = _mk_r(log1, cache_dir, selftest=False)
         sp.start(timeout_seconds=180)
         try:
-            _wait_ready(sp)
             prompt_a = _prompt_of(sp, N_A)
             r = _gen(sp, prompt_a, 4)
             assert r.status_code == 200, r.body
@@ -322,16 +333,15 @@ def test_cached_conversation_larger_than_the_pool_grows_it_back():
         sp = _mk_r(log2, cache_dir, selftest=True)
         sp.start(timeout_seconds=180)
         try:
-            _wait_ready(sp)
-            _cache_a_then_pressure(sp, prompt_a)
+            _pressure(sp)              # A stays on disk: nothing here touches it before the shrink
 
-            text = _log(log2)
+            text = _log(sp.log_path)
             shrinks = _shrink_lines(text)
             assert any(n_to < held + n_a + 2 for _, n_to, held in shrinks), \
                 f"the pool never shrank below the {n_a}-token entry ({shrinks}): the situation was not created, nothing is proven"
 
             t = _return_of_a(sp, prompt_a)
-            text = _log(log2)
+            text = _log(sp.log_path)
             assert "failed to find" not in text, "state_read_meta could not place the cached conversation"
             assert "failed to load prompt from cache" not in text
             assert t["prompt_n"] == 1 and t["cache_n"] == n_a - 1, \

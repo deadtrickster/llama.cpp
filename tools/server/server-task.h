@@ -715,6 +715,10 @@ struct server_prompt_cache {
     // from "refused for size" (a conversation about to be lost)
     bool contains(const server_prompt & prompt) const;
 
+    // [pool-restore] tokens of the largest entry in the RAM tier: what a shrink of the KV pool must leave
+    // room for, a restore being all-or-nothing. The disk tier is not counted - see pool_restore_floor()
+    size_t n_tokens_largest_resident() const;
+
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);

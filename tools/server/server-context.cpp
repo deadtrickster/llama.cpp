@@ -2715,6 +2715,35 @@ private:
         return params_base.pool_min_ctx > 0 ? (uint32_t) params_base.pool_min_ctx : (uint32_t) llama_n_batch(ctx_tgt);
     }
 
+    // [pool-restore] the cells a shrink must leave FREE beyond what is held. --pool-min-ctx, or what the largest
+    // conversation the prompt cache could hand back needs to come back - its tokens plus the batch margin -
+    // whichever is more. `n_largest` says which entry set it (0: --pool-min-ctx did).
+    //
+    // Why an entry at all: unheld cells are not idle. They are the capacity a cached conversation needs to
+    // return, and a restore is all-or-nothing - state_read_meta finds every one of its cells or fails, and the
+    // conversation is then prefilled from scratch (GLM, 2026-09-07: 141k tokens, 8.4 minutes, past the client's
+    // timeout, looping). The shrink that caused it looked at 157 cache entries' worth of capacity and saw idle.
+    //
+    // Why the LARGEST single entry and not the sum: a shrink leaves room for any ONE of them to come back, which
+    // is what a restore is; the sum would pin the pool at the size of everything ever cached and undo the trade.
+    // Why the RAM tier only: --cache-ram is the operator's statement of what is hot, LRU-bounded, so the floor
+    // moves with the workload; the disk tier is bounded only by --cache-disk (1 TiB in production) and adopts
+    // files from previous runs, so "largest on disk" is the deepest conversation this model has ever seen on
+    // this machine - a permanent pin. An entry that comes back from disk still gets its cells: the restore path
+    // grows the pool for it (pool_room_for_restore), so the cost of being outside the floor is a resize plus
+    // idle ids given back, not a reprefill. The floor is per device by construction: a cell count is one span
+    // across every device that holds cells, so keeping N cells keeps their bytes on each of them.
+    uint32_t pool_restore_floor(size_t & n_largest) const {
+        n_largest = prompt_cache ? prompt_cache->n_tokens_largest_resident() : 0;
+
+        const size_t min_ctx = pool_min_ctx();
+        if (n_largest == 0) {
+            return (uint32_t) min_ctx;
+        }
+
+        return (uint32_t) std::max<size_t>(min_ctx, n_largest + 1 + slots.size());
+    }
+
     static uint32_t pool_pad(size_t n) {
         return (uint32_t) GGML_PAD(std::max<size_t>(n, 256), 256);
     }
@@ -2884,15 +2913,22 @@ private:
             return false;
         }
 
-        const uint32_t n_cur   = pool_size();
-        const size_t   held    = pool_cells_held();
-        const uint32_t min_ctx = pool_min_ctx();
+        const uint32_t n_cur    = pool_size();
+        const size_t   held     = pool_cells_held();
         const size_t   headroom = (size_t) params_base.seq_max_headroom_mib * 1024 * 1024;
 
-        if (n_cur <= held + min_ctx) {
+        // [pool-restore] what stays free: --pool-min-ctx, or the largest cached conversation's way back
+        size_t n_largest = 0;
+        const uint32_t floor = pool_restore_floor(n_largest);
+        const std::string floor_str = n_largest > 0
+            ? string_format("the floor of %u: a %zu-token cached conversation plus the batch margin", floor, n_largest)
+            : string_format("the floor of %u: --pool-min-ctx", floor);
+
+        if (n_cur <= held + floor) {
+            SRV_INF("[pool] stays at %u cells: %zu held, nothing idle beyond %s (%s)\n", n_cur, held, floor_str.c_str(), why);
             return false;
         }
-        const size_t idle = n_cur - held - min_ctx; // cells that could go
+        const size_t idle = n_cur - held - floor; // cells that could go
 
         // per-cell cost per device, from what one padding step would add
         pool_cost_t step;
@@ -2922,7 +2958,7 @@ private:
             return false;
         }
         if (n_give > idle) {
-            SRV_INF("[pool] stays at %u cells: %zu would have to go and only %zu are idle beyond --pool-min-ctx %u (%s)\n", n_cur, n_give, idle, min_ctx, why);
+            SRV_INF("[pool] stays at %u cells: %zu would have to go and only %zu are idle beyond %s (%s)\n", n_cur, n_give, idle, floor_str.c_str(), why);
             return false;
         }
 
@@ -2934,7 +2970,17 @@ private:
             return false;
         }
 
-        return pool_resize(n_new, why);
+        if (!pool_resize(n_new, why)) {
+            return false;
+        }
+        {
+            std::string bytes_str;
+            for (const auto & [buft, per_cell] : step) {
+                bytes_str += string_format("%s%s %.1f MiB", bytes_str.empty() ? "" : ", ", ggml_backend_buft_name(buft), (n_cur - n_new) * (per_cell / 256) / 1048576.0);
+            }
+            SRV_INF("[pool] gave back %u cells (%s) for %s, keeping %zu held and %s\n", n_cur - n_new, bytes_str.c_str(), why, held, floor_str.c_str());
+        }
+        return true;
     }
 
     // [pool] admission asks whether the WHOLE conversation fits - its id (if none is free) and its cells (if the

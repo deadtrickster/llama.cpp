@@ -2457,6 +2457,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+size_t server_prompt_cache::n_tokens_largest_resident() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        if (!state.spilled()) {
+            res = std::max(res, state.prompt.tokens.size());
+        }
+    }
+
+    return res;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
