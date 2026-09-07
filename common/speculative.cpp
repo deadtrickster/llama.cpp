@@ -2617,7 +2617,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
-    result.n_outputs_max = params.n_parallel;
+    result.n_outputs_max = params.n_seq_max_eff(); // not n_parallel: llama reserves n_seq_max outputs and asserts on it
     result.n_outputs_max_per_seq = 1;
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
@@ -2631,7 +2631,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
         const int32_t per_seq = std::max(1, params_spec.n_max + 1);
-        result.n_outputs_max = params.n_parallel * per_seq;
+        result.n_outputs_max = params.n_seq_max_eff() * per_seq;
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }

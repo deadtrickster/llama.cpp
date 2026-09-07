@@ -2597,6 +2597,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--seq-max"}, "N",
+            string_format(
+                "number of sequence ids the context is allocated for, must be >= --parallel (default: %d, 0 = same as --parallel)\n"
+                "this is a residency ceiling for sequences that outlive their slot; today no id above --parallel is handed out\n"
+                "NOT FREE: every id in [0, N) is charged its full recurrent state at allocation, whether used or not\n"
+                "(hybrid/recurrent models; GLM-5.3-Flash: ~437 MiB per id with MTP rollback rows, ~146 MiB without)\n"
+                "and without --kv-unified the KV cache is split into N streams, so per-slot context shrinks to n_ctx/N",
+                params.n_seq_max),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("error: invalid value for --seq-max\n");
+                }
+                params.n_seq_max = value;
+            }
+        ).set_env("LLAMA_ARG_SEQ_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

@@ -155,6 +155,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+
+        // --seq-max is a ceiling on sequence ids; every slot needs its own id below it
+        if (params.n_seq_max > 0 && params.n_seq_max < params.n_parallel) {
+            SRV_ERR("--seq-max (%d) must be >= --parallel (%d)\n", params.n_seq_max, params.n_parallel);
+            return 1;
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
