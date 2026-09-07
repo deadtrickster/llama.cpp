@@ -182,9 +182,36 @@ static void common_params_fit_impl(
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
+    if (!tensor_buft_overrides) {
+        throw common_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
+    }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
-    const llama_model_params default_mparams = llama_model_default_params();
+
+    // Everything the user set is a constraint, everything else is derived:
+    //   - tensor buffer overrides the user passed (-ot, --cpu-moe, --n-cpu-moe) stay in front of the array; the fitter
+    //     only ever appends behind them. The loader takes the first matching pattern, so a user pin always wins and
+    //     every measurement below already includes its effect - "keep these experts in system memory" is a floor the
+    //     search builds on, not a reason to refuse.
+    //   - n_gpu_layers is an upper bound ("max. number of layers to store in VRAM"); the fitter may go below it.
+    //   - a user tensor_split pins the placement; the context is then the only thing left to size.
+    //   - the context is sized if and only if the user left it at 0.
+    size_t n_tbo_user = 0;
+    if (mparams->tensor_buft_overrides) {
+        for (const llama_model_tensor_buft_override * o = mparams->tensor_buft_overrides; o->pattern != nullptr; ++o) {
+            n_tbo_user++;
+        }
+        if (n_tbo_user + 1 >= llama_max_tensor_buft_overrides()) {
+            throw common_params_fit_exception("too many user tensor_buft_overrides for the fitter to add its own, abort");
+        }
+        if (mparams->tensor_buft_overrides != tensor_buft_overrides) {
+            for (size_t i = 0; i < n_tbo_user; i++) {
+                tensor_buft_overrides[i] = mparams->tensor_buft_overrides[i];
+            }
+        }
+    }
+    tensor_buft_overrides[n_tbo_user] = {nullptr, nullptr};
+    mparams->tensor_buft_overrides = tensor_buft_overrides;
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0; // hparams.n_gpu_layers
@@ -405,7 +432,7 @@ static void common_params_fit_impl(
                         //   - for MoE models only whole tensors can be assigned to devices, which we estimate to be <= 1/3 of a layer
                         //   - on average we expect a waste of 0.5 layers/tensors per device
                         //   - use slightly more than the expected average for nd devices to be safe
-                        const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
+                        const int64_t model_per_layer = sum_projected_model / std::max<uint32_t>(1, std::min(uint32_t(mparams->n_gpu_layers), hp_ngl));
                         sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
                     }
 
@@ -432,11 +459,7 @@ static void common_params_fit_impl(
                         const int64_t memory_reduction = (n_ctx_max - cparams->n_ctx) * bytes_per_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
-                        if (nd <= 1) {
-                            LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
-                            return;
-                        }
-                        LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
+                        LOG_TRC("%s: entire model should be fit by reducing context, verified per device below\n", __func__);
                     } else {
                         const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
                         LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
@@ -459,9 +482,16 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
 
-    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
-        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+    // the most layers the fitter may put on devices: what the user allowed, else all of them (+1 for the output layer)
+    const uint32_t ngl_max = mparams->n_gpu_layers >= 0 ?
+        std::min<uint32_t>(uint32_t(mparams->n_gpu_layers), hp_ngl + 1) : hp_ngl + 1;
+    if (mparams->n_gpu_layers >= 0) {
+        LOG_TRC("%s: n_gpu_layers set by user to %d -> treating it as an upper bound of %" PRIu32 " layers\n",
+            __func__, mparams->n_gpu_layers, ngl_max);
     }
+
+    // a placement is pinned when the user decided the split themselves; the fitter then only sizes the context
+    bool placement_pinned = false;
     if (nd > 1) {
         if (!tensor_split) {
             throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
@@ -469,19 +499,159 @@ static void common_params_fit_impl(
         if (mparams->tensor_split) {
             for (size_t id = 0; id < nd; id++) {
                 if (mparams->tensor_split[id] != 0.0f) {
-                    throw common_params_fit_exception("model_params::tensor_split already set by user, abort");
+                    placement_pinned = true;
+                    break;
                 }
             }
         }
+        if (placement_pinned) {
+            LOG_TRC("%s: tensor_split set by user -> keeping the placement, only the context is sized\n", __func__);
+        }
         if (mparams->split_mode == LLAMA_SPLIT_MODE_ROW) {
-            throw common_params_fit_exception("changing weight allocation for LLAMA_SPLIT_MODE_ROW not implemented, abort");
+            LOG_TRC("%s: changing weight allocation for LLAMA_SPLIT_MODE_ROW not implemented -> keeping the placement\n", __func__);
+            placement_pinned = true;
         }
     }
-    if (!tensor_buft_overrides) {
-        throw common_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
+    if (!n_ctx_auto && placement_pinned) {
+        throw common_params_fit_exception("context size, tensor_split and layer placement all set by user, nothing left to adjust, abort");
     }
-    if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
-        throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
+
+    // utility: the largest context at which every device meets its target, for the placement currently in mparams.
+    //   - a per-device search: the binding device is the one with the least room per token of context, and a sum over
+    //     devices cannot see it (device 0 short by 500 MiB and device 1 with 2 GiB spare is a surplus that OOMs)
+    //   - measured, not modelled: KV is linear in n_ctx but compute buffers need not be, so every candidate is checked
+    //   - the search is seeded with the current n_ctx (the sum-based estimate from above), which is usually close
+    //   - returns false if the placement does not fit even at the minimum context
+    const uint32_t n_ctx_align = 256 * n_streams;
+    auto fit_ctx_per_device = [&](const char * func_name, const std::vector<int64_t> & targets_local) -> bool {
+        auto measure = [&](uint32_t n_ctx) -> std::vector<int64_t> {
+            cparams->n_ctx = n_ctx;
+            dmds_t dmds = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            add_extra_memory(dmds);
+            std::vector<int64_t> ret;
+            ret.reserve(nd);
+            for (size_t id = 0; id < nd; id++) {
+                ret.push_back(dmds[id].mb.total());
+            }
+            return ret;
+        };
+        auto fits = [&](const std::vector<int64_t> & mem) -> bool {
+            for (size_t id = 0; id < nd; id++) {
+                if (mem[id] > targets_local[id]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        auto align_down = [&](uint32_t n_ctx) -> uint32_t {
+            return n_ctx - n_ctx % n_ctx_align;
+        };
+
+        if (!n_ctx_auto || n_ctx_max <= n_ctx_min_total) {
+            // nothing to size: the user pinned the context, asked for the full one, or the model's is at the minimum;
+            // the answer is still whether what is left fits
+            const std::vector<int64_t> mem = measure(cparams->n_ctx);
+            const bool ok = fits(mem);
+            if (!ok) {
+                for (size_t id = 0; id < nd; id++) {
+                    LOG_TRC("%s:   - %s: %6" PRId64 " MiB needed at the context size of %" PRIu32 " vs. target of %6" PRId64 "\n",
+                        func_name, dev_names[id].c_str(), mem[id]/MiB, cparams->n_ctx, targets_local[id]/MiB);
+                }
+            }
+            return ok;
+        }
+
+        uint32_t hi = n_ctx_max;
+        uint32_t lo = n_ctx_min_total;
+
+        LOG_TRC("%s: sizing the context per device for the final placement, range [%" PRIu32 ", %" PRIu32 "]:\n",
+            func_name, lo, hi);
+
+        std::vector<int64_t> mem_hi = measure(hi);
+        if (fits(mem_hi)) {
+            LOG_TRC("%s: full context of %" PRIu32 " fits on every device\n", func_name, hi);
+            return true;
+        }
+        std::vector<int64_t> mem_lo = measure(lo);
+        if (!fits(mem_lo)) {
+            cparams->n_ctx = lo;
+            for (size_t id = 0; id < nd; id++) {
+                LOG_TRC("%s:   - %s: %6" PRId64 " MiB needed at the minimum context vs. target of %6" PRId64 "\n",
+                    func_name, dev_names[id].c_str(), mem_lo[id]/MiB, targets_local[id]/MiB);
+            }
+            return false;
+        }
+
+        // the estimate we arrived with is the first probe, after that the binding device's secant
+        uint32_t cand = align_down(cparams->n_ctx);
+        for (int iter = 0; iter < 8 && hi - lo > n_ctx_align; iter++) {
+            if (!(cand > lo && cand < hi)) {
+                cand = hi;
+                for (size_t id = 0; id < nd; id++) {
+                    if (mem_hi[id] <= mem_lo[id]) {
+                        continue; // this device does not grow with the context, it cannot bind
+                    }
+                    const uint32_t cand_id = lo + uint32_t(
+                        int64_t(hi - lo) * (targets_local[id] - mem_lo[id]) / (mem_hi[id] - mem_lo[id]));
+                    cand = std::min(cand, cand_id);
+                }
+                cand = align_down(cand);
+                cand = std::max(cand, lo + n_ctx_align);
+                cand = std::min(cand, hi - n_ctx_align);
+                if (!(cand > lo && cand < hi)) {
+                    break;
+                }
+            }
+            const std::vector<int64_t> mem_cand = measure(cand);
+            if (fits(mem_cand)) {
+                lo     = cand;
+                mem_lo = mem_cand;
+                LOG_TRC("%s: context %" PRIu32 " fits\n", func_name, cand);
+            } else {
+                hi     = cand;
+                mem_hi = mem_cand;
+                LOG_TRC("%s: context %" PRIu32 " does not fit\n", func_name, cand);
+            }
+            cand = 0; // next probe from the secant
+        }
+        cparams->n_ctx = lo;
+        LOG_TRC("%s: context size set to %" PRIu32 " (largest that meets every device's target)\n", func_name, lo);
+        return true;
+    };
+
+    std::vector<int64_t> targets; // maximum acceptable memory use per device
+    targets.reserve(nd);
+    for (size_t id = 0; id < nd; id++) {
+        targets.push_back(dmds_full[id].free - margins[id]);
+        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
+    }
+
+    // utility: one line per device of what the fit arrived at, at a level the operator sees without -v
+    auto log_result = [&](const char * func_name) {
+        dmds_t dmds = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmds);
+        size_t n_tbo_fit = 0;
+        for (const llama_model_tensor_buft_override * o = mparams->tensor_buft_overrides + n_tbo_user; o->pattern != nullptr; ++o) {
+            n_tbo_fit++;
+        }
+        LOG_INF("%s: fit result: n_ctx = %" PRIu32 ", n_gpu_layers = %d, %zu user + %zu fitted tensor overrides%s\n",
+            func_name, cparams->n_ctx, mparams->n_gpu_layers, n_tbo_user, n_tbo_fit,
+            placement_pinned ? " (placement pinned by user)" : "");
+        for (size_t id = 0; id < nd; id++) {
+            const int64_t used = dmds[id].mb.total();
+            LOG_INF("%s:   - %s: %6" PRId64 " MiB projected (model %" PRId64 " + context %" PRId64 " + compute %" PRId64 "), %6" PRId64 " MiB left vs. margin of %" PRId64 "%s\n",
+                func_name, dev_names[id].c_str(), used/MiB, int64_t(dmds[id].mb.model)/MiB, int64_t(dmds[id].mb.context)/MiB,
+                int64_t(dmds[id].mb.compute)/MiB, (dmds[id].free - used)/MiB, margins[id]/MiB,
+                (nd > 1 && mparams->tensor_split) ? (", split " + std::to_string(int(mparams->tensor_split[id]))).c_str() : "");
+        }
+    };
+
+    if (placement_pinned) {
+        if (!fit_ctx_per_device(__func__, targets)) {
+            throw common_params_fit_exception("the placement set by user does not fit within the margins at a context size of " + std::to_string(cparams->n_ctx) + ", abort");
+        }
+        log_result(__func__);
+        return;
     }
 
     // step 3: iteratively fill the back to front with "dense" layers
@@ -560,7 +730,7 @@ static void common_params_fit_impl(
 
         mparams.tensor_split = tensor_split;
 
-        size_t itbo = 0;
+        size_t itbo = n_tbo_user;
         for (size_t id = 0; id < nd; id++) {
             il0 += ngl_per_device[id].n_full();
             for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
@@ -616,8 +786,8 @@ static void common_params_fit_impl(
     if (hp_nex > 0) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-        tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
-        tensor_buft_overrides[1] = {nullptr, nullptr};
+        tensor_buft_overrides[n_tbo_user]     = {pattern_moe_all.c_str(), cpu_buft};
+        tensor_buft_overrides[n_tbo_user + 1] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
@@ -639,15 +809,8 @@ static void common_params_fit_impl(
         }
 
         // reset
-        tensor_buft_overrides[0] = {nullptr, nullptr};
+        tensor_buft_overrides[n_tbo_user] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
-    }
-
-    std::vector<int64_t> targets; // maximum acceptable memory use per device
-    targets.reserve(nd);
-    for (size_t id = 0; id < nd; id++) {
-        targets.push_back(dmds_full[id].free - margins[id]);
-        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
 
     std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
@@ -672,7 +835,7 @@ static void common_params_fit_impl(
         LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
     }
     for (int id = nd - 1; id >= 0; id--) {
-        uint32_t n_unassigned = hp_ngl + 1;
+        uint32_t n_unassigned = ngl_max;
         for (size_t jd = id + 1; jd < nd; ++jd) {
             assert(n_unassigned >= ngl_per_device[jd].n_layer);
             n_unassigned -= ngl_per_device[jd].n_layer;
@@ -728,6 +891,10 @@ static void common_params_fit_impl(
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        if (!fit_ctx_per_device(__func__, targets)) {
+            throw common_params_fit_exception("the fitted placement does not fit within the margins at a context size of " + std::to_string(cparams->n_ctx) + ", abort");
+        }
+        log_result(__func__);
         return;
     }
 
@@ -873,6 +1040,10 @@ static void common_params_fit_impl(
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+    if (!fit_ctx_per_device(__func__, targets)) {
+        throw common_params_fit_exception("the fitted placement does not fit within the margins at a context size of " + std::to_string(cparams->n_ctx) + ", abort");
+    }
+    log_result(__func__);
 }
 
 enum common_params_fit_status common_fit_params(

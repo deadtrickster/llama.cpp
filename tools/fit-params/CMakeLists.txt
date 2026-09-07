@@ -23,3 +23,14 @@ target_compile_features(${TARGET} PRIVATE cxx_std_17)
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} RUNTIME)
 endif()
+
+# the fitter against two RPC-backed devices, with no GPU: refusals that became fits, and the context sized per device
+if (LLAMA_BUILD_TESTS AND UNIX AND TARGET ggml-rpc-server AND TARGET test-llama-archs)
+    add_test(
+        NAME test-fit-rpc
+        COMMAND bash ${PROJECT_SOURCE_DIR}/tests/test-fit-rpc.sh
+            $<TARGET_FILE:ggml-rpc-server>
+            $<TARGET_FILE:llama-fit-params>
+            $<TARGET_FILE:test-llama-archs>)
+    set_property(TEST test-fit-rpc PROPERTY LABELS main)
+endif()
