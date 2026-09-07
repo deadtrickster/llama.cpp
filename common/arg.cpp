@@ -2652,6 +2652,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         ).set_env("LLAMA_ARG_SEQ_MAX_HEADROOM").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
+            {"--pool-min-ctx"}, "N",
+            string_format(
+                "[pool] KV cells one conversation can always have (default: %d, 0 = derive: n_batch)\n"
+                "the one constant of the elastic pool: one sequence's fixed cost plus this many cells is held back on every device,\n"
+                "so a conversation can always make progress; the pool never shrinks below what is held plus this",
+                params.pool_min_ctx),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("error: invalid value for --pool-min-ctx\n");
+                }
+                params.pool_min_ctx = value;
+            }
+        ).set_env("LLAMA_ARG_POOL_MIN_CTX").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--pool-static"},
+            "[pool] pin the KV cell count to -c for the life of the server (default: the pool grows for tokens and shrinks for sequence ids under --kv-unified)",
+            [](common_params & params) {
+                params.pool_static = true;
+            }
+        ).set_env("LLAMA_ARG_POOL_STATIC").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
             {"--parallel-max"}, "N",
             string_format(
                 "the most server slots there may be (default: %d, 0 = derive: as many as the pool holds sequences, up to the sequence ceiling's cap)\n"

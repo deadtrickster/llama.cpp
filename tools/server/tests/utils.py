@@ -125,6 +125,8 @@ class ServerProcess:
     checkpoint_min_step: int | None = None
     cache_disk: int | None = None
     no_cache_idle_slots: bool = False
+    pool_min_ctx: int | None = None   # [pool] --pool-min-ctx
+    pool_static: bool = False         # [pool] --pool-static
     log_path: str | None = None
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
@@ -313,6 +315,10 @@ class ServerProcess:
             server_args.extend(["--cache-disk", self.cache_disk])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
+        if self.pool_min_ctx is not None:
+            server_args.extend(["--pool-min-ctx", self.pool_min_ctx])
+        if self.pool_static:
+            server_args.append("--pool-static")
         if self.ui_mcp_proxy:
             server_args.append("--ui-mcp-proxy")
         if self.server_tools:
