@@ -75,6 +75,13 @@ struct llama_context {
     // ok = false when the ceiling cannot change at all (non-unified cache, no memory, out of range)
     std::map<ggml_backend_buffer_type_t, size_t> seq_max_cost(uint32_t n_seq_max, bool & ok);
 
+    // [pool] change the KV cell count of this live context; false = refused, nothing changed
+    bool set_n_ctx(uint32_t n_ctx);
+
+    // [pool] extra bytes per buffer type that growing to n_ctx cells would need.
+    // ok = false when the cell count cannot change at all (non-unified cache, no memory, out of range)
+    std::map<ggml_backend_buffer_type_t, size_t> n_ctx_cost(uint32_t n_ctx, bool & ok);
+
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
 
@@ -372,12 +379,17 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // [seq-max] worst-case compute size at n_seqs, measured on a throwaway scheduler (no allocation)
-    bool compute_size_at(uint32_t n_seqs, std::vector<size_t> & sizes);
+    bool compute_size_at(uint32_t n_seqs, std::vector<size_t> & sizes, uint32_t n_kv_limit = 0);
 
     // [seq-max] marginal compute bytes per sequence, per backend, measured against the last reserve;
     // valid until the next sched_reserve()
     std::vector<size_t> backend_buf_seq_cost;
     bool                backend_buf_seq_cost_valid = false;
+
+    // [pool] the compute buffers' marginal cost per KV cell, per backend, measured by a dry run at
+    // half the pool; valid until the next sched_reserve()
+    std::vector<double> backend_buf_ctx_cost;
+    bool                backend_buf_ctx_cost_valid = false;
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

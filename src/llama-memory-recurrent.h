@@ -70,6 +70,9 @@ public:
     bool seq_max_resize(uint32_t n_seq_max) override;
     std::map<ggml_backend_buffer_type_t, size_t> seq_max_cost(uint32_t n_seq_max) const override;
 
+    // [pool] no KV cells here: a resize is a no-op that succeeds, and costs nothing
+    bool n_ctx_resize(uint32_t n_ctx) override { GGML_UNUSED(n_ctx); return true; }
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

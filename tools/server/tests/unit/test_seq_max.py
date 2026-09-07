@@ -88,7 +88,9 @@ def test_seq_max_above_parallel_starts_and_serves():
         props = sp.make_request("GET", "/props")
         assert props.status_code == 200
         assert props.body["total_slots"] == 2
-        assert props.body["default_generation_settings"]["n_ctx"] == 1024  # unified: the whole pool per slot
+        # unified: the whole pool per slot - and [pool] the pool grows for a conversation, so a slot's context is
+        # the model's (tinyllama2: 2048), not the 1024 cells -c starts the pool at
+        assert props.body["default_generation_settings"]["n_ctx"] == 2048
     finally:
         sp.stop()
 

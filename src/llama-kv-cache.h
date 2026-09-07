@@ -135,6 +135,13 @@ public:
 
     bool seq_max_resize(uint32_t n_seq_max) override;
 
+    bool n_ctx_resize(uint32_t n_ctx) override;
+    std::map<ggml_backend_buffer_type_t, size_t> n_ctx_cost(uint32_t n_ctx) const override;
+    void set_n_kv_limit(uint32_t n_kv) override;
+
+    // [pool] the cell count the full-memory context builds the graph for: the size, or the dry-run limit
+    uint32_t get_n_kv_full() const;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -159,6 +166,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    uint32_t get_n_seq_max() const { return n_seq_max; }
 
     bool get_has_shift() const;
 
@@ -278,6 +286,13 @@ private:
     mutable bool kpool_dirty = false;
 
     uint32_t n_seq_max = 1; // [seq-max] mutable under a unified cache, see seq_max_resize()
+
+    // [pool] a dry-run cap on the n_kv the full-memory context reports; 0 = none. see set_n_kv_limit()
+    uint32_t n_kv_limit = 0;
+
+    // [pool] the buffer type each layer's tensors belong on, in `layers` order: after a refused resize
+    // rebuilt them in host memory, the next resize puts them back where the constructor chose
+    std::vector<ggml_backend_buffer_type_t> buft_pref_l;
     const uint32_t n_stream  = 1;
 
     // required padding

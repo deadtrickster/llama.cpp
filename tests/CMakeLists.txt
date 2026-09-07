@@ -152,6 +152,7 @@ llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-memory-can-shift.cpp)
 llama_build(test-save-load-state.cpp)
 llama_build(test-seq-max-resize.cpp)
+    llama_build(test-n-ctx-resize.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -263,6 +264,19 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             ARGS "${MODEL_DIR}/${seq_max_model}.gguf"
         )
         set_tests_properties(test-seq-max-resize-${seq_max_model} PROPERTIES
+            FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
+
+    # the KV cell count of a live context: grown, shrunk with live cells packed, refused without a throw
+    foreach(n_ctx_model llama-dense qwen35-dense glm5next-moe)
+        llama_test(
+            test-n-ctx-resize
+            NAME test-n-ctx-resize-${n_ctx_model}
+            LABEL main
+            ARGS "${MODEL_DIR}/${n_ctx_model}.gguf"
+        )
+        set_tests_properties(test-n-ctx-resize-${n_ctx_model} PROPERTIES
             FIXTURES_REQUIRED generate-models
         )
     endforeach()

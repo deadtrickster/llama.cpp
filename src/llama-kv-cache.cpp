@@ -186,6 +186,7 @@ llama_kv_cache::llama_kv_cache(
 
                 layers.push_back(layer_share);
                 layers.back().il = il;
+                buft_pref_l.push_back(nullptr);
 
                 continue;
             }
@@ -247,6 +248,7 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+        buft_pref_l.push_back(buft);
     }
 
     if (reuse) {
@@ -1237,6 +1239,492 @@ bool llama_kv_cache::seq_max_resize(uint32_t n_seq_max_new) {
     n_seq_max = n_seq_max_new;
 
     return true;
+}
+
+// [pool] Resize the number of cells (the KV pool), keeping every live cell.
+//
+// The K/V rows are one contiguous tensor per layer with kv_size rows (K and non-transposed V: a row per
+// cell; transposed V: n_embd rows of kv_size elements), so a resize allocates new tensors and moves the
+// live cells across. Where a cell lands is a PLAN: a cell keeps its index when the new size holds it,
+// and when a shrink would cut live cells off the end they are packed toward the front, in order - the
+// metadata (position, sequences, extra) moves with the rows, so nothing above the cache notices. More
+// live cells than the new size holds is a refusal.
+//
+// The rows move on the device when there is room for the old and the new tensors at once (a same-device
+// copy per run of cells, no host traffic - a 1M-token conversation is 20 GiB of KV on GLM and would
+// take seconds through the host); otherwise they are staged through host memory, the old tensors are
+// freed and the new ones take their place, which is what makes growing at the edge of a device's memory
+// possible at all. Before anything is freed the device is asked what it has: a request that could not fit
+// even in the old tensors' place is refused without touching them, and the side-by-side attempt is a
+// probe (skipped, not reported as an error, when the device already says no). If the in-place allocation
+// fails the previous tensors are rebuilt from the staging copy and false is returned; if THAT fails too
+// they are rebuilt in host memory - slower, but the context stays usable and the next resize tries the
+// device again. The same contract as llama_memory_recurrent::seq_max_resize.
+//
+// A cache that views another cache's tensors (mem_other) cannot resize them; a pending position shift
+// is applied on the next decode and has to land before cells move; both are refused. Unified only, as
+// the sequence ceiling is: one stream per sequence would multiply every step by the stream count for a
+// layout the pool is not used with.
+bool llama_kv_cache::n_ctx_resize(uint32_t n_new) {
+    const uint32_t n_old = get_size();
+
+    if (n_new == n_old) {
+        return true;
+    }
+
+    if (other) {
+        LLAMA_LOG_ERROR("%s: this cache views another cache's tensors and cannot resize them\n", __func__);
+        return false;
+    }
+
+    if (n_stream != 1) {
+        LLAMA_LOG_ERROR("%s: the cell count can only change with a unified KV cache (n_stream = %u)\n", __func__, n_stream);
+        return false;
+    }
+
+    if (hparams.no_alloc) {
+        LLAMA_LOG_ERROR("%s: a no-alloc cache holds no tensors to resize\n", __func__);
+        return false;
+    }
+
+    if (n_new < 1 || n_new % n_pad != 0) {
+        LLAMA_LOG_ERROR("%s: n_ctx = %u is not a positive multiple of the padding (%u)\n", __func__, n_new, n_pad);
+        return false;
+    }
+
+    if (get_has_shift()) {
+        LLAMA_LOG_ERROR("%s: a position shift is pending; it has to be applied (llama_memory_update) before cells can move\n", __func__);
+        return false;
+    }
+
+    auto & cells = v_cells[0];
+
+    // 1. the plan: runs of cells {src, dst, n}, in ascending order of src
+    struct run { uint32_t src; uint32_t dst; uint32_t n; };
+    std::vector<run> plan;
+
+    const uint32_t n_used = cells.get_used();
+    const bool compact = n_new < cells.used_max_p1();
+
+    if (compact) {
+        if (n_used > n_new) {
+            LLAMA_LOG_ERROR("%s: cannot shrink to %u cells: %u are in use\n", __func__, n_new, n_used);
+            return false;
+        }
+        uint32_t dst = 0;
+        for (uint32_t i = 0; i < n_old; ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+            if (!plan.empty() && plan.back().src + plan.back().n == i) {
+                plan.back().n++;
+            } else {
+                plan.push_back({ i, dst, 1 });
+            }
+            dst++;
+        }
+    } else if (cells.used_max_p1() > 0) {
+        plan.push_back({ 0, 0, cells.used_max_p1() });
+    }
+
+    // 2. what the tensors look like, so the new ones match (layer.k/v may have moved to host after a
+    //    refused resize; the buffer type they BELONG on is where the constructor put them, kept here)
+    const size_t n_layer = layers.size();
+
+    struct shape { ggml_type type_k; int64_t ne0_k; std::string name_k; ggml_type type_v; int64_t ne0_v; std::string name_v; };
+    std::vector<shape> shape_l(n_layer);
+
+    std::vector<ggml_backend_buffer_type_t> buft_l(n_layer, nullptr);
+    for (size_t i = 0; i < n_layer; ++i) {
+        const ggml_tensor * k = layers[i].k;
+        const ggml_tensor * v = layers[i].v;
+        const ggml_tensor * t = k ? k : v;
+        GGML_ASSERT(t != nullptr);
+        buft_l[i]  = buft_pref_l.size() == n_layer && buft_pref_l[i] ? buft_pref_l[i] : ggml_backend_buffer_get_type(t->buffer);
+        shape_l[i] = { k ? k->type : GGML_TYPE_F32, k ? k->ne[0] : 0, k ? k->name : "",
+                       v ? v->type : GGML_TYPE_F32, v ? v->ne[0] : 0, v ? v->name : "" };
+    }
+
+    // bytes of a run in the given tensor's layout: rows for K and non-transposed V, a slice of every
+    // embedding row for transposed V. offsets are computed the same way, on the tensor's own kv_size
+    auto row_bytes = [](const ggml_tensor * t) { return t->nb[1]; };
+
+    // the transposed V layout stores n_kv elements per embedding row; a run's slice of one embedding
+    // row is contiguous, its offset (j * kv_size + cell) elements from the start
+    auto v_trans_slice = [](const ggml_tensor * v, uint32_t kv_size, uint32_t j, uint32_t cell) {
+        return ggml_row_size(v->type, (size_t) j * kv_size + cell);
+    };
+
+    if (v_trans) {
+        // ggml_row_size() is exact for whole blocks only; a quantized transposed V with runs off a block
+        // boundary cannot be sliced. FA is required for a quantized V anyway, and FA does not transpose.
+        for (const auto & layer : layers) {
+            if (layer.v && ggml_blck_size(layer.v->type) > 1) {
+                for (const auto & r : plan) {
+                    if (r.src % ggml_blck_size(layer.v->type) != 0 || r.dst % ggml_blck_size(layer.v->type) != 0 || r.n % ggml_blck_size(layer.v->type) != 0) {
+                        LLAMA_LOG_ERROR("%s: a quantized transposed V cache cannot move cells off a block boundary\n", __func__);
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. ask the devices first, as the recurrent module does: room for both, room in place, or neither
+    bool room_for_both = true;
+    bool room_in_place = true;
+    {
+        std::map<ggml_backend_buffer_type_t, size_t> old_bytes;
+        for (const auto & [ctx, buf] : ctxs_bufs) {
+            old_bytes[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+        }
+        for (const auto & [buft, bytes_old] : old_bytes) {
+            ggml_backend_buffer_type_t buft_new = buft;
+            for (size_t i = 0; i < n_layer; ++i) {
+                ggml_tensor * t = layers[i].k ? layers[i].k : layers[i].v;
+                if (ggml_backend_buffer_get_type(t->buffer) == buft) {
+                    buft_new = buft_l[i];
+                    break;
+                }
+            }
+            const size_t bytes_new  = (bytes_old / n_old) * n_new + (bytes_old % n_old) * n_new / n_old;
+            const size_t bytes_back = buft_new == buft ? bytes_old : 0;
+
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft_new);
+            if (dev == nullptr) {
+                continue;
+            }
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+
+            if (bytes_new > free) {
+                room_for_both = false;
+            }
+            if (bytes_new > free + bytes_back) {
+                room_in_place = false;
+                LLAMA_LOG_WARN("%s: %u -> %u cells refused: %s needs %.1f MiB, has %.1f MiB free and %.1f MiB to give back\n", __func__,
+                        n_old, n_new, ggml_backend_buft_name(buft_new), bytes_new / 1048576.0, free / 1048576.0, bytes_back / 1048576.0);
+            }
+        }
+    }
+
+    if (!room_in_place) {
+        return false; // nothing was touched
+    }
+
+    // 4. build a full set of tensors for n_cells cells, one no_alloc context per buffer type, as the constructor does
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+
+    using ctxs_bufs_t = std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>>;
+
+    auto build = [&](uint32_t n_cells, ctxs_bufs_t & out, std::vector<kv_layer> & out_layers, ggml_backend_buffer_type_t buft_override = nullptr) -> bool {
+        std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+        out.clear();
+        out_layers = layers; // il and the per-layer shape come from the old ones; the tensors are replaced below
+
+        for (size_t i = 0; i < n_layer; ++i) {
+            const ggml_backend_buffer_type_t buft_il = buft_override ? buft_override : buft_l[i];
+            auto it = ctx_map.find(buft_il);
+            if (it == ctx_map.end()) {
+                ggml_init_params params = {
+                    /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context * ctx = ggml_init(params);
+                if (!ctx) {
+                    return false;
+                }
+                it = ctx_map.emplace(buft_il, ctx).first;
+            }
+            ggml_context * ctx = it->second.get();
+
+            const shape & sh = shape_l[i];
+
+            ggml_tensor * k = nullptr;
+            ggml_tensor * v = nullptr;
+
+            if (sh.ne0_k > 0) {
+                k = ggml_new_tensor_3d(ctx, sh.type_k, sh.ne0_k, n_cells, n_stream);
+                ggml_set_name(k, sh.name_k.c_str());
+            }
+            if (sh.ne0_v > 0) {
+                // transposed V: ne[0] is the embedding, the cells are the rows - same shape either way,
+                // the layout difference is in how the graph views it
+                v = ggml_new_tensor_3d(ctx, sh.type_v, sh.ne0_v, n_cells, n_stream);
+                ggml_set_name(v, sh.name_v.c_str());
+            }
+
+            out_layers[i].k = k;
+            out_layers[i].v = v;
+            out_layers[i].k_stream.clear();
+            out_layers[i].v_stream.clear();
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                out_layers[i].k_stream.push_back(k ? ggml_view_2d(ctx, k, k->ne[0], n_cells, k->nb[1], s*k->nb[2]) : nullptr);
+                out_layers[i].v_stream.push_back(v ? ggml_view_2d(ctx, v, v->ne[0], n_cells, v->nb[1], s*v->nb[2]) : nullptr);
+            }
+        }
+
+        for (auto & [buft, ctx] : ctx_map) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            if (!buf) {
+                out.clear();
+                return false;
+            }
+            ggml_backend_buffer_clear(buf, 0);
+            out.emplace_back(std::move(ctx), buf);
+        }
+
+        return true;
+    };
+
+    // 5. moving the rows of a plan between two tensor sets (device to device, through views of the same
+    //    layout), or staging them to the host and putting them back. `size_src`/`size_dst` are the cell
+    //    counts of the tensors the offsets are computed on.
+    auto move_on_device = [&](const std::vector<kv_layer> & src_l, uint32_t size_src, std::vector<kv_layer> & dst_l, uint32_t size_dst) {
+        // a scratch context for the views; per layer, so it stays small even with a transposed V
+        for (size_t i = 0; i < n_layer; ++i) {
+            size_t n_views = 0;
+            for (const auto & r : plan) {
+                n_views += 2 + (v_trans && src_l[i].v ? 2 * src_l[i].v->ne[0] : 2);
+                GGML_UNUSED(r);
+            }
+            if (n_views == 0) {
+                continue;
+            }
+            ggml_init_params params = {
+                /*.mem_size   =*/ n_views * ggml_tensor_overhead() + 1024,
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx { ggml_init(params) };
+            GGML_ASSERT(ctx);
+
+            auto copy_rows = [&](ggml_tensor * src, ggml_tensor * dst, const run & r) {
+                ggml_tensor * vs = ggml_view_2d(ctx.get(), src, src->ne[0], r.n, row_bytes(src), (size_t) r.src * row_bytes(src));
+                ggml_tensor * vd = ggml_view_2d(ctx.get(), dst, dst->ne[0], r.n, row_bytes(dst), (size_t) r.dst * row_bytes(dst));
+                ggml_backend_view_init(vs);
+                ggml_backend_view_init(vd);
+                ggml_backend_tensor_copy(vs, vd);
+            };
+
+            for (const auto & r : plan) {
+                if (src_l[i].k) {
+                    copy_rows(src_l[i].k, dst_l[i].k, r);
+                }
+                if (!src_l[i].v) {
+                    continue;
+                }
+                if (!v_trans) {
+                    copy_rows(src_l[i].v, dst_l[i].v, r);
+                    continue;
+                }
+                ggml_tensor * vsrc = src_l[i].v;
+                ggml_tensor * vdst = dst_l[i].v;
+                const int64_t n_embd_v = vsrc->ne[0];
+                for (int64_t j = 0; j < n_embd_v; ++j) {
+                    ggml_tensor * vs = ggml_view_1d(ctx.get(), vsrc, r.n, v_trans_slice(vsrc, size_src, (uint32_t) j, r.src));
+                    ggml_tensor * vd = ggml_view_1d(ctx.get(), vdst, r.n, v_trans_slice(vdst, size_dst, (uint32_t) j, r.dst));
+                    ggml_backend_view_init(vs);
+                    ggml_backend_view_init(vd);
+                    ggml_backend_tensor_copy(vs, vd);
+                }
+            }
+        }
+
+        // the device copies may be asynchronous on the backend's stream; a synchronous read from the
+        // destination orders after them, and the old tensors are freed only once this returns
+        for (size_t i = 0; i < n_layer; ++i) {
+            ggml_tensor * t = dst_l[i].k ? dst_l[i].k : dst_l[i].v;
+            if (t && ggml_nbytes(t) > 0) {
+                uint8_t fence = 0;
+                ggml_backend_tensor_get(t, &fence, 0, 1);
+                break;
+            }
+        }
+    };
+
+    // staged rows: [layer][run] -> bytes; K rows, then V (rows, or every embedding row's slice in turn)
+    using staged_t = std::vector<std::vector<std::vector<uint8_t>>>;
+
+    auto stage = [&](const std::vector<kv_layer> & src_l, uint32_t size_src, staged_t & st_k, staged_t & st_v) -> size_t {
+        size_t n_bytes = 0;
+        st_k.assign(n_layer, {});
+        st_v.assign(n_layer, {});
+        for (size_t i = 0; i < n_layer; ++i) {
+            st_k[i].resize(plan.size());
+            st_v[i].resize(plan.size());
+            for (size_t ir = 0; ir < plan.size(); ++ir) {
+                const run & r = plan[ir];
+                if (src_l[i].k) {
+                    auto & b = st_k[i][ir];
+                    b.resize((size_t) r.n * row_bytes(src_l[i].k));
+                    ggml_backend_tensor_get(src_l[i].k, b.data(), (size_t) r.src * row_bytes(src_l[i].k), b.size());
+                    n_bytes += b.size();
+                }
+                if (!src_l[i].v) {
+                    continue;
+                }
+                auto & b = st_v[i][ir];
+                if (!v_trans) {
+                    b.resize((size_t) r.n * row_bytes(src_l[i].v));
+                    ggml_backend_tensor_get(src_l[i].v, b.data(), (size_t) r.src * row_bytes(src_l[i].v), b.size());
+                } else {
+                    const ggml_tensor * v = src_l[i].v;
+                    const size_t slice = ggml_row_size(v->type, r.n);
+                    b.resize(slice * v->ne[0]);
+                    for (int64_t j = 0; j < v->ne[0]; ++j) {
+                        ggml_backend_tensor_get(v, b.data() + j * slice, v_trans_slice(v, size_src, (uint32_t) j, r.src), slice);
+                    }
+                }
+                n_bytes += b.size();
+            }
+        }
+        return n_bytes;
+    };
+
+    // put staged rows into dst_l at `to` (the run's src for a rebuild of the old layout, its dst otherwise)
+    auto unstage = [&](std::vector<kv_layer> & dst_l, uint32_t size_dst, const staged_t & st_k, const staged_t & st_v, bool to_dst) {
+        for (size_t i = 0; i < n_layer; ++i) {
+            for (size_t ir = 0; ir < plan.size(); ++ir) {
+                const run & r = plan[ir];
+                const uint32_t to = to_dst ? r.dst : r.src;
+                if (dst_l[i].k) {
+                    const auto & b = st_k[i][ir];
+                    ggml_backend_tensor_set(dst_l[i].k, b.data(), (size_t) to * row_bytes(dst_l[i].k), b.size());
+                }
+                if (!dst_l[i].v) {
+                    continue;
+                }
+                const auto & b = st_v[i][ir];
+                if (!v_trans) {
+                    ggml_backend_tensor_set(dst_l[i].v, b.data(), (size_t) to * row_bytes(dst_l[i].v), b.size());
+                } else {
+                    ggml_tensor * v = dst_l[i].v;
+                    const size_t slice = ggml_row_size(v->type, r.n);
+                    for (int64_t j = 0; j < v->ne[0]; ++j) {
+                        ggml_backend_tensor_set(v, b.data() + j * slice, v_trans_slice(v, size_dst, (uint32_t) j, to), slice);
+                    }
+                }
+            }
+        }
+    };
+
+    ctxs_bufs_t new_ctxs_bufs;
+    std::vector<kv_layer> new_layers;
+
+    uint32_t n_install = n_new;
+    bool     moved_on_device = false;
+    size_t   n_staged = 0;
+
+    if (room_for_both) {
+        // a probe: the device said yes, but its accounting is not the allocator's, so a failure here is
+        // a fallback and not an error - the backends log it as such (ggml_backend_alloc_probe_begin)
+        ggml_backend_alloc_probe_begin();
+        const bool built = build(n_new, new_ctxs_bufs, new_layers);
+        ggml_backend_alloc_probe_end();
+        if (built) {
+            move_on_device(layers, n_old, new_layers, n_new);
+            moved_on_device = true;
+        }
+    }
+
+    if (!moved_on_device) {
+        LLAMA_LOG_INFO("%s: no room for the old and the new KV tensors at once (%u -> %u cells), staging %u live cells through the host\n",
+                __func__, n_old, n_new, n_used);
+
+        staged_t st_k, st_v;
+        n_staged = stage(layers, n_old, st_k, st_v);
+
+        ctxs_bufs.clear();
+        for (auto & layer : layers) {
+            layer.k = nullptr;
+            layer.v = nullptr;
+            layer.k_stream.clear();
+            layer.v_stream.clear();
+        }
+
+        if (build(n_new, new_ctxs_bufs, new_layers)) {
+            unstage(new_layers, n_new, st_k, st_v, /*to_dst*/ true);
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to allocate KV tensors for %u cells, restoring the previous %u\n", __func__, n_new, n_old);
+            n_install = n_old;
+            if (!build(n_old, new_ctxs_bufs, new_layers)) {
+                ggml_backend_buffer_type_t buft_host = ggml_backend_cpu_buffer_type();
+                LLAMA_LOG_ERROR("%s: could not rebuild the previous %u cells where they were; rebuilding them in %s\n", __func__, n_old, ggml_backend_buft_name(buft_host));
+                if (!build(n_old, new_ctxs_bufs, new_layers, buft_host)) {
+                    throw std::runtime_error("failed to restore the KV tensors after a refused resize: no device and no host memory for them");
+                }
+            }
+            unstage(new_layers, n_old, st_k, st_v, /*to_dst*/ false);
+        }
+    }
+
+    // 6. install the tensors; the cells follow only when the new size is in
+    ctxs_bufs = std::move(new_ctxs_bufs);
+    layers    = std::move(new_layers);
+
+    if (n_install != n_new) {
+        return false; // restored the old layout after a refused allocation
+    }
+
+    {
+        llama_kv_cells cells_new;
+        cells_new.resize(n_new);
+        for (const auto & r : plan) {
+            cells_new.set(r.dst, cells.cp(r.src, r.n));
+        }
+        cells = std::move(cells_new);
+    }
+
+    v_heads[0] = 0; // a search hint only
+
+    if (compact) {
+        // pooled keys are grouped by cell index in the kpool cache; a move regroups them
+        set_kpool_dirty();
+    }
+
+    LLAMA_LOG_INFO("%s: %u -> %u cells (%u live, %zu run(s), %s%s), KV now %.2f MiB\n",
+            __func__, n_old, n_new, n_used, plan.size(),
+            moved_on_device ? "moved on the device" : "staged through the host",
+            compact ? ", packed" : "",
+            (size_k_bytes() + size_v_bytes()) / (1024.0 * 1024.0));
+
+    return true;
+}
+
+// [pool] every cell costs the same: the tensors hold kv_size rows of every layer that lives on that
+// buffer type, so one more cell is one more kv_size-th of each buffer
+std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::n_ctx_cost(uint32_t n_new) const {
+    std::map<ggml_backend_buffer_type_t, size_t> res;
+
+    const uint32_t n_old = get_size();
+
+    if (other || n_new <= n_old) {
+        return res;
+    }
+
+    for (const auto & [_, buf] : ctxs_bufs) {
+        const size_t bytes = ggml_backend_buffer_get_size(buf.get());
+        res[ggml_backend_buffer_get_type(buf.get())] += (bytes / n_old) * (n_new - n_old) + (bytes % n_old) * (n_new - n_old) / n_old;
+    }
+
+    return res;
+}
+
+void llama_kv_cache::set_n_kv_limit(uint32_t n_kv) {
+    n_kv_limit = n_kv;
+}
+
+uint32_t llama_kv_cache::get_n_kv_full() const {
+    const uint32_t n = get_size();
+    return n_kv_limit > 0 ? std::min(n, n_kv_limit) : n;
 }
 
 bool llama_kv_cache::get_has_shift() const {
@@ -2732,7 +3220,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    n_kv = kv->get_n_kv_full();
 
     const uint32_t n_stream = kv->get_n_stream();
 

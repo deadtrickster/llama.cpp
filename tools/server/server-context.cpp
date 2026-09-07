@@ -1899,6 +1899,14 @@ private:
         SRV_INF("initializing, n_slots = %d, n_seq_max = %u, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_seq_max, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
 
+        if (pool_elastic()) {
+            SRV_INF("[pool] elastic: starts at %u cells, one conversation always has room for one id and %u cells (%s)\n",
+                    pool_size(), pool_min_ctx(), params_base.pool_min_ctx > 0 ? "--pool-min-ctx" : "derived from n_batch");
+        } else if (params_base.kv_unified) {
+            SRV_INF("[pool] static: %u cells for the life of the server (%s)\n", pool_size(),
+                    params_base.pool_static ? "--pool-static" : "the draft shares the target's KV tensors");
+        }
+
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
@@ -2456,7 +2464,7 @@ private:
     // [seq-max] one more id, paid for now. Asks the loaded model what one more sequence costs (its state rows,
     // exact; its compute-buffer share, measured) and the devices what they have free, then raises the ceiling
     // on every context that shares the ids and on the speculative state - all or nothing.
-    bool seq_ceiling_raise() {
+    bool seq_ceiling_raise(bool urgent = false) {
         const uint32_t n_cur = seq_ceiling();
         const uint32_t n_new = n_cur + 1;
 
@@ -2485,19 +2493,18 @@ private:
             }
         }
 
-        const size_t headroom = (size_t) params_base.seq_max_headroom_mib * 1024 * 1024;
+        // [pool] the raise must leave the floor: one more id after this one (this one takes the free id) and
+        // --pool-min-ctx cells. When the device says no, cells nobody holds are given back and it is asked again;
+        // past a deadline (urgent) the reserve itself may be spent
+        const pool_cost_t reserve = urgent ? pool_cost_t{} : pool_reserve(/*ids_free_after*/ 0, pool_cells_free(), pool_size());
 
         std::string cost_str;
-        for (const auto & [buft, bytes] : need) {
-            auto * dev = ggml_backend_buft_get_device(buft);
-            size_t free = 0;
-            size_t total = 0;
-            if (dev != nullptr) {
-                ggml_backend_dev_memory(dev, &free, &total);
+        if (!pool_fits(need, reserve, cost_str)) {
+            pool_cost_t need_all = need;
+            for (const auto & [buft, bytes] : reserve) {
+                need_all[buft] += bytes;
             }
-            cost_str += string_format("%s%s %.1f MiB (%.1f MiB free)", cost_str.empty() ? "" : ", ",
-                    ggml_backend_buft_name(buft), bytes / 1048576.0, free / 1048576.0);
-            if (dev != nullptr && bytes + headroom > free) {
+            if (!pool_shrink_for(need_all, "one more sequence id") || !pool_fits(need, reserve, cost_str)) {
                 SRV_INF("sequence ceiling stays at %u: one more sequence needs %s\n", n_cur, cost_str.c_str());
                 return false;
             }
@@ -2526,36 +2533,368 @@ private:
     // [seq-max] give ids back when nothing needs them: down to the highest live id, never below the seat
     // count. Each step is a reallocation and a re-reserve, so this runs in the quiet moment when every seat
     // is idle and nothing waits, not on every release.
-    void seq_ceiling_shrink() {
+    bool seq_ceiling_shrink() {
         if (!params_base.kv_unified) {
-            return;
+            return false;
         }
 
         const uint32_t n_cur = seq_ceiling();
         const uint32_t n_new = std::max<uint32_t>((uint32_t) params_base.n_parallel, (uint32_t) (seq_id_highest() + 1));
         if (n_new >= n_cur) {
-            return;
+            return false;
         }
 
         if (!llama_set_n_seq_max(ctx_tgt, n_new)) {
-            return;
+            return false;
         }
         if (ctx_dft != nullptr && !llama_set_n_seq_max(ctx_dft, n_new)) {
             llama_set_n_seq_max(ctx_tgt, n_cur);
-            return;
+            return false;
         }
         if (spec) {
             common_speculative_set_n_seq(spec.get(), n_new);
         }
 
         SRV_INF("lowered the sequence ceiling to %u\n", n_new);
+
+        return true;
+    }
+
+    //
+    // [pool] ONE budget. The operator's design: "there is VRAM and model weight and the rest is well - a pool";
+    // "i want a pool and whatever fits in here gets batched"; "i dont want to care about presizing".
+    //
+    // Two things draw from it and only one scales with depth: a sequence id (its state rows and compute share,
+    // llama_seq_max_cost: 437 MiB on GLM, the same at 1 token or 250k) and its cells (llama_n_ctx_cost: 19.25 KiB
+    // each on GLM). Before this the cells were carved out ONCE by -c and the ids competed for what was left - on
+    // GLM the ceiling stopped at 5 while 1 GiB of the pool held 54,613 cells nobody used, which is four more ids.
+    // Now the cell count moves too, and the trade is made at the margin in whichever direction is short:
+    //
+    //   cells short   grow the pool (a conversation's prompt, a batch that found no room, a state coming back);
+    //                 if the device has nothing, idle ids are given back first (seq_ceiling_shrink) and asked again
+    //   ids short     shrink the pool: cells nobody holds go back to the device, and the raise is asked again
+    //
+    // Ids and cells are not interchangeable at the margin - an id cannot be subdivided and a pool grown by less
+    // than one id's worth frees no id - and they do not have to be, because of THE FLOOR, the one constant left:
+    //
+    //   reserve   one conversation's worth, PER DEVICE: one more id's fixed cost (unless an id is free) plus
+    //             --pool-min-ctx cells (unless that many are free in the pool). --pool-min-ctx derives from
+    //             n_batch: the largest step the batch builder places at once, so the smallest pool in which any
+    //             request makes progress. It is the only knob; --seq-max-headroom stays what it was, the
+    //             allocator's own slack (measured: the CUDA pool grows once on the first big prefill).
+    //   rule      an ordinary grow or raise must leave the reserve on every device. Admission that needs nothing
+    //             new never consults it. The deadline path (RULE 1, a sequence past its sleep bound) may spend it:
+    //             that is what it is for - forward progress is structural, not something eviction has to be
+    //             clever enough to preserve.
+    //
+    // Nothing here caps a conversation to protect concurrency: one conversation taking the whole pool is correct,
+    // and concurrency is what yields (the ladder: evict, offload, suspend). The system never refuses; it degrades
+    // to swapping. -c is where the pool STARTS, nothing more; --pool-static pins it for anyone who wants that.
+    //
+    // A resize moves the live cells (on the device when both tensor sets fit, through host memory when they do
+    // not) and re-reserves the compute buffers, so it is not free: growth takes a quarter of the pool at a time
+    // and a shrink gives back at least half the idle cells, so the next request does not resize again.
+    //
+
+    using pool_cost_t = std::map<ggml_backend_buffer_type_t, size_t>;
+
+    bool pool_elastic() const {
+        if (!params_base.kv_unified || params_base.pool_static) {
+            return false;
+        }
+        // a draft that VIEWS the target's KV tensors (gemma4-assistant) would be left pointing at freed memory
+        if (ctx_dft != nullptr) {
+            char arch[64] = {0};
+            llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch));
+            if (std::strcmp(arch, "gemma4-assistant") == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    uint32_t pool_size() const {
+        return llama_n_ctx(ctx_tgt);
+    }
+
+    size_t pool_cells_free() const {
+        const size_t held = pool_cells_held();
+        const size_t n    = pool_size();
+        return held >= n ? 0 : n - held;
+    }
+
+    uint32_t pool_min_ctx() const {
+        return params_base.pool_min_ctx > 0 ? (uint32_t) params_base.pool_min_ctx : (uint32_t) llama_n_batch(ctx_tgt);
+    }
+
+    static uint32_t pool_pad(size_t n) {
+        return (uint32_t) GGML_PAD(std::max<size_t>(n, 256), 256);
+    }
+
+    size_t seq_ids_free() const {
+        size_t in_use = 0;
+        for (const auto & s : seqs) {
+            in_use += s.seq_id >= 0;
+        }
+        const uint32_t n = seq_ceiling();
+        return in_use >= n ? 0 : n - in_use;
+    }
+
+    // what growing the pool to n_new cells costs, on every context that holds cells. false: a context cannot
+    bool pool_grow_cost(uint32_t n_new, pool_cost_t & need) const {
+        for (llama_context * ctx : { ctx_tgt, ctx_dft }) {
+            if (ctx == nullptr) {
+                continue;
+            }
+            if (ctx == ctx_dft && llama_n_ctx(ctx_dft) != llama_n_ctx(ctx_tgt)) {
+                continue; // not in lockstep with the target: it is not resized either
+            }
+            ggml_backend_buffer_type_t bufts[16];
+            size_t sizes[16];
+            const int32_t n = llama_n_ctx_cost(ctx, n_new, bufts, sizes, 16);
+            if (n < 0) {
+                return false;
+            }
+            for (int32_t i = 0; i < std::min<int32_t>(n, 16); ++i) {
+                need[bufts[i]] += sizes[i];
+            }
+        }
+        return true;
+    }
+
+    // what one more id costs, on every context that shares the ids. false: a context cannot
+    bool pool_id_cost(pool_cost_t & need) const {
+        for (llama_context * ctx : { ctx_tgt, ctx_dft }) {
+            if (ctx == nullptr) {
+                continue;
+            }
+            ggml_backend_buffer_type_t bufts[16];
+            size_t sizes[16];
+            const int32_t n = llama_seq_max_cost(ctx, seq_ceiling() + 1, bufts, sizes, 16);
+            if (n < 0) {
+                return false;
+            }
+            for (int32_t i = 0; i < std::min<int32_t>(n, 16); ++i) {
+                need[bufts[i]] += sizes[i];
+            }
+        }
+        return true;
+    }
+
+    // the floor: one conversation's worth held back per device, given how many ids and cells would be free
+    pool_cost_t pool_reserve(size_t ids_free_after, size_t cells_free_after, uint32_t n_pool_after) const {
+        pool_cost_t res;
+        if (ids_free_after == 0) {
+            pool_id_cost(res);
+        }
+        const uint32_t min_ctx = pool_min_ctx();
+        if (cells_free_after < min_ctx) {
+            pool_grow_cost(pool_pad(n_pool_after + (min_ctx - cells_free_after)), res);
+        }
+        return res;
+    }
+
+    // does `need` fit on every device next to `reserve` and the headroom? `str` says what was asked, per device
+    bool pool_fits(const pool_cost_t & need, const pool_cost_t & reserve, std::string & str) const {
+        const size_t headroom = (size_t) params_base.seq_max_headroom_mib * 1024 * 1024;
+
+        pool_cost_t all = need;
+        for (const auto & [buft, bytes] : reserve) {
+            all[buft] += 0; // make sure the device is listed even when the need there is zero
+        }
+
+        bool fits = true;
+        str.clear();
+        for (const auto & [buft, bytes] : all) {
+            const size_t res = reserve.count(buft) ? reserve.at(buft) : 0;
+            auto * dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr) {
+                // no device to ask (the CPU buffer type reports none): attempt and see, as the resize does
+                str += string_format("%s%s %.1f MiB + %.1f MiB reserve (no device to ask)", str.empty() ? "" : ", ",
+                        ggml_backend_buft_name(buft), bytes / 1048576.0, res / 1048576.0);
+                continue;
+            }
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            str += string_format("%s%s %.1f MiB + %.1f MiB reserve (%.1f MiB free)", str.empty() ? "" : ", ",
+                    ggml_backend_buft_name(buft), bytes / 1048576.0, res / 1048576.0, free / 1048576.0);
+            if (bytes + res + headroom > free) {
+                fits = false;
+            }
+        }
+        return fits;
+    }
+
+    // the cell count of every context that holds cells moves together, all or nothing
+    bool pool_resize(uint32_t n_new, const char * why) {
+        const uint32_t n_cur = pool_size();
+        const bool dft_too = ctx_dft != nullptr && llama_n_ctx(ctx_dft) == n_cur;
+
+        if (!llama_set_n_ctx(ctx_tgt, n_new)) {
+            return false;
+        }
+        if (dft_too && !llama_set_n_ctx(ctx_dft, n_new)) {
+            llama_set_n_ctx(ctx_tgt, n_cur);
+            return false;
+        }
+
+        SRV_INF("[pool] %u -> %u cells (%zu held, %zu ids of %u): %s\n", n_cur, n_new, pool_cells_held(), seq_ceiling() - seq_ids_free(), seq_ceiling(), why);
+        SRV_DBG("%s", n_new > n_cur ? "__TEST_TAG_POOL_GROW__\n" : "__TEST_TAG_POOL_SHRINK__\n");
+
+        return true;
+    }
+
+    // cells are short by n_more: grow the pool if the device (after idle ids are given back) can pay for it and
+    // the reserve stays. `urgent` may spend the reserve (RULE 1). false: not grown, nothing changed
+    bool pool_grow(size_t n_more, bool urgent, const char * why) {
+        if (!pool_elastic() || n_more == 0) {
+            return false;
+        }
+
+        const uint32_t n_cur = pool_size();
+        const size_t   held  = pool_cells_held();
+
+        // a quarter of the pool at a time, unless only the exact need fits
+        std::vector<uint32_t> targets;
+        targets.push_back(pool_pad(n_cur + std::max<size_t>(n_more, n_cur / 4)));
+        if (pool_pad(n_cur + n_more) != targets.back()) {
+            targets.push_back(pool_pad(n_cur + n_more));
+        }
+
+        for (int pass = 0; pass < 2; ++pass) {
+            for (const uint32_t n_new : targets) {
+                pool_cost_t need;
+                if (!pool_grow_cost(n_new, need)) {
+                    SRV_INF("[pool] stays at %u cells: a context cannot change its cell count\n", n_cur);
+                    return false;
+                }
+                const pool_cost_t reserve = urgent ? pool_cost_t{} : pool_reserve(seq_ids_free(), n_new > held ? n_new - held : 0, n_new);
+
+                std::string str;
+                if (pool_fits(need, reserve, str)) {
+                    if (pool_resize(n_new, why)) {
+                        SRV_INF("[pool] grew for %zu more cells: %s\n", n_more, str.c_str());
+                        return true;
+                    }
+                    return false;
+                }
+                SRV_DBG("[pool] %u -> %u cells does not fit: %s\n", n_cur, n_new, str.c_str());
+            }
+            // cells short, ids idle: give the idle ids back and ask once more
+            if (pass == 0 && !seq_ceiling_shrink()) {
+                break;
+            }
+        }
+
+        SRV_INF("[pool] stays at %u cells: %zu more do not fit (%s)\n", n_cur, n_more, why);
+        return false;
+    }
+
+    // ids are short by `need` bytes per device: shrink the pool so the cells nobody holds pay for it, keeping
+    // --pool-min-ctx free. false: not shrunk, nothing changed
+    bool pool_shrink_for(const pool_cost_t & need, const char * why) {
+        if (!pool_elastic()) {
+            return false;
+        }
+
+        const uint32_t n_cur   = pool_size();
+        const size_t   held    = pool_cells_held();
+        const uint32_t min_ctx = pool_min_ctx();
+        const size_t   headroom = (size_t) params_base.seq_max_headroom_mib * 1024 * 1024;
+
+        if (n_cur <= held + min_ctx) {
+            return false;
+        }
+        const size_t idle = n_cur - held - min_ctx; // cells that could go
+
+        // per-cell cost per device, from what one padding step would add
+        pool_cost_t step;
+        if (!pool_grow_cost(pool_pad(n_cur + 256), step)) {
+            return false;
+        }
+
+        // cells to give back so every device gains what it lacks
+        size_t n_give = 0;
+        for (const auto & [buft, bytes] : need) {
+            auto * dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr) {
+                continue;
+            }
+            size_t free  = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            if (bytes + headroom <= free) {
+                continue;
+            }
+            const size_t lack = bytes + headroom - free;
+            const size_t per_cell = step.count(buft) ? step.at(buft) / 256 : 0;
+            if (per_cell == 0) {
+                SRV_INF("[pool] stays at %u cells: %s lacks %.1f MiB and holds no cells\n", n_cur, ggml_backend_buft_name(buft), lack / 1048576.0);
+                return false; // the cells live elsewhere; giving them back helps nothing here
+            }
+            n_give = std::max(n_give, (lack + per_cell - 1) / per_cell);
+        }
+        if (n_give == 0) {
+            return false;
+        }
+        if (n_give > idle) {
+            SRV_INF("[pool] stays at %u cells: %zu would have to go and only %zu are idle beyond --pool-min-ctx %u (%s)\n", n_cur, n_give, idle, min_ctx, why);
+            return false;
+        }
+
+        // at least half the idle cells, so the next id does not resize again
+        n_give = std::max(n_give, idle / 2);
+
+        const uint32_t n_new = pool_pad(n_cur - n_give);
+        if (n_new >= n_cur) {
+            return false;
+        }
+
+        return pool_resize(n_new, why);
+    }
+
+    // [pool] admission asks whether the WHOLE conversation fits - its id (if none is free) and its cells (if the
+    // pool has too few), together, next to the reserve - and grows the pool for the cells when it does. When it
+    // does not, nothing is refused here: the id path evicts an idle conversation for its id and the batch ladder
+    // evicts for cells; the pool is grown then, at need, if it can be.
+    void pool_admit(size_t n_tokens, const char * why) {
+        if (!pool_elastic()) {
+            return;
+        }
+
+        const size_t free_cells = pool_cells_free();
+        const size_t margin     = 1 + slots.size(); // the next token of every seat, and this one's
+        if (n_tokens + margin <= free_cells) {
+            return; // cells are there; the id path asks its own question
+        }
+
+        const size_t n_more = n_tokens + margin - free_cells;
+        const uint32_t n_new = pool_pad(pool_size() + n_more);
+
+        pool_cost_t need;
+        if (seq_ids_free() == 0 && !pool_id_cost(need)) {
+            return;
+        }
+        if (!pool_grow_cost(n_new, need)) {
+            return;
+        }
+        const pool_cost_t reserve = pool_reserve(seq_ids_free() > 0 ? seq_ids_free() - 1 : 0, 0, n_new);
+
+        std::string str;
+        if (!pool_fits(need, reserve, str)) {
+            SRV_INF("[pool] %s (%zu tokens) does not fit whole: %s; it will be packed by eviction\n", why, n_tokens, str.c_str());
+            return;
+        }
+
+        pool_grow(n_more, /*urgent*/ false, why);
     }
 
     // [seq] an id for a new sequence, in rising order of cost: one nobody holds; one more from the model if the
     // device has room (the ceiling grows); the LRU finished conversation's, which goes to the prompt cache; and
     // last a yielded generation's, whose state is copied out and back later - the price of having no room for
     // another id. -1 when even that is not allowed or possible.
-    llama_seq_id seq_id_acquire(bool allow_offload, const char * why) {
+    llama_seq_id seq_id_acquire(bool allow_offload, const char * why, bool urgent = false) {
         llama_seq_id id = seq_id_free();
         if (id >= 0) {
             return id;
@@ -2570,7 +2909,7 @@ private:
             }
         }
 
-        if (seq_ceiling_raise()) {
+        if (seq_ceiling_raise(urgent)) {
             id = seq_id_free();
             GGML_ASSERT(id >= 0);
             return id;
@@ -2803,6 +3142,26 @@ private:
     // One move per call; the caller retries the batch. Only under --kv-unified: without it every id has its own
     // stream, and one sequence's wall is nobody else's.
     //
+
+    // [pool] rung -1: the batch found no room for its tokens from `off` on, and the pool can grow. Nobody is
+    // evicted for cells the device would have given. A deadline-forced batch may spend the reserve.
+    bool pool_grow_pending(int32_t off) {
+        if (!pool_elastic()) {
+            return false;
+        }
+        size_t n_pending = 0;
+        for (const auto & [slot, n] : batch_pending_slots(off)) {
+            n_pending += n;
+            GGML_UNUSED(slot);
+        }
+        if (n_pending == 0) {
+            return false;
+        }
+        const size_t free_cells = pool_cells_free();
+        const size_t margin     = 1 + slots.size();
+        const size_t n_more     = n_pending + margin > free_cells ? n_pending + margin - free_cells : n_pending;
+        return pool_grow(n_more, /*urgent*/ false, "a batch found no room");
+    }
 
     // rung 1: a finished conversation with cells leaves the pool - the shallowest first, cells being what is
     // short here (SEQ_NEED_CELLS, see seq_evictable). A refused save keeps it unless `force`
@@ -3038,6 +3397,14 @@ private:
 
         for (int pass = 0; pass < 2; ++pass) {
             for (;;) {
+                if (!pool_has_room_for(s)) {
+                    // [pool] the cells it needs, from the device first
+                    const size_t need = s.prompt.tokens.size() + 1 + slots.size();
+                    const size_t have = pool_cells_free();
+                    if (need > have) {
+                        pool_grow(need - have, /*urgent*/ false, "resuming a suspended generation");
+                    }
+                }
                 if (pool_has_room_for(s) && seq_restore(s, id)) {
                     return true;
                 }
@@ -3195,6 +3562,7 @@ private:
             if (match != nullptr) {
                 ret = seat_add("a resident conversation with a new turn");
             } else {
+                pool_admit(task.n_tokens(), "a new conversation");
                 const llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "a new conversation");
                 if (id >= 0) {
                     ret = seat_add("a new conversation");
@@ -4569,7 +4937,7 @@ private:
                     // it needs an id back: a free one, one more from the model, or a finished conversation's (saved
                     // first) - never another yielded generation's, that would only move the problem along. Past the
                     // deadline, a running generation's (RULE 1).
-                    llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "resuming a suspended generation");
+                    llama_seq_id id = seq_id_acquire(/*allow_offload*/ false, "resuming a suspended generation", /*urgent*/ force);
                     if (id < 0 && force) {
                         taken = pool_preempt_running(/*offload*/ true, s, "is past its suspension deadline and needs an id");
                         if (taken != nullptr) {
@@ -5651,7 +6019,8 @@ private:
                 // [seq] T2.5: the pool has no cell for a single token. The ladder, one move per retry; rung 1
                 // ran on the way down (below), so here it only catches what finished since. This used to
                 // error, release and clear EVERY processing slot; then one; now one only when nothing else can go.
-                if (pool_defer_pending(off)                    ||
+                if (pool_grow_pending(off)                     ||
+                    pool_defer_pending(off)                    ||
                     pool_evict_resident(false, "KV pool full") ||
                     pool_offload_waiting()                     ||
                     pool_suspend_running(off)                  ||
@@ -5700,7 +6069,7 @@ private:
 
             // retry with half the batch size to try to find a free slot in the KV cache. A finished conversation
             // goes first (rung 1, cheap and due anyway); the copies wait until halving has proved them necessary
-            if (!pool_evict_resident(false, "KV pool full")) {
+            if (!pool_grow_pending(off) && !pool_evict_resident(false, "KV pool full")) {
                 n_batch /= 2;
             }
 
@@ -6092,9 +6461,10 @@ private:
         }
     }
 
-    // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
+    // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model.
+    // [pool] with an elastic pool the pool of the moment is no cap: it grows for the conversation
     int n_ctx_slot() const {
-        int res = llama_n_ctx_seq(ctx_tgt);
+        int res = pool_elastic() ? llama_model_n_ctx_train(model_tgt) : llama_n_ctx_seq(ctx_tgt);
 
         if (params_base.kv_unified_per_slot > 0) {
             res = std::min(res, params_base.kv_unified_per_slot);
