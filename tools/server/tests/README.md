@@ -27,11 +27,12 @@ It's possible to override some scenario steps values with environment variables:
 
 | variable                 | description                                                                                    |
 |--------------------------|------------------------------------------------------------------------------------------------|
-| `PORT`                   | `context.server_port` to set the listening port of the server during scenario, default: `8080` |
+| `PORT`                   | `context.server_port` to set the listening port of the server during scenario, default: `8080`. Under xdist it is the BASE: worker N listens on `PORT + 10*N`. Keep it below the kernel's ephemeral range (`/proc/sys/net/ipv4/ip_local_port_range`, 32768-60999 by default): a port inside it can be taken by any outbound connection, and a worker whose port is gone fails every test it is handed |
 | `LLAMA_SERVER_BIN_PATH`  | to change the server binary path, default: `../../../build/bin/llama-server`                         |
 | `DEBUG`                  | to enable steps and server verbose mode `--verbose`                                       |
 | `N_GPU_LAYERS`           | number of model layers to offload to VRAM `-ngl --n-gpu-layers`                                |
 | `LLAMA_CACHE`            | by default server tests re-download models to the `tmp` subfolder. Set this to your cache (e.g. `$HOME/Library/Caches/llama.cpp` on Mac or `$HOME/.cache/llama.cpp` on Unix) to avoid this |
+| `LLAMA_TESTS_SKIP_LOAD_ALL` | set to `1` to skip `ServerPreset.load_all()` when `LLAMA_CACHE` is already warm. It starts and stops every preset back-to-back on one port; on a loaded box the next bind can land before the previous process has let go, and then every test of that worker errors at setup with "Server process died" |
 
 To run slow tests (will download many models, make sure to set `LLAMA_CACHE` if needed):
 
