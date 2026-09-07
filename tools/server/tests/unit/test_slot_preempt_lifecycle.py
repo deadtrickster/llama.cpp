@@ -52,6 +52,9 @@ def _mk(log, quantum, n_slots=1, n_ctx=2048, n_threads=None, kv_unified=False):
     # generation stays RESIDENT (cells kept, zero copy); without it the ceiling cannot move and
     # the yielded generation is OFFLOADED (state copied out). Both paths must satisfy these tests.
     sp.kv_unified = kv_unified
+    # [pool] a suspended state that must FAIL to come back needs a pool that cannot grow for it; on CPU the
+    # elastic pool would (the device never says no): pin it, which is what --pool-static is for
+    sp.pool_static = True
     sp.n_predict = None           # the preset's --n-predict 64 is not a cap we want
     sp.server_slots = True
     sp.slot_quantum = quantum

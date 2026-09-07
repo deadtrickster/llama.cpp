@@ -2706,14 +2706,17 @@ private:
         bool fits = true;
         str.clear();
         for (const auto & [buft, bytes] : all) {
+            const size_t res = reserve.count(buft) ? reserve.at(buft) : 0;
             auto * dev = ggml_backend_buft_get_device(buft);
             if (dev == nullptr) {
+                // no device to ask (the CPU buffer type reports none): attempt and see, as the resize does
+                str += string_format("%s%s %.1f MiB + %.1f MiB reserve (no device to ask)", str.empty() ? "" : ", ",
+                        ggml_backend_buft_name(buft), bytes / 1048576.0, res / 1048576.0);
                 continue;
             }
             size_t free  = 0;
             size_t total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
-            const size_t res = reserve.count(buft) ? reserve.at(buft) : 0;
             str += string_format("%s%s %.1f MiB + %.1f MiB reserve (%.1f MiB free)", str.empty() ? "" : ", ",
                     ggml_backend_buft_name(buft), bytes / 1048576.0, res / 1048576.0, free / 1048576.0);
             if (bytes + res + headroom > free) {

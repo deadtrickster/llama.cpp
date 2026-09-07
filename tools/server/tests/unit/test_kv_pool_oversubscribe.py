@@ -48,6 +48,9 @@ def _mk(log_path: str, n_ctx: int = POOL, n_predict: int = 4) -> ServerProcess:
     sp.n_ctx = n_ctx
     sp.n_batch = 256
     sp.kv_unified = True
+    # [pool] these tests are about what happens to the CONVERSATIONS when the pool is full, and on CPU the
+    # elastic pool would grow instead (the device never says no): pin it, which is what --pool-static is for
+    sp.pool_static = True
     sp.n_predict = n_predict
     sp.temperature = 0.0
     sp.cache_ram = 100
