@@ -1918,8 +1918,10 @@ private:
 
         // [seats] the floor: --parallel seats exist from the start. Everything above follows residency
         for (int i = 0; i < params_base.n_parallel; i++) {
-            server_slot * slot = seat_add("the floor");
-            GGML_ASSERT(slot != nullptr);
+            if (seat_add("the floor") == nullptr) {
+                SRV_ERR("could not create the %d floor slots (cap %u)\n", params_base.n_parallel, seat_cap());
+                return false;
+            }
         }
 
         SRV_INF("seats: floor %u, cap %u (ceiling cap %u, %d per seat in a batch of %d)\n",
@@ -2139,6 +2141,11 @@ private:
     }
 
     server_slot * get_slot_by_id(int id_slot) {
+        // [seats] a pinned id names a seat by index, and seats above the floor come and go. Rather than wrap onto
+        // a different seat (a save on 3 restored onto 0), an id below the cap gets its seats back
+        while (id_slot >= 0 && (size_t) id_slot >= slots.size() && seat_add("a pinned slot id") != nullptr) {
+        }
+
         // note: allow id_slot to be out of bounds (wrap around)
         id_slot = id_slot % slots.size();
 
