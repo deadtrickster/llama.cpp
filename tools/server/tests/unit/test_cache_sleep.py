@@ -89,3 +89,26 @@ def test_single_conversation_survives_sleep_wake(tmp_path):
     # the final token is always reprocessed
     assert t_a2["cache_n"] == n_prompt_a - 1, f"conversation lost on sleep: {t_a2}"
     assert t_a2["prompt_n"] == 1
+
+
+def test_shutdown_while_sleeping_exits_cleanly(tmp_path):
+    # T1.3: sleep frees the llama_context but leaves the slots populated, and
+    # shutdown flushes the slots into the prompt cache. Flushing a slot that
+    # still holds tokens against the freed context is a use-after-free. The
+    # assertion is that the process survived its own shutdown, not that a
+    # request failed.
+    server = make_server(str(tmp_path))
+    server.start()
+    try:
+        t_a = complete_when_ready(server, PROMPT_A)
+        assert t_a["prompt_n"] > 0
+
+        wait_for_sleep(server)
+
+        # SIGTERM, the same thing stop() sends, but we want the exit status
+        server.process.terminate()
+        rc = server.process.wait(timeout=30)
+    finally:
+        server.stop()
+
+    assert rc == 0, f"server exited with {rc} when terminated while sleeping"

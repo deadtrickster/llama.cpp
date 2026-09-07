@@ -1267,6 +1267,18 @@ private:
             return;
         }
 
+        // destroy() frees the context but leaves the slots populated - they are
+        // only rebuilt by load_model(). A shutdown while sleeping therefore
+        // arrives here with slots that still claim tokens and a ctx_tgt that
+        // was freed; prompt_save() on those is a use-after-free. Nothing is
+        // lost by skipping the walk: the sleep path flushed them before the
+        // free. The spill below is context-free and still runs.
+        if (ctx_tgt == nullptr) {
+            SRV_INF("flush: context is gone (%s), skipping slot walk\n", sleeping ? "sleeping" : "not loaded");
+            prompt_cache->spill_all();
+            return;
+        }
+
         int n_saved = 0;
         int n_live  = 0;
         for (auto & slot : slots) {
