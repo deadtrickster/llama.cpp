@@ -1,4 +1,5 @@
 #include "server-schema.h"
+#include "llama.h"
 
 #include "json-schema-to-grammar.h"
 
@@ -60,7 +61,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Number of tokens after n_keep that may be discarded when shifting context (0 = half context)"));
 
     add((new field_num("n_cmpl", params.n_cmpl))
-        ->set_hard_limits(1, params_base.n_parallel)
+        // [seats] seats follow the pool, so the bound is the sequence ceiling's cap, not --parallel
+        ->set_hard_limits(1, std::max<int32_t>(params_base.n_parallel,
+                                               params_base.n_seq_max > 0 ? params_base.n_seq_max : (int32_t) llama_max_parallel_sequences()))
         ->add_alias("n") // alias "n" as fallback (OpenAI completions API)
         ->set_desc("Number of completions to generate. If the input has multiple prompts, total outputs will be N prompts times n_cmpl"));
 

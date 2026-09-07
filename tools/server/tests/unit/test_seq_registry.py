@@ -430,3 +430,178 @@ def test_resume_saves_the_finished_conversation_it_displaces():
     assert b2["cache_n"] == len(toks_b) + 8 - 1, \
         f"B's conversation was destroyed by A's resume instead of spilled: {b2}"
     assert b2["prompt_n"] == 1
+
+
+#
+# Pool-driven seats. The operator's spec, verbatim: "i want a pool and whatever fits in here gets batched."
+# A seat (server_slot) is a batch position; before this, --parallel fixed their number and the sequence
+# ceiling moved underneath it, so residency adapted and batching did not. Now seats follow residency: a
+# resident sequence with pending work is batched, and admission asks the one question the cost query
+# answers - does one more sequence fit right now, on this model, on each device. --parallel is a floor.
+#
+# The property, as an assertion: with a pool that can hold N conversations, N conversations make progress
+# CONCURRENTLY - without anyone having set N. Asserted by observing generation, not by reading a config.
+#
+
+import json
+import requests
+
+PROMPTS = [
+    "Once upon a time in a land far away there lived a brave knight who",
+    "In a small village by the sea an old fisherman mended his nets every morning",
+    "The mountain pass was closed by snow and the travellers waited in the inn",
+    "Deep in the forest a fox and a rabbit argued about who owned the river",
+    "The baker woke before dawn to light the ovens and knead the bread",
+    "A little girl found a key in the garden and wondered which door it opened",
+]
+
+
+def _stream(sp: ServerProcess, prompt: str, n_predict: int, out: dict, tag: str):
+    """One streamed completion. Records when its first and last tokens ARRIVED, so
+    overlapping [first, last] windows are direct evidence of concurrent decoding."""
+    url = f"http://{sp.server_host}:{sp.server_port}/completion"
+    r = requests.post(url, json={
+        "prompt": prompt, "n_predict": n_predict, "temperature": 0.0, "top_k": 1, "seed": 42,
+        "cache_prompt": False, "stream": True, "ignore_eos": True}, stream=True, timeout=600)
+    t_first = None
+    t_last = None
+    gaps = []
+    text = ""
+    n = 0
+    for raw in r.iter_lines():
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace")
+        if not line.startswith("data: "):
+            continue
+        d = json.loads(line[6:])
+        now = time.time()
+        if t_first is None:
+            t_first = now
+        else:
+            gaps.append(now - t_last)
+        t_last = now
+        n += 1
+        text += d.get("content", "")
+        if d.get("stop"):
+            break
+    out[tag] = {"status": r.status_code, "t_first": t_first, "t_last": t_last, "n": n,
+                "text": text, "max_gap": max(gaps) if gaps else 0.0}
+
+
+def _run_concurrently(sp: ServerProcess, prompts, n_predict: int, stagger_s: float = 0.0) -> dict:
+    out = {}
+    threads = []
+    for i, p in enumerate(prompts):
+        t = threading.Thread(target=_stream, args=(sp, p, n_predict, out, f"r{i}"))
+        t.start()
+        threads.append(t)
+        if stagger_s:
+            time.sleep(stagger_s)
+    for t in threads:
+        t.join(timeout=600)
+    assert len(out) == len(prompts), f"{len(prompts) - len(out)} requests never returned"
+    for tag, r in out.items():
+        assert r["status"] == 200, (tag, r)
+        assert r["n"] >= n_predict, f"{tag} produced {r['n']} < {n_predict} tokens"
+    return out
+
+
+def _max_overlap(out: dict) -> int:
+    """The largest number of generations that were between their first and last token at one instant."""
+    events = []
+    for r in out.values():
+        events.append((r["t_first"], 1))
+        events.append((r["t_last"], -1))
+    events.sort(key=lambda e: (e[0], e[1]))  # an end at the same instant as a start counts as not overlapping
+    cur = best = 0
+    for _, d in events:
+        cur += d
+        best = max(best, cur)
+    return best
+
+
+def _seat_counts(log_text: str) -> list:
+    """Every seat count the server logged when it grew or shrank."""
+    return [int(m) for m in re.findall(r"seats: (\d+) \(", log_text)]
+
+
+def test_pool_holds_n_so_n_run_concurrently():
+    """Four conversations that the pool can hold, --parallel 1, no --seq-max: all four must be
+    generating at the same instant. Before pool-driven seats --parallel was the batch width and the
+    three others waited their turn on the one seat, however much room the pool had."""
+    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log, n_slots=1, seq_max=None, n_ctx=8192)
+    sp.start(timeout_seconds=120)
+    try:
+        _wait_ready(sp)
+        out = _run_concurrently(sp, PROMPTS[:4], n_predict=400)
+    finally:
+        sp.stop()
+
+    overlap = _max_overlap(out)
+    first_done = min(r["t_last"] for r in out.values())
+    last_start = max(r["t_first"] for r in out.values())
+    assert overlap == 4, (
+        f"only {overlap} of 4 generations ran at once: the last first-token arrived {last_start - first_done:+.3f} s "
+        f"after the first generation finished. Nobody set 4; the pool holds 4; 4 must run.")
+    counts = _seat_counts(_log(log))
+    assert counts and max(counts) == 4, f"the seat count never followed the pool: {counts}"
+
+
+def test_pool_bound_admits_exactly_what_fits():
+    """The other half of 'whatever fits gets batched': what does NOT fit waits. --seq-max 2 stands in
+    for the cost query refusing a third id (that is the GLM situation at ceiling 5). Four requests,
+    --parallel 1: exactly two generate at once, never three, the seat count never exceeds the ceiling,
+    and all four complete."""
+    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log, n_slots=1, seq_max=2, n_ctx=8192)
+    sp.start(timeout_seconds=120)
+    try:
+        _wait_ready(sp)
+        out = _run_concurrently(sp, PROMPTS[:4], n_predict=400)
+    finally:
+        sp.stop()
+
+    assert _max_overlap(out) == 2, f"expected exactly 2 concurrent generations under a 2-id ceiling, saw {_max_overlap(out)}"
+    counts = _seat_counts(_log(log))
+    assert counts and max(counts) == 2, f"seats went past the ceiling or never grew: {counts}"
+
+
+def test_suspended_generation_gets_compute_within_the_deadline():
+    """RULE 1 of the scheduler: a hard ceiling on time asleep. The adversarial shape: every seat held by a
+    long generation with NOTHING queued behind it, plus one suspended sequence. One id (--seq-max 1), so
+    A's yield to B offloads A; B is as long as A and nobody else arrives, so no quantum yield ever fires
+    for A's benefit. --slot-resume-after is the bound. Before this A waited for B to finish - the
+    resume pass could win a free seat but nothing ever freed one."""
+    bound_ms = 300
+    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log, n_slots=1, seq_max=1, quantum=8, n_ctx=4096)
+    sp.slot_resume_after = bound_ms
+    sp.n_threads = 1              # the model's training context caps a generation at 2048 tokens; slow it instead
+    sp.start(timeout_seconds=120)
+    try:
+        _wait_ready(sp)
+        alone = sp.make_request("POST", "/completion", data={
+            "prompt": PROMPTS[0], "n_predict": 2000, "temperature": 0.0, "top_k": 1,
+            "seed": 42, "cache_prompt": False, "ignore_eos": True}, timeout=600)
+        assert alone.status_code == 200
+        t_alone = alone.body["timings"]["predicted_ms"]
+        # PRECONDITION: B alone runs several bounds long, or waiting for it to finish would meet the deadline by accident
+        assert t_alone > 4 * bound_ms, f"the long generation only takes {t_alone:.0f} ms; slow it down or lower the bound"
+
+        out = _run_concurrently(sp, PROMPTS[:2], n_predict=2000, stagger_s=0.05)
+    finally:
+        sp.stop()
+
+    text = _log(log)
+    assert "offloaded sequence" in text, "precondition: A was never offloaded, the id was not contended"
+    waits = [int(m) for m in re.findall(r"resumed at \d+ generated tokens after (\d+) ms suspended", text)]
+    assert waits, "no generation was ever resumed"
+    # the guarantee: nothing slept past the bound (plus one batch to notice)
+    slack_ms = 300
+    assert max(waits) <= bound_ms + slack_ms, (
+        f"a suspended generation waited {max(waits)} ms for compute against a {bound_ms} ms bound "
+        f"(all waits: {waits}); B alone takes {t_alone:.0f} ms, so it waited for B to finish")
+    # and the time-slicing changed nothing about what was generated
+    assert out["r0"]["text"] == alone.body["content"], "A's continuation diverged across the swaps"

@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -104,6 +105,18 @@ public:
     void yield_to_queue(std::function<void()> && work);
 
     // for metrics
+    // how many deferred tasks satisfy `pred`: the yield trigger asks for the ones a given seat could serve
+    size_t count_deferred_if(const std::function<bool(const server_task &)> & pred) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        size_t n = 0;
+        for (const auto & t : queue_tasks_deferred) {
+            if (pred(t)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
     size_t queue_tasks_deferred_size() {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return queue_tasks_deferred.size();
