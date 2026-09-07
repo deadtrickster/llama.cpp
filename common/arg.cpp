@@ -2600,11 +2600,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         add_opt(common_arg(
             {"--seq-max"}, "N",
             string_format(
-                "number of sequence ids the context is allocated for, must be >= --parallel (default: %d, 0 = same as --parallel)\n"
-                "this is a residency ceiling for sequences that outlive their slot; today no id above --parallel is handed out\n"
-                "NOT FREE: every id in [0, N) is charged its full recurrent state at allocation, whether used or not\n"
+                "number of sequence ids the context starts with, and the most it may grow to; must be >= --parallel (default: %d, 0 = start at --parallel, grow up to the library maximum)\n"
+                "sequences outlive their slot: with --kv-unified the server raises the ceiling by one whenever a new conversation needs an id and the loaded model says one more fits, and lowers it again when idle\n"
+                "NOT FREE: every id below the ceiling is charged its full recurrent state, whether used or not\n"
                 "(hybrid/recurrent models; GLM-5.3-Flash: ~437 MiB per id with MTP rollback rows, ~146 MiB without)\n"
-                "and without --kv-unified the KV cache is split into N streams, so per-slot context shrinks to n_ctx/N",
+                "and without --kv-unified the KV cache is split into N streams, so per-slot context shrinks to n_ctx/N and the ceiling cannot move",
                 params.n_seq_max),
             [](common_params & params, int value) {
                 if (value < 0) {
@@ -2613,6 +2613,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_seq_max = value;
             }
         ).set_env("LLAMA_ARG_SEQ_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--seq-max-headroom"}, "MiB",
+            string_format(
+                "device memory to leave free when raising the sequence ceiling at runtime (default: %d)\n"
+                "the raise is refused when a device would have less than this left after paying for one more sequence",
+                params.seq_max_headroom_mib),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("error: invalid value for --seq-max-headroom\n");
+                }
+                params.seq_max_headroom_mib = value;
+            }
+        ).set_env("LLAMA_ARG_SEQ_MAX_HEADROOM").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

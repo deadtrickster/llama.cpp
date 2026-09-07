@@ -138,6 +138,234 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+// [seq-max] Resize the number of cells (= sequence ids) this memory holds, keeping every live state.
+//
+// The state is one 2D [n_embd, n_rows] tensor per layer with n_rows = size * (1 + n_rs_seq): the row
+// for (cell, snapshot j) sits at j*size + cell, so a resize is not an append - every snapshot group
+// moves. The live rows are staged through host memory. The new buffers are allocated while the old
+// ones still exist when there is room for both; when there is not, the old ones are freed first and
+// the retry needs room for the new size only - which is what makes growing by one row at the edge of
+// a device's memory possible at all. If even that fails the previous buffers are rebuilt from the
+// staging copy and false is returned; a failure of that rebuild is fatal, and is the one moment in
+// this function where the state is not in place somewhere.
+//
+// Shrinking requires the dropped cells to be empty and the dropped ids to own no tail; the caller
+// removes those sequences first. Nothing changes on a refusal.
+bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
+    if (n_new == size) {
+        return true;
+    }
+
+    if (n_new < 1 || n_new > LLAMA_MAX_SEQ) {
+        LLAMA_LOG_ERROR("%s: n_seq_max = %u is out of range [1, %d]\n", __func__, n_new, LLAMA_MAX_SEQ);
+        return false;
+    }
+
+    if (n_new < size) {
+        for (uint32_t i = n_new; i < size; ++i) {
+            if (!cells[i].is_empty() || cells[i].pos >= 0) {
+                LLAMA_LOG_ERROR("%s: cannot shrink to %u cells: cell %u is in use\n", __func__, n_new, i);
+                return false;
+            }
+        }
+        for (uint32_t s = n_new; s < size; ++s) {
+            // cells[s].tail is the tail cell of sequence s
+            if (cells[s].tail >= 0) {
+                LLAMA_LOG_ERROR("%s: cannot shrink to %u: sequence %u still holds state (tail cell %d)\n", __func__, n_new, s, cells[s].tail);
+                return false;
+            }
+        }
+    }
+
+    const int32_t  n_layer  = hparams.n_layer();
+    const uint32_t n_groups = 1 + n_rs_seq;
+    const uint32_t n_copy   = std::min(size, n_new); // cells whose rows survive
+
+    // per layer: where and how the old tensors were allocated, so the new ones match
+    std::vector<ggml_backend_buffer_type_t> buft_l(n_layer, nullptr);
+    std::vector<ggml_type> type_r_l(n_layer, GGML_TYPE_F32);
+    std::vector<ggml_type> type_s_l(n_layer, GGML_TYPE_F32);
+
+    // 1. stage every live row on the host: [layer][group] -> n_copy rows
+    using rows_t = std::vector<std::vector<uint8_t>>;
+    auto stage = [&](const ggml_tensor * t) {
+        rows_t groups(n_groups);
+        const size_t row_bytes = t->nb[1];
+        for (uint32_t j = 0; j < n_groups; ++j) {
+            groups[j].resize((size_t) n_copy * row_bytes);
+            ggml_backend_tensor_get(t, groups[j].data(), (size_t) j * size * row_bytes, groups[j].size());
+        }
+        return groups;
+    };
+
+    std::vector<rows_t> st_r(n_layer), st_s(n_layer), st_p(n_layer);
+    size_t n_staged = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        if (!r_l[il]) {
+            continue;
+        }
+        buft_l[il]   = ggml_backend_buffer_get_type(r_l[il]->buffer);
+        type_r_l[il] = r_l[il]->type;
+        type_s_l[il] = s_l[il]->type;
+        st_r[il] = stage(r_l[il]);
+        st_s[il] = stage(s_l[il]);
+        if (p_l[il]) {
+            st_p[il] = stage(p_l[il]);
+        }
+        for (const auto & g : st_r[il]) n_staged += g.size();
+        for (const auto & g : st_s[il]) n_staged += g.size();
+        for (const auto & g : st_p[il]) n_staged += g.size();
+    }
+
+    // 2. build a full set of tensors for n_cells cells, one no_alloc context per buffer type, as the constructor does
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+
+    using ctxs_bufs_t = std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>>;
+
+    auto build = [&](uint32_t n_cells, ctxs_bufs_t & out, std::vector<ggml_tensor *> & out_r, std::vector<ggml_tensor *> & out_s, std::vector<ggml_tensor *> & out_p) -> bool {
+        std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+        out.clear();
+        out_r.assign(n_layer, nullptr);
+        out_s.assign(n_layer, nullptr);
+        out_p.assign(n_layer, nullptr);
+
+        const uint32_t n_rows = n_cells * n_groups;
+
+        for (int il = 0; il < n_layer; ++il) {
+            if (!buft_l[il]) {
+                continue;
+            }
+            auto it = ctx_map.find(buft_l[il]);
+            if (it == ctx_map.end()) {
+                ggml_init_params params = {
+                    /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context * ctx = ggml_init(params);
+                if (!ctx) {
+                    return false;
+                }
+                it = ctx_map.emplace(buft_l[il], ctx).first;
+            }
+            ggml_context * ctx = it->second.get();
+
+            ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r_l[il], hparams.n_embd_r(), n_rows);
+            ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s_l[il], hparams.n_embd_s(), n_rows);
+            ggml_format_name(r, "cache_r_l%d", il);
+            ggml_format_name(s, "cache_s_l%d", il);
+            out_r[il] = r;
+            out_s[il] = s;
+
+            if (hparams.ple_conv_state() > 0 && hparams.is_ple(il)) {
+                ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r_l[il], hparams.ple_conv_state(), n_rows);
+                ggml_format_name(p, "cache_ple_r_l%d", il);
+                out_p[il] = p;
+            }
+        }
+
+        for (auto & [buft, ctx] : ctx_map) {
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+            if (!buf) {
+                out.clear(); // frees what this attempt already got
+                return false;
+            }
+            ggml_backend_buffer_clear(buf, 0);
+            out.emplace_back(std::move(ctx), buf);
+        }
+
+        return true;
+    };
+
+    ctxs_bufs_t new_ctxs_bufs;
+    std::vector<ggml_tensor *> new_r, new_s, new_p;
+
+    uint32_t n_install = n_new;
+
+    // 3. allocate: next to the old buffers when both fit, otherwise in their place
+    if (!build(n_new, new_ctxs_bufs, new_r, new_s, new_p)) {
+        LLAMA_LOG_WARN("%s: no room for the old and the new state buffers at once (%u -> %u cells), freeing the old ones first\n", __func__, size, n_new);
+
+        ctxs_bufs.clear();
+        std::fill(r_l.begin(), r_l.end(), nullptr);
+        std::fill(s_l.begin(), s_l.end(), nullptr);
+        std::fill(p_l.begin(), p_l.end(), nullptr);
+
+        if (!build(n_new, new_ctxs_bufs, new_r, new_s, new_p)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate state buffers for %u cells, restoring the previous %u\n", __func__, n_new, size);
+            if (!build(size, new_ctxs_bufs, new_r, new_s, new_p)) {
+                // the rows are in host memory and nowhere else; nothing here can be continued from
+                throw std::runtime_error("failed to restore the recurrent state buffers after a refused resize");
+            }
+            n_install = size;
+        }
+    }
+
+    // 4. put the rows back: (cell, group j) -> row j*n_install + cell
+    auto unstage = [&](ggml_tensor * t, const rows_t & groups) {
+        const size_t row_bytes = t->nb[1];
+        for (uint32_t j = 0; j < n_groups; ++j) {
+            ggml_backend_tensor_set(t, groups[j].data(), (size_t) j * n_install * row_bytes, groups[j].size());
+        }
+    };
+
+    for (int il = 0; il < n_layer; ++il) {
+        if (!buft_l[il]) {
+            continue;
+        }
+        unstage(new_r[il], st_r[il]);
+        unstage(new_s[il], st_s[il]);
+        if (new_p[il]) {
+            unstage(new_p[il], st_p[il]);
+        }
+    }
+
+    // 5. install
+    ctxs_bufs = std::move(new_ctxs_bufs);
+    r_l = std::move(new_r);
+    s_l = std::move(new_s);
+    p_l = std::move(new_p);
+
+    if (n_install != n_new) {
+        return false; // restored the old layout after a refused allocation
+    }
+
+    const uint32_t n_old = size;
+
+    size      = n_new;
+    n_seq_max = n_new;
+    cells.resize(n_new);  // new cells are empty; dropped ones were verified empty above
+    rs_idx.resize(n_new, 0);
+    head = 0;             // a search hint only
+
+    LLAMA_LOG_INFO("%s: %u -> %u cells (%2u rs_seq), %.2f MiB staged through the host, state now %.2f MiB\n",
+            __func__, n_old, n_new, n_rs_seq, n_staged / (1024.0 * 1024.0), total_size() / (1024.0 * 1024.0));
+
+    return true;
+}
+
+// [seq-max] every cell costs the same: the buffers hold size*(1 + n_rs_seq) rows of every layer that
+// lives on that buffer type, so one more cell is one more size-th of each buffer
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::seq_max_cost(uint32_t n_new) const {
+    std::map<ggml_backend_buffer_type_t, size_t> res;
+
+    if (n_new <= size) {
+        return res;
+    }
+
+    for (const auto & [_, buf] : ctxs_bufs) {
+        const size_t per_cell = ggml_backend_buffer_get_size(buf.get()) / size;
+        res[ggml_backend_buffer_get_type(buf.get())] += per_cell * (n_new - size);
+    }
+
+    return res;
+}
+
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
         cells[i].pos = -1;

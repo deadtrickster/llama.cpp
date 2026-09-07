@@ -573,6 +573,20 @@ extern "C" {
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+
+    // [seq-max] Change the sequence ceiling (n_seq_max) of a live context. Only with a unified KV cache.
+    // Grows or shrinks the per-sequence memory (recurrent state rows) and re-reserves the compute buffers
+    // for the new worst case; on any failure the context is rolled back to its previous ceiling and false
+    // is returned. Must not be called while a batch is being processed. Shrinking requires that no
+    // sequence id >= n_seq_max holds anything (llama_memory_seq_rm them first).
+    LLAMA_API bool llama_set_n_seq_max(struct llama_context * ctx, uint32_t n_seq_max);
+
+    // [seq-max] Estimated extra memory that raising the ceiling to n_seq_max would need, per buffer type,
+    // asked of the loaded model: the per-sequence memory exactly, plus the marginal compute-buffer cost
+    // measured on this context's worst-case graphs (unknown, and omitted, at a ceiling of 1).
+    // Writes up to n_max entries and returns the number of entries there are (which may exceed n_max);
+    // 0 for a shrink or a no-op; -1 when the ceiling cannot be changed at all.
+    LLAMA_API int32_t llama_seq_max_cost(struct llama_context * ctx, uint32_t n_seq_max, ggml_backend_buffer_type_t * bufts, size_t * sizes, int32_t n_max);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");

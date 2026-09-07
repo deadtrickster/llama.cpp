@@ -1206,6 +1206,39 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+// [seq-max] under a unified layout every id lives on stream 0 and seq_to_stream is sized LLAMA_MAX_SEQ,
+// so the ceiling is a number and nothing has to move. One stream per id would need every K/V tensor
+// reallocated, which this does not do.
+bool llama_kv_cache::seq_max_resize(uint32_t n_seq_max_new) {
+    if (n_seq_max_new == n_seq_max) {
+        return true;
+    }
+
+    if (n_seq_max_new < 1 || n_seq_max_new > LLAMA_MAX_SEQ) {
+        LLAMA_LOG_ERROR("%s: n_seq_max = %u is out of range [1, %d]\n", __func__, n_seq_max_new, LLAMA_MAX_SEQ);
+        return false;
+    }
+
+    if (n_stream != 1) {
+        LLAMA_LOG_ERROR("%s: the sequence ceiling can only change with a unified KV cache (n_stream = %u)\n", __func__, n_stream);
+        return false;
+    }
+
+    // the same contract as the recurrent module: an id above the new ceiling may hold nothing
+    for (uint32_t s = n_seq_max_new; s < n_seq_max; ++s) {
+        if (seq_pos_max(s) >= 0) {
+            LLAMA_LOG_ERROR("%s: cannot shrink to %u: sequence %u still holds cells\n", __func__, n_seq_max_new, s);
+            return false;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: n_seq_max %u -> %u (unified, nothing reallocated)\n", __func__, n_seq_max, n_seq_max_new);
+
+    n_seq_max = n_seq_max_new;
+
+    return true;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 

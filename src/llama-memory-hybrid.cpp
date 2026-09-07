@@ -168,6 +168,35 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift() && mem_recr->get_can_shift();
 }
 
+// [seq-max] attention first: under a unified cache it only changes a number, so undoing it costs nothing if the recurrent half refuses
+bool llama_memory_hybrid::seq_max_resize(uint32_t n_seq_max) {
+    const uint32_t n_seq_max_old = mem_recr->size;
+
+    if (!mem_attn->seq_max_resize(n_seq_max)) {
+        return false;
+    }
+
+    if (mem_idx && !mem_idx->seq_max_resize(n_seq_max)) {
+        mem_attn->seq_max_resize(n_seq_max_old);
+        return false;
+    }
+
+    if (!mem_recr->seq_max_resize(n_seq_max)) {
+        mem_attn->seq_max_resize(n_seq_max_old);
+        if (mem_idx) {
+            mem_idx->seq_max_resize(n_seq_max_old);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::seq_max_cost(uint32_t n_seq_max) const {
+    // the unified attention cache does not grow with the ceiling; the recurrent rows do
+    return mem_recr->seq_max_cost(n_seq_max);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     if (mem_idx) mem_idx->clear(data);

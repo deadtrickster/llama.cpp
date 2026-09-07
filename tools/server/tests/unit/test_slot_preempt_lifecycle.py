@@ -40,11 +40,15 @@ PROMPT_B = "In a small village by the sea an old fisherman mended his nets every
 DISCONNECT_POLL_S = 1.0
 
 
-def _mk(log, quantum, n_slots=1, n_ctx=2048, n_threads=None):
+def _mk(log, quantum, n_slots=1, n_ctx=2048, n_threads=None, kv_unified=False):
     sp = ServerPreset.tinyllama2()
     sp.n_slots = n_slots
     sp.n_ctx = n_ctx
     sp.n_threads = n_threads
+    # [seq] with a unified cache the server grows the sequence ceiling on demand, so a yielded
+    # generation stays RESIDENT (cells kept, zero copy); without it the ceiling cannot move and
+    # the yielded generation is OFFLOADED (state copied out). Both paths must satisfy these tests.
+    sp.kv_unified = kv_unified
     sp.n_predict = None           # the preset's --n-predict 64 is not a cap we want
     sp.server_slots = True
     sp.slot_quantum = quantum
@@ -119,7 +123,8 @@ def _slots_idle(sp: ServerProcess) -> bool:
     return not any(s["is_processing"] for s in r.body)
 
 
-def test_cancel_reaches_a_suspended_task():
+@pytest.mark.parametrize("kv_unified", [False, True])
+def test_cancel_reaches_a_suspended_task(kv_unified):
     """T1.6. A holds the only slot, B queues, A yields. A's client hangs up
     while A is suspended. The CANCEL handler searched `slots`, so A stayed in
     queue_suspended, resumed when B finished, and generated ~1500 tokens into
@@ -128,7 +133,7 @@ def test_cancel_reaches_a_suspended_task():
     -t 1 so that B (a full 2048-token context, ~2.4 s) outlives the server's
     1 s socket poll: the CANCEL has to land while A is still suspended."""
     log = os.path.join(tempfile.mkdtemp(), "srv.log")
-    sp = _mk(log, quantum=8, n_slots=1, n_threads=1)
+    sp = _mk(log, quantum=8, n_slots=1, n_threads=1, kv_unified=kv_unified)
     sp.start(timeout_seconds=120)
     try:
         _wait_ready(sp)
@@ -180,11 +185,14 @@ def _read_stream_until_quiet(resp: http.client.HTTPResponse) -> str:
     return content
 
 
-def test_suspended_task_survives_shutdown(tmp_path):
+@pytest.mark.parametrize("kv_unified", [False, True])
+def test_suspended_task_survives_shutdown(tmp_path, kv_unified):
     """T1.5. A yields to B; SIGTERM lands while A is suspended and B holds the
     slot. flush_prompt_cache() walked `slots` only, so B was saved and A - whose
     KV state and prompt were sitting in queue_suspended in exactly the format
-    the cache stores - died with the process.
+    the cache stores - died with the process. With the registry A is either
+    OFFLOADED (bytes, no context needed) or RESIDENT (its cells are read out of
+    the context, like a seated sequence's); the flush must cover both.
 
     Two facts after the shutdown: the spill directory holds an entry of exactly
     A's prompt + generated-so-far length, and a restart on the same
@@ -199,7 +207,7 @@ def test_suspended_task_survives_shutdown(tmp_path):
     and ctx_http.stop() waits on it (pre-existing, not the subject here)."""
     cache_dir = str(tmp_path)
     log = os.path.join(cache_dir, "srv1.log")
-    sp = _mk(log, quantum=8, n_slots=1, n_threads=1)
+    sp = _mk(log, quantum=8, n_slots=1, n_threads=1, kv_unified=kv_unified)
     sp.cache_ram = 100
     sp.slot_save_path = cache_dir
     sp.start(timeout_seconds=120)

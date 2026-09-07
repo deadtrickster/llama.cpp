@@ -50,6 +50,15 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
 void common_speculative_free(common_speculative * spec);
 
+// [seq-max] follow a change of the sequence ceiling: the per-sequence state of every implementation is
+// resized. Shrinking always works; growing works for the implementations that know how (draft-simple,
+// draft-mtp) and is refused, with nothing changed, by the others. The draft context (if any) must have
+// been resized first, since draft-simple checks it matches.
+bool common_speculative_set_n_seq(common_speculative * spec, uint32_t n_seq);
+
+// the number of sequences the speculative state is sized for
+uint32_t common_speculative_n_seq(const common_speculative * spec);
+
 struct common_speculative_draft_params {
     // this flag is used to chain the drafts through all the available implementations
     // after the first successful draft from an implementation, we set it

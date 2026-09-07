@@ -133,6 +133,8 @@ public:
 
     bool get_can_shift() const override;
 
+    bool seq_max_resize(uint32_t n_seq_max) override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -275,7 +277,7 @@ private:
     // see set_kpool_dirty. mutable: its only consumer runs from set_input, holding a const cache
     mutable bool kpool_dirty = false;
 
-    const uint32_t n_seq_max = 1;
+    uint32_t n_seq_max = 1; // [seq-max] mutable under a unified cache, see seq_max_resize()
     const uint32_t n_stream  = 1;
 
     // required padding
