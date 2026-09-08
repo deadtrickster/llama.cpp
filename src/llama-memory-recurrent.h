@@ -141,6 +141,8 @@ private:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
     size_t total_size() const;
+    // bytes held by one of ctxs_bufs, projected from the tensors when the buffer is a no_alloc dummy
+    size_t buf_size(ggml_context * ctx, ggml_backend_buffer_t buf) const;
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;

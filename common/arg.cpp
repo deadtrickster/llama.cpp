@@ -1785,7 +1785,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_unified = value;
         }
-    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_FIT_PARAMS}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
@@ -3085,6 +3085,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.fit_params_min_ctx = value;
         }
     ).set_env("LLAMA_ARG_FIT_CTX"));
+    add_opt(common_arg(
+        { "-fits", "--fit-seq" }, "N",
+        string_format("sequences beyond those the context starts with to hold device memory in reserve for, so the next\n"
+            "conversation can be seated without evicting one; the cost is measured per device for the loaded model.\n"
+            "everything above the reserve goes to the KV pool. requires --kv-unified to matter (default: %" PRIi32 ", 0 = none)", params.fit_params_seq),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.fit_params_seq = value;
+        }
+    ).set_env("LLAMA_ARG_FIT_SEQ"));
     add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),

@@ -65,7 +65,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-l/--n-layer N] [--n-ff N] [--n-expert N] [--n-ctx N] [-v N] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -79,10 +79,16 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
+// -l/--n-layer: override the per-arch default so a memory-placement test has enough layers to spread across devices
+static uint32_t g_n_layer_override = 0;
+static uint32_t g_n_ff_override     = 0; // --n-ff: expert width, so experts can dominate the weights as they do in a real MoE
+static uint32_t g_n_expert_override = 0; // --n-expert
+static uint32_t g_n_ctx_override    = 0; // --n-ctx: trained context, so a context-sizing test has a range to search
+
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
-    const uint32_t n_ctx = 256;
+    const uint32_t n_ctx = g_n_ctx_override > 0 ? g_n_ctx_override : 256;
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -129,6 +135,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 10240;
     } else if (arch == LLM_ARCH_QWEN3TTS) {
         n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
+    }
+
+    if (g_n_layer_override > 0) {
+        n_layer = g_n_layer_override;
+    }
+    if (g_n_ff_override > 0) {
+        n_ff = g_n_ff_override;
     }
 
     uint32_t n_head_kv = n_head;
@@ -342,7 +355,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, n_ff / 2);  // distinct from n_ff so a saver key-clobber surfaces on reload
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               g_n_expert_override > 0 ? g_n_expert_override : uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
@@ -860,6 +873,38 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "-v") == 0) {
             if (i + 1 < argc) {
                 verbosity = std::stoull(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
+        if (strcmp(argv[i], "--n-ctx") == 0) {
+            if (i + 1 < argc) {
+                g_n_ctx_override = std::stoul(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
+        if (strcmp(argv[i], "--n-ff") == 0) {
+            if (i + 1 < argc) {
+                g_n_ff_override = std::stoul(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
+        if (strcmp(argv[i], "--n-expert") == 0) {
+            if (i + 1 < argc) {
+                g_n_expert_override = std::stoul(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        }
+        if (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--n-layer") == 0) {
+            if (i + 1 < argc) {
+                g_n_layer_override = std::stoul(argv[++i]);
             } else {
                 usage(argv);
                 return 1;
