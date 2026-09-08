@@ -1993,6 +1993,66 @@ size_t server_prompt_cache::disk_size() const {
     return res;
 }
 
+// [cache-ladder] Shed one rung of fidelity from `state`, freeing RAM without
+// making the entry unusable. Returns false once nothing is left to shed, which
+// is the caller's signal to spill it instead.
+//
+// Every rung costs time on a later restore and none costs correctness: a thinned
+// entry rolls back to a coarser point, a skeletal one reprocesses from the start
+// of the conversation, and one without draft state decodes at the unaccelerated
+// rate until MTP warms up again.
+bool server_prompt_cache::degrade(server_prompt_cache_state & state) {
+    if (!state.can_degrade()) {
+        return false;
+    }
+
+    const size_t before = state.size();
+    const int    from   = state.degrade_level;
+
+    switch (state.degrade_level) {
+        case 0:
+            {
+                // thin: drop every other checkpoint, keeping the newest - the one a
+                // rollback is most likely to land on.
+                auto & ckpts = state.prompt.checkpoints;
+                bool drop = false;
+                for (auto it = ckpts.begin(); it != ckpts.end(); ) {
+                    if (drop && std::next(it) != ckpts.end()) {
+                        it = ckpts.erase(it);
+                    } else {
+                        ++it;
+                    }
+                    drop = !drop;
+                }
+            } break;
+        case 1:
+            state.prompt.checkpoints.clear();
+            break;
+        case 2:
+            state.data.drft = {};
+            break;
+        default:
+            return false;
+    }
+
+    state.degrade_level++;
+
+    const size_t after = state.size();
+    if (after >= before) {
+        // the rung had nothing to give (no checkpoints, no draft state); charge the
+        // level anyway so the ladder advances instead of spinning on this entry.
+        SRV_TRC(" - cache ladder: entry %d tokens at level %d -> %d freed nothing\n",
+                (int) state.prompt.n_tokens(), from, state.degrade_level);
+        return false;
+    }
+
+    SRV_INF(" - cache ladder: degraded entry (%d tokens) level %d -> %d, freed %.3f MiB, now %.3f MiB\n",
+            (int) state.prompt.n_tokens(), from, state.degrade_level,
+            (before - after) / (1024.0 * 1024.0), after / (1024.0 * 1024.0));
+
+    return true;
+}
+
 bool server_prompt_cache::spill(server_prompt_cache_state & state) {
     if (disk_dir.empty() || state.spilled()) {
         return false;
@@ -2442,6 +2502,31 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
+            // [cache-ladder] Rung one: shed fidelity before evicting anything.
+            //
+            // The victim is the LEAST DEGRADED entry, and only among those the least
+            // recently used. Degrading the LRU entry repeatedly would strip one
+            // conversation bare while the next kept everything - the same cliff as
+            // spilling, just slower. Taking the least degraded first spreads the loss
+            // evenly, so every conversation keeps a usable shape, with LRU deciding
+            // the order within a rung.
+            {
+                std::list<server_prompt_cache_state>::iterator best = states.end();
+                for (auto it = states.begin(); it != states.end(); ++it) {
+                    if (!it->can_degrade()) {
+                        continue;
+                    }
+                    if (best == states.end() ||
+                        it->degrade_level <  best->degrade_level ||
+                       (it->degrade_level == best->degrade_level && it->t_last_used < best->t_last_used)) {
+                        best = it;
+                    }
+                }
+                if (best != states.end() && degrade(*best)) {
+                    continue;
+                }
+            }
+
             // [l2-spill] prefer moving the oldest resident entry to disk over
             // destroying it. Spilled entries keep their index in RAM but stop
             // counting toward the size limit.

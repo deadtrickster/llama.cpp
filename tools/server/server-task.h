@@ -618,6 +618,24 @@ struct server_prompt_cache_state {
 
     bool spilled() const { return !spill_path.empty(); }
 
+    // [cache-ladder] How far this entry has been degraded under memory pressure.
+    // Eviction used to be binary - the LRU entry was spilled WHOLE, so one
+    // conversation lost everything while the next kept full fidelity. Each rung
+    // here drops state that costs performance on a later restore but never
+    // correctness, so a pressured cache keeps a usable shape for every
+    // conversation instead of a perfect shape for a few.
+    //
+    //   0  full            checkpoints as placed
+    //   1  thinned         every other checkpoint dropped, newest kept
+    //   2  skeletal        no checkpoints; KV + draft only
+    //   3  no draft        MTP draft state dropped; restore loses acceptance
+    //   4  exhausted       nothing left to shed - the caller spills
+    int degrade_level = 0;
+
+    static constexpr int DEGRADE_MAX = 4;
+
+    bool can_degrade() const { return !spilled() && degrade_level < DEGRADE_MAX; }
+
     // RAM footprint. A spilled entry costs only its token list + metadata.
     size_t size() const {
         if (spilled()) {
@@ -677,6 +695,9 @@ struct server_prompt_cache {
 
     // move an entry's bulk buffers to disk, keeping its index in RAM
     bool spill(server_prompt_cache_state & state);
+
+    // [cache-ladder] shed one rung from `state`; false when nothing is left to shed.
+    bool degrade(server_prompt_cache_state & state);
 
     // [state-buf] Pooling now lives inside common_state_buf (common/common.h):
     // mmap + MAP_POPULATE + mlock, recycled through a global free list.
