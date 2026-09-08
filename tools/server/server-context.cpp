@@ -4535,24 +4535,59 @@ private:
         return true;
     }
 
+    // [checkpoint-exp] each retained checkpoint sits at least this many times further
+    // from the tip than the one after it. 2 gives 8k/16k/32k/64k/128k on min-step 8192.
+    static constexpr int64_t CHECKPOINT_EXP_FACTOR = 2;
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+        // [checkpoint-exp] Thin checkpoints exponentially by distance from the tip,
+        // rather than spacing them uniformly.
+        //
+        // Uniform spacing costs O(n) checkpoints on a long conversation - ~24 on a
+        // 200k one at min-step 8192 - and each is 145.563 MiB of state carried inside
+        // every prompt-cache entry. Measured on 2026-09-08: entries averaged 40.6
+        // KiB/token against GLM's raw KV of 19.25, so checkpoints were roughly HALF of
+        // the prompt cache, and the cache is what OOM-killed the server four times.
+        //
+        // A rollback lands near the tip in practice, so keep a checkpoint only if it
+        // sits at least CHECKPOINT_EXP_FACTOR times further from the tip than the last
+        // one kept: 8k, 16k, 32k, 64k, 128k back. That is O(log n) checkpoints spanning
+        // the WHOLE history and densest where a divergence actually happens, instead of
+        // O(n) evenly spread. ~5 instead of ~24 on 200k, and unlike simply lowering
+        // --ctx-checkpoints it does not leave the older history uncovered.
+        //
+        // Checkpoints belonging to the current task are never thinned, as before.
+        {
+            const int64_t tip  = slot.prompt.n_tokens();
+            const int64_t step = std::max<int64_t>(1, params_base.checkpoint_min_step);
 
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
+            std::list<common_prompt_checkpoint> kept;
+
+            int64_t keep_dist = 0; // distance from the tip of the last checkpoint kept
+
+            for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
+                const int64_t dist = tip - it->n_tokens;
+
+                // keep_dist == 0 means nothing has been kept yet: the checkpoint nearest
+                // the tip is always retained, however close it is. It is the one a
+                // rollback is most likely to land on, and it is created within
+                // --checkpoint-min-step of the tip, so a distance test would drop it.
+                if (it->id_task == id_task || keep_dist == 0 || dist >= std::max(step, keep_dist*CHECKPOINT_EXP_FACTOR)) {
+                    if (it->id_task != id_task) {
+                        keep_dist = dist;
+                    }
+                    kept.push_front(std::move(*it));
+                    continue;
+                }
+
+                SLT_TRC(slot, "erasing context checkpoint too close to a later one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", dist = %" PRId64 ", size = %.3f MiB)\n",
+                        it->pos_min, it->pos_max, it->n_tokens, dist, (float) it->size() / 1024 / 1024);
             }
 
-            last = it->n_tokens;
-            ++it;
+            slot.prompt.checkpoints = std::move(kept);
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
