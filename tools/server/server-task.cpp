@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <csignal>
 #include <unistd.h>
+#include <fcntl.h>
 #include <system_error>
 #include <filesystem>
 #include <cstdio>
@@ -1935,6 +1936,37 @@ static std::string l2_spill_name(const std::string & model_key, int n_tokens, co
          + ".spill";
 }
 
+// [l2-fadvise] Spill files are cold by construction: written once, read back at
+// most once, and unlinked on restore. Leaving them in the page cache charges this
+// process's cgroup for every byte it has ever spilled - 505 GiB on disk here -
+// which is what made systemd report a 164 GB "memory peak" while the cache itself
+// held 72 GiB. That cache is reclaimable, so it is not what triggers an OOM, but
+// it hides the number that is and it competes with the mlocked state buffers.
+//
+// DONTNEED only drops CLEAN pages, so a write has to be flushed first. fsync of a
+// multi-GiB spill costs real time (the "9 GB/s" in the spill log is the memcpy
+// into page cache, not the write to NVMe), and on the eviction path that latency
+// lands inside a request. It is paid deliberately: the alternative is letting the
+// dirty pages accumulate against vm.dirty_ratio, which is 20% of RAM here.
+//
+// Linux-only; a no-op everywhere else.
+static void l2_drop_page_cache(const std::string & path, bool flush_first) {
+#if defined(__linux__)
+    const int fd = open(path.c_str(), flush_first ? O_WRONLY : O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    if (flush_first) {
+        fsync(fd);
+    }
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    close(fd);
+#else
+    (void) path;
+    (void) flush_first;
+#endif
+}
+
 // [l2-spill] least-recently-used entry satisfying `pred`, or end().
 template <typename Pred>
 static std::list<server_prompt_cache_state>::iterator lru_find(
@@ -2019,6 +2051,10 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
     }
     f.close();
 
+    // [l2-fadvise] the bytes are on NVMe now and will not be read again unless
+    // this entry is restored, so do not let them sit in the page cache.
+    l2_drop_page_cache(path, /*flush_first*/ true);
+
     // release the RAM - the mapping goes back to common_state_buf's pool
     state.data.main.clear(); state.data.main.shrink_to_fit();
     state.data.drft.clear(); state.data.drft.shrink_to_fit();
@@ -2082,6 +2118,11 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
     SRV_INF(" - L2: restored %7d tokens (%.3f MiB) in %.0f ms (%.2f GB/s) from %s\n",
             state.prompt.n_tokens(), state.spill_bytes / (1024.0 * 1024.0), t_ms,
             (state.spill_bytes / 1e9) / (t_ms / 1000.0), state.spill_path.c_str());
+
+    // [l2-fadvise] the restore just pulled the whole file through the page cache
+    // and nothing will read it again. The unlink below frees these pages too, so
+    // this mainly matters if the removal fails or is ever dropped.
+    l2_drop_page_cache(state.spill_path, /*flush_first*/ false);
 
     std::remove(state.spill_path.c_str());
     state.spill_path.clear();
