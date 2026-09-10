@@ -4093,11 +4093,16 @@ private:
             } else {
                 result.text_to_send = "";
             }
+        } else {
+            // the token ends the text with a partial UTF-8 character, so no text can be sent yet.
+            // still emit the token: stats.n_gen was already advanced for it, and in stream mode the
+            // final response carries no tokens, so a skipped token here is never sent at all
+            result.text_to_send = "";
+        }
 
-            slot.add_token(result);
-            if (slot.task->params.stream) {
-                send_partial_response(slot, result, false);
-            }
+        slot.add_token(result);
+        if (slot.task->params.stream) {
+            send_partial_response(slot, result, false);
         }
 
         if (incomplete) {
