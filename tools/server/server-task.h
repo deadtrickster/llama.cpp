@@ -612,18 +612,25 @@ struct server_prompt_cache_state {
     server_prompt_data data;
 
     // [l2-spill] when non-empty, the bulk buffers (data.main, data.drft and the
-    // checkpoints' data_*) live in this file instead of RAM. prompt.tokens and
-    // the checkpoint position metadata stay resident so prefix matching in
-    // load() never needs to touch the disk.
+    // checkpoints' data_*) have been written to this file. Whether they are ALSO
+    // still resident in RAM is `resident`, not this: a mirrored entry is on disk
+    // and in RAM, a spilled one on disk only.
     std::string spill_path;
     size_t      spill_bytes = 0;
+
+    // [l2-mirror] true while the bulk buffers are held in RAM. A mirrored entry
+    // (spill_path set AND resident) has its disk copy as a power-loss safety net,
+    // not an eviction; it still counts toward the RAM limit and can still be
+    // degraded. Eviction flips this to false, releasing the RAM.
+    bool resident = true;
 
     // [l2-spill] last time this entry was created or hit, for LRU selection.
     // The list order is insertion order (FIFO), which evicts an old-but-hot
     // entry ahead of a newer cold one.
     int64_t t_last_used = 0;
 
-    bool spilled() const { return !spill_path.empty(); }
+    bool spilled()  const { return !spill_path.empty(); }
+    bool mirrored() const { return spilled() && resident; }
 
     // [cache-ladder] How far this entry has been degraded under memory pressure.
     // Eviction used to be binary - the LRU entry was spilled WHOLE, so one
@@ -641,11 +648,11 @@ struct server_prompt_cache_state {
 
     static constexpr int DEGRADE_MAX = 4;
 
-    bool can_degrade() const { return !spilled() && degrade_level < DEGRADE_MAX; }
+    bool can_degrade() const { return resident && degrade_level < DEGRADE_MAX; }
 
-    // RAM footprint. A spilled entry costs only its token list + metadata.
+    // RAM footprint. A non-resident entry costs only its token list + metadata.
     size_t size() const {
-        if (spilled()) {
+        if (!resident) {
             return 0;
         }
 
@@ -660,7 +667,7 @@ struct server_prompt_cache_state {
 
     // total bytes held, wherever they are
     size_t size_total() const {
-        return spilled() ? spill_bytes : size();
+        return resident ? size() : spill_bytes;
     }
 };
 
@@ -710,8 +717,14 @@ struct server_prompt_cache {
     // entries can never be mistaken for each other.
     std::string model_key = "unknown";
 
-    // move an entry's bulk buffers to disk, keeping its index in RAM
-    bool spill(server_prompt_cache_state & state);
+    // move an entry's bulk buffers to disk, keeping its index in RAM. With
+    // release_ram (default) the RAM copy is dropped - the eviction path. Without
+    // it the entry is only mirrored to disk and stays resident (mirror()).
+    bool spill(server_prompt_cache_state & state, bool release_ram = true);
+
+    // [l2-mirror] write an entry through to disk while keeping it resident - the
+    // periodic power-loss safety net. Returns false when it is already on disk.
+    bool mirror(server_prompt_cache_state & state);
 
     // [cache-ladder] shed one rung from `state`; false when nothing is left to shed.
     bool degrade(server_prompt_cache_state & state);
@@ -729,11 +742,12 @@ struct server_prompt_cache {
     // on the sleep path, where the alternative is throwing the whole cache away.
     void spill_all();
 
-    // [deep-reuse] spill the resident entries that are older than active_seconds,
-    // leaving the active ones in RAM for fast restore. The periodic background
-    // spill calls this, not spill_all(), so an active conversation is not moved
-    // to disk every interval.
-    void spill_inactive();
+    // [l2-mirror] write every resident entry through to disk while keeping it in
+    // RAM - the periodic power-loss safety net. The RAM tier stays full; the disk
+    // copy only means a power cut loses at most one interval. Called on the
+    // --cache-spill-seconds timer. Eviction (when the RAM tier is full) is a
+    // separate, release-RAM path.
+    void mirror_resident();
 
     // [l2-persist] adopt this model's spill files left by a previous run. Only the
     // headers are read, so the entries come back marked spilled(): tokens resident

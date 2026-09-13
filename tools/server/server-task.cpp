@@ -2010,7 +2010,7 @@ static std::list<server_prompt_cache_state>::iterator lru_find_inactive_first(
 
     // pass 1: the LRU resident entry that is already inactive
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (it->spilled()) {
+        if (!it->resident) {
             continue;
         }
         if (active_seconds > 0 && now - it->t_last_used <= threshold) {
@@ -2026,7 +2026,7 @@ static std::list<server_prompt_cache_state>::iterator lru_find_inactive_first(
 
     // pass 2: the LRU resident entry, active or not
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (it->spilled()) {
+        if (!it->resident) {
             continue;
         }
         if (best == states.end() || it->t_last_used < best->t_last_used) {
@@ -2108,8 +2108,25 @@ bool server_prompt_cache::degrade(server_prompt_cache_state & state) {
     return true;
 }
 
-bool server_prompt_cache::spill(server_prompt_cache_state & state) {
-    if (disk_dir.empty() || state.spilled()) {
+bool server_prompt_cache::spill(server_prompt_cache_state & state, bool release_ram) {
+    if (disk_dir.empty()) {
+        return false;
+    }
+
+    if (state.spilled()) {
+        // already on disk: an eviction that still holds the RAM copy (mirrored)
+        // just drops it; a mirror has nothing left to write.
+        if (release_ram && state.resident) {
+            state.data.main.clear(); state.data.main.shrink_to_fit();
+            state.data.drft.clear(); state.data.drft.shrink_to_fit();
+            for (auto & c : state.prompt.checkpoints) {
+                c.data_tgt.clear();  c.data_tgt.shrink_to_fit();
+                c.data_dft.clear();  c.data_dft.shrink_to_fit();
+                c.data_spec.clear(); c.data_spec.shrink_to_fit();
+            }
+            state.resident = false;
+            return true;
+        }
         return false;
     }
 
@@ -2170,29 +2187,37 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state) {
     // this entry is restored, so do not let them sit in the page cache.
     l2_drop_page_cache(path, /*flush_first*/ true);
 
-    // release the RAM - the mapping goes back to common_state_buf's pool
-    state.data.main.clear(); state.data.main.shrink_to_fit();
-    state.data.drft.clear(); state.data.drft.shrink_to_fit();
-    for (auto & c : state.prompt.checkpoints) {
-        c.data_tgt.clear();  c.data_tgt.shrink_to_fit();
-        c.data_dft.clear();  c.data_dft.shrink_to_fit();
-        c.data_spec.clear(); c.data_spec.shrink_to_fit();
-    }
-
     state.spill_path  = path;
     state.spill_bytes = bytes;
 
+    if (release_ram) {
+        // release the RAM - the mapping goes back to common_state_buf's pool
+        state.data.main.clear(); state.data.main.shrink_to_fit();
+        state.data.drft.clear(); state.data.drft.shrink_to_fit();
+        for (auto & c : state.prompt.checkpoints) {
+            c.data_tgt.clear();  c.data_tgt.shrink_to_fit();
+            c.data_dft.clear();  c.data_dft.shrink_to_fit();
+            c.data_spec.clear(); c.data_spec.shrink_to_fit();
+        }
+        state.resident = false;
+    }
+
     const double t_ms = (ggml_time_us() - t_start) / 1000.0;
-    SRV_INF(" - L2: spilled %7d tokens (%.3f MiB) in %.0f ms (%.2f GB/s) to %s\n",
+    SRV_INF(" - L2: %s %7d tokens (%.3f MiB) in %.0f ms (%.2f GB/s) to %s\n",
+            release_ram ? "spilled" : "mirrored",
             state.prompt.n_tokens(), bytes / (1024.0 * 1024.0), t_ms,
             (bytes / 1e9) / (t_ms / 1000.0), path.c_str());
 
     return true;
 }
 
+bool server_prompt_cache::mirror(server_prompt_cache_state & state) {
+    return spill(state, /*release_ram*/ false);
+}
+
 bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
-    if (!state.spilled()) {
-        return true;
+    if (state.resident) {
+        return true; // already in RAM (resident or mirrored), nothing to read
     }
 
     const int64_t t_start = ggml_time_us();
@@ -2228,6 +2253,8 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
         }
     }
     f.close();
+
+    state.resident = true;
 
     const double t_ms = (ggml_time_us() - t_start) / 1000.0;
     SRV_INF(" - L2: restored %7d tokens (%.3f MiB) in %.0f ms (%.2f GB/s) from %s\n",
@@ -2303,11 +2330,13 @@ void server_prompt_cache::trim_disk() {
 
     // [deep-reuse] first reap entries that have aged past reap_seconds: a spill
     // nobody has touched for that long is dead, whatever the size budget says.
+    // Only fully-spilled entries (disk, no RAM copy) are reaped - a mirrored one
+    // still serves the RAM tier and is left alone.
     if (reap_seconds > 0) {
         const int64_t now       = ggml_time_us();
         const int64_t threshold = reap_seconds * 1000000;
         for (auto it = states.begin(); it != states.end(); ) {
-            if (it->spilled() && now - it->t_last_used > threshold) {
+            if (it->spilled() && !it->resident && now - it->t_last_used > threshold) {
                 SRV_INF(" - L2: reaping spilled entry idle for %.0f s (%d tokens)\n",
                         (now - it->t_last_used) / 1e6, it->prompt.n_tokens());
                 std::remove(it->spill_path.c_str());
@@ -2319,7 +2348,7 @@ void server_prompt_cache::trim_disk() {
     }
 
     while (disk_size() > limit_disk) {
-        auto it = lru_find(states, [](const server_prompt_cache_state & st) { return st.spilled(); });
+        auto it = lru_find(states, [](const server_prompt_cache_state & st) { return st.spilled() && !st.resident; });
 
         if (it == states.end()) {
             break;
@@ -2360,33 +2389,27 @@ void server_prompt_cache::spill_all() {
     }
 }
 
-void server_prompt_cache::spill_inactive() {
-    if (disk_dir.empty() || active_seconds <= 0) {
+void server_prompt_cache::mirror_resident() {
+    if (disk_dir.empty()) {
         return;
     }
 
-    const int64_t now       = ggml_time_us();
-    const int64_t threshold = active_seconds * 1000000;
-
-    size_t n_spilled = 0;
-    size_t n_bytes   = 0;
+    size_t n_mirrored = 0;
+    size_t n_bytes    = 0;
 
     for (auto & state : states) {
         if (state.spilled()) {
-            continue;
+            continue; // already on disk (mirrored or spilled)
         }
-        if (now - state.t_last_used <= threshold) {
-            continue; // still active, keep resident for fast restore
-        }
-        if (spill(state)) {
-            n_spilled++;
+        if (mirror(state)) {
+            n_mirrored++;
             n_bytes += state.spill_bytes;
         }
     }
 
-    if (n_spilled > 0) {
-        SRV_INF(" - L2: spilled %zu inactive cache entries (%.3f MiB) to %s\n",
-                n_spilled, n_bytes / (1024.0 * 1024.0), disk_dir.c_str());
+    if (n_mirrored > 0) {
+        SRV_INF(" - L2: mirrored %zu resident cache entries (%.3f MiB) to %s\n",
+                n_mirrored, n_bytes / (1024.0 * 1024.0), disk_dir.c_str());
     }
 }
 
@@ -2492,6 +2515,7 @@ void server_prompt_cache::index_disk() {
         state.prompt.deep_reuse  = idx.deep_reuse;
         state.spill_path         = c.path;
         state.spill_bytes        = c.bytes;
+        state.resident           = false; // [l2-mirror] indexed from disk: on disk, not in RAM
 
         // keep the relative order of the files, and keep every restored entry older
         // than anything this run creates
@@ -2541,7 +2565,7 @@ size_t server_prompt_cache::n_tokens_resident() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        if (!state.spilled()) {
+        if (state.resident) {
             res += state.prompt.n_tokens();
         }
     }
@@ -2701,6 +2725,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         },
         /*.spill_path  =*/ {},   // [l2-spill] resident on creation
         /*.spill_bytes =*/ 0,
+        /*.resident    =*/ true,
         /*.t_last_used =*/ ggml_time_us(),
     });
 
@@ -2711,7 +2736,7 @@ size_t server_prompt_cache::n_tokens_largest_resident() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        if (!state.spilled()) {
+        if (state.resident) {
             res = std::max(res, state.prompt.tokens.size());
         }
     }

@@ -5149,18 +5149,18 @@ private:
         }
 #endif
 
-        // [l2-spill] periodic background spill, so a hard kill / OOM / power loss
-        // loses at most --cache-spill-seconds worth of the RAM tier instead of all
-        // of it. Only INACTIVE entries (older than --cache-active-seconds) are
-        // moved; the active conversation stays resident for fast restore. Runs on
-        // the update_slots cadence (idle: ~1 Hz).
+        // [l2-mirror] periodic write-through, so a hard kill / OOM / power loss
+        // loses at most --cache-spill-seconds of the RAM tier instead of all of
+        // it. The entries stay resident - this is a power-loss safety net, not an
+        // eviction, so the RAM tier stays full. Runs on the update_slots cadence
+        // (idle: ~1 Hz).
         {
             const int64_t interval_ms = (int64_t) params_base.cache_spill_seconds * 1000;
             if (interval_ms > 0 && prompt_cache) {
                 const int64_t now = ggml_time_ms();
                 if (t_last_cache_spill_ms == 0 || now - t_last_cache_spill_ms >= interval_ms) {
                     t_last_cache_spill_ms = now;
-                    prompt_cache->spill_inactive();
+                    prompt_cache->mirror_resident();
                 }
             }
         }
