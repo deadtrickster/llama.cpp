@@ -643,6 +643,10 @@ struct server_slot {
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
+    // [metrics-live] called from print_timings_tg() with the window of generation
+    // since the last flush (n_delta tokens, t_delta_us), so the throughput gauge
+    // reads the live rate during a long generation instead of 0 until reset()
+    std::function<void(const server_slot &, uint64_t /* n_delta */, uint64_t /* t_delta_us */)> callback_on_timing;
 
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
@@ -1058,6 +1062,13 @@ struct server_slot {
 
         const double n_gen_second     = stats.n_gen_tps();
         const double n_gen_second_win = 1e6 / (t_now - t_print_last) * (stats.n_gen - n_gen_last);
+
+        // [metrics-live] hand the window to the server's rate bucket before advancing the
+        // print cursor, so a long reasoning generation is reflected in the throughput
+        // gauge while it is still running rather than only after the slot resets
+        if (callback_on_timing) {
+            callback_on_timing(*this, (uint64_t) (stats.n_gen - n_gen_last), (uint64_t) (t_now - t_print_last));
+        }
 
         t_print_last = t_now;
         n_gen_last = stats.n_gen;
@@ -3163,6 +3174,10 @@ private:
             if (slot.stats.n_gen > 0) {
                 metrics_on_prediction(slot);
             }
+        };
+
+        slot.callback_on_timing = [this](const server_slot & slot, uint64_t n_delta, uint64_t t_delta_us) {
+            metrics_on_prediction_window(slot, n_delta, t_delta_us);
         };
 
         slot.reset();
@@ -6858,13 +6873,32 @@ private:
         metrics_flush_prompt();
     }
 
+    // [metrics-live] add one window of an in-progress generation to the rate bucket.
+    // print_timings_tg() calls this every ~3s while a slot is generating, so a long
+    // reasoning block is reflected in the throughput gauge while it runs instead of
+    // only after it finishes and the slot resets. The slot argument is unused; the
+    // window (tokens, microseconds) is the whole point.
+    void metrics_on_prediction_window(const server_slot & /* slot */, uint64_t n_delta, uint64_t t_delta_us) {
+        metrics.predict_bucket.add(n_delta, n_delta, t_delta_us);
+    }
+
     void metrics_on_prediction(const server_slot & slot) {
         const uint64_t t_us    = slot.stats.t_gen_us();
         const uint64_t n       = slot.stats.n_gen;
         const uint64_t n_steps = slot.stats.n_gen_steps();
 
-        metrics.predict       .add(n, n_steps, t_us);
-        metrics.predict_bucket.add(n, n_steps, t_us);
+        // cumulative counters: the whole generation, added once here
+        metrics.predict.add(n, n_steps, t_us);
+
+        // [metrics-live] the rate bucket already received each periodic window from
+        // print_timings_tg()/metrics_on_prediction_window(); add only the tail since
+        // the last one so the bucket holds the generation exactly once, not once in
+        // windows and again in full at reset
+        const uint64_t n_tail = n - (uint64_t) slot.n_gen_last;
+        const uint64_t t_tail = slot.stats.t_gen_last > slot.t_print_last
+            ? (uint64_t) (slot.stats.t_gen_last - slot.t_print_last)
+            : t_us;
+        metrics.predict_bucket.add(n_tail, n_tail, t_tail);
 
         metrics.n_draft_tokens      += slot.stats.n_draft_tokens;
         metrics.n_draft_accepted    += slot.stats.n_draft_accepted;
