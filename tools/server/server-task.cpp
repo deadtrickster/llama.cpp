@@ -2499,7 +2499,7 @@ void server_prompt_cache::index_disk() {
         }
         f.close();
 
-        const auto & toks = idx.tokens.get_tokens();
+        const auto toks = idx.tokens.get_text_tokens();
         bool superseded = false;
         for (const auto & root : roots) {
             if (root.size() > toks.size() &&
