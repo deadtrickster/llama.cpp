@@ -92,8 +92,12 @@ public:
      * - Wait until req_stop_sleeping is set to true
      * - Call callback_sleeping_state(false)
      * - Exit sleeping state
+     *
+     * `ram_pressure` (optional) is consulted on top of the idle timer: the server
+     * only sleeps when it returns true, so an idle-but-not-pressured cache keeps
+     * the model and its resident conversations loaded instead of draining them.
      */
-    void start_loop(int64_t idle_sleep_ms = -1);
+    void start_loop(int64_t idle_sleep_ms = -1, std::function<bool()> ram_pressure = nullptr);
 
     // while waiting for work() to finish, run process_new_tasks on the worker thread
     // returns once work() is done (may throw exceptions)

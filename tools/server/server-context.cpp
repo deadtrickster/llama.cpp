@@ -6895,7 +6895,11 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
-    impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
+    // [sleep-pressure] hand the queue the RAM-pressure test: an idle server only
+    // sleeps when the prompt cache is actually near --cache-ram, so a quiet
+    // single conversation stays resident instead of being drained and reprefilled.
+    impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000,
+        [impl = impl.get()]() { return impl->prompt_cache ? impl->prompt_cache->under_ram_pressure() : false; });
 }
 
 void server_context::terminate() {

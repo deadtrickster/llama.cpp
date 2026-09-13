@@ -762,6 +762,16 @@ struct server_prompt_cache {
 
     size_t size() const;
 
+    // [sleep-pressure] whether the RAM tier holds enough of its limit that an idle
+    // sleep would actually reclaim something worth the reload it costs. The
+    // sleep-idle drain existed to stop a near-limit cache from OOMing the host;
+    // draining a few-GiB cache against an 80-GiB budget is pure loss - it evicts
+    // the only resident conversation for nothing. true: >= 3/4 of the limit, and
+    // only when a limit is actually set (no limit = nothing to be under).
+    bool under_ram_pressure() const {
+        return limit_size > 0 && size() * 4 >= limit_size * 3;
+    }
+
     size_t n_tokens() const;
 
     // [l2-spill] tokens held by the entries that still count toward limit_size - the ones the token

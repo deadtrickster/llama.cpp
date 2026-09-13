@@ -275,7 +275,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
     }
 }
 
-void server_queue::start_loop(int64_t idle_sleep_ms) {
+void server_queue::start_loop(int64_t idle_sleep_ms, std::function<bool()> ram_pressure) {
     running = true;
     time_last_task = ggml_time_ms();
 
@@ -290,6 +290,13 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     auto should_sleep = [&]() -> bool {
         // caller must hold mutex_tasks
         if (idle_sleep_ms < 0) {
+            return false;
+        }
+        // [sleep-pressure] idle alone is not enough: the sleep unloads the model
+        // and drains the RAM cache, so it must only fire when that RAM is actually
+        // worth reclaiming (the cache near its limit). Otherwise a quiet-but-small
+        // cache pays a reload + reprefill for nothing.
+        if (ram_pressure && !ram_pressure()) {
             return false;
         }
         int64_t now = ggml_time_ms();
