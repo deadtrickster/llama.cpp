@@ -1716,7 +1716,7 @@ static const uint32_t L2_SPILL_MAGIC   = 0x4C325350; // "L2SP"
 // The header is what identifies an entry, and it is first and length-prefixed so
 // that indexing a directory reads a few KB per file instead of the gigabytes of
 // KV state behind it. Version 1 files have no header and are ignored, not deleted.
-static const uint32_t L2_SPILL_VERSION = 2;
+static const uint32_t L2_SPILL_VERSION = 3; // v3 adds the deep_reuse flag to the header
 
 template <typename V>
 static void l2_write_vec(std::ofstream & f, const V & v) {
@@ -1793,6 +1793,7 @@ struct l2_header_reader {
 struct l2_spill_index_entry {
     server_tokens tokens;
     std::list<common_prompt_checkpoint> checkpoints; // position metadata only, data_* empty
+    bool deep_reuse = false; // [deep-reuse] persisted so granularity survives a restart
 };
 
 // [l2-header] serialize the identifying part of an entry
@@ -1809,6 +1810,9 @@ static void l2_write_header(std::ofstream & f, const server_prompt_cache_state &
         w.put((llama_pos) c.pos_min);
         w.put((llama_pos) c.pos_max);
     }
+
+    // [deep-reuse] one flag byte, after the checkpoint metadata
+    w.put((uint8_t) (state.prompt.deep_reuse ? 1 : 0));
 
     const uint64_t header_bytes = w.buf.size();
     f.write(reinterpret_cast<const char *>(&header_bytes), sizeof(header_bytes));
@@ -1827,9 +1831,9 @@ static bool l2_read_header(std::ifstream & f, const std::string & path, bool has
         return false;
     }
 
-    if (version != L2_SPILL_VERSION) {
+    if (version < 2 || version > L2_SPILL_VERSION) {
         // not ours to interpret and not ours to delete
-        SRV_WRN(" - L2: %s has format version %u, expected %u - ignoring the file\n",
+        SRV_WRN(" - L2: %s has format version %u, expected 2..%u - ignoring the file\n",
                 path.c_str(), version, L2_SPILL_VERSION);
         return false;
     }
@@ -1895,6 +1899,16 @@ static bool l2_read_header(std::ifstream & f, const std::string & path, bool has
         c.pos_max  = pos_max;
 
         out->checkpoints.push_back(std::move(c));
+    }
+
+    // [deep-reuse] v2 files predate the flag; default false for them.
+    if (version >= 3) {
+        uint8_t dr = 0;
+        if (!r.get(dr)) {
+            SRV_WRN(" - L2: malformed deep_reuse flag in %s\n", path.c_str());
+            return false;
+        }
+        out->deep_reuse = dr != 0;
     }
 
     return true;
@@ -1983,6 +1997,45 @@ static std::list<server_prompt_cache_state>::iterator lru_find(
     return best;
 }
 
+// [deep-reuse] like lru_find over the resident entries, but prefers the least-
+// recently-used INACTIVE entry (older than active_seconds) before touching any
+// active one. Used when RAM pressure forces a spill, so a busy conversation is
+// not moved to disk while an idle one still holds RAM.
+static std::list<server_prompt_cache_state>::iterator lru_find_inactive_first(
+        std::list<server_prompt_cache_state> & states, int64_t active_seconds) {
+    const int64_t now       = ggml_time_us();
+    const int64_t threshold = active_seconds * 1000000;
+
+    auto best = states.end();
+
+    // pass 1: the LRU resident entry that is already inactive
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->spilled()) {
+            continue;
+        }
+        if (active_seconds > 0 && now - it->t_last_used <= threshold) {
+            continue;
+        }
+        if (best == states.end() || it->t_last_used < best->t_last_used) {
+            best = it;
+        }
+    }
+    if (best != states.end()) {
+        return best;
+    }
+
+    // pass 2: the LRU resident entry, active or not
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->spilled()) {
+            continue;
+        }
+        if (best == states.end() || it->t_last_used < best->t_last_used) {
+            best = it;
+        }
+    }
+    return best;
+}
+
 size_t server_prompt_cache::disk_size() const {
     size_t res = 0;
     for (const auto & state : states) {
@@ -2012,22 +2065,24 @@ bool server_prompt_cache::degrade(server_prompt_cache_state & state) {
     switch (state.degrade_level) {
         case 0:
             {
-                // thin: drop every other checkpoint, keeping the newest - the one a
-                // rollback is most likely to land on.
+                // [deep-reuse] thin: drop the middle checkpoints, keep the newest
+                // (a near-tip rollback lands there) and the oldest (a deep anchor
+                // still lets a rollback reach far back without reprocessing from 0).
                 auto & ckpts = state.prompt.checkpoints;
-                bool drop = false;
-                for (auto it = ckpts.begin(); it != ckpts.end(); ) {
-                    if (drop && std::next(it) != ckpts.end()) {
-                        it = ckpts.erase(it);
-                    } else {
-                        ++it;
-                    }
-                    drop = !drop;
+                if (ckpts.size() > 2) {
+                    ckpts.erase(std::next(ckpts.begin()), std::prev(ckpts.end()));
                 }
             } break;
         case 1:
-            state.prompt.checkpoints.clear();
-            break;
+            {
+                // drop the oldest anchor too, keeping only the newest checkpoint:
+                // the conversation is still restorable near the tip, and anything
+                // older reprocesses from the start.
+                auto & ckpts = state.prompt.checkpoints;
+                if (ckpts.size() > 1) {
+                    ckpts.erase(ckpts.begin(), std::prev(ckpts.end()));
+                }
+            } break;
         case 2:
             state.data.drft = {};
             break;
@@ -2246,6 +2301,23 @@ void server_prompt_cache::trim_disk() {
         return;
     }
 
+    // [deep-reuse] first reap entries that have aged past reap_seconds: a spill
+    // nobody has touched for that long is dead, whatever the size budget says.
+    if (reap_seconds > 0) {
+        const int64_t now       = ggml_time_us();
+        const int64_t threshold = reap_seconds * 1000000;
+        for (auto it = states.begin(); it != states.end(); ) {
+            if (it->spilled() && now - it->t_last_used > threshold) {
+                SRV_INF(" - L2: reaping spilled entry idle for %.0f s (%d tokens)\n",
+                        (now - it->t_last_used) / 1e6, it->prompt.n_tokens());
+                std::remove(it->spill_path.c_str());
+                it = states.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
     while (disk_size() > limit_disk) {
         auto it = lru_find(states, [](const server_prompt_cache_state & st) { return st.spilled(); });
 
@@ -2284,6 +2356,36 @@ void server_prompt_cache::spill_all() {
 
     if (n_spilled > 0) {
         SRV_INF(" - L2: spilled %zu remaining cache entries (%.3f MiB) to %s\n",
+                n_spilled, n_bytes / (1024.0 * 1024.0), disk_dir.c_str());
+    }
+}
+
+void server_prompt_cache::spill_inactive() {
+    if (disk_dir.empty() || active_seconds <= 0) {
+        return;
+    }
+
+    const int64_t now       = ggml_time_us();
+    const int64_t threshold = active_seconds * 1000000;
+
+    size_t n_spilled = 0;
+    size_t n_bytes   = 0;
+
+    for (auto & state : states) {
+        if (state.spilled()) {
+            continue;
+        }
+        if (now - state.t_last_used <= threshold) {
+            continue; // still active, keep resident for fast restore
+        }
+        if (spill(state)) {
+            n_spilled++;
+            n_bytes += state.spill_bytes;
+        }
+    }
+
+    if (n_spilled > 0) {
+        SRV_INF(" - L2: spilled %zu inactive cache entries (%.3f MiB) to %s\n",
                 n_spilled, n_bytes / (1024.0 * 1024.0), disk_dir.c_str());
     }
 }
@@ -2387,6 +2489,7 @@ void server_prompt_cache::index_disk() {
         server_prompt_cache_state state;
         state.prompt.tokens      = std::move(idx.tokens);
         state.prompt.checkpoints = std::move(idx.checkpoints);
+        state.prompt.deep_reuse  = idx.deep_reuse;
         state.spill_path         = c.path;
         state.spill_bytes        = c.bytes;
 
@@ -2520,21 +2623,25 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         while (!states.empty() && size() + state_size_new > limit_size) {
             // [cache-ladder] Rung one: shed fidelity before evicting anything.
             //
-            // The victim is the LEAST DEGRADED entry, and only among those the least
-            // recently used. Degrading the LRU entry repeatedly would strip one
-            // conversation bare while the next kept everything - the same cliff as
-            // spilling, just slower. Taking the least degraded first spreads the loss
-            // evenly, so every conversation keeps a usable shape, with LRU deciding
-            // the order within a rung.
+            // The victim is scored (deep_reuse, t_last_used, degrade_level), lowest
+            // first: a conversation that has never rolled back sheds its deep
+            // checkpoints before one that has (they are dead weight in a pure
+            // append-only history), and the oldest goes before the newest, so the
+            // busy conversation keeps its granularity. degrade_level spreads the
+            // loss within a class so one entry is not stripped while its equal
+            // keeps everything.
             {
                 std::list<server_prompt_cache_state>::iterator best = states.end();
                 for (auto it = states.begin(); it != states.end(); ++it) {
                     if (!it->can_degrade()) {
                         continue;
                     }
-                    if (best == states.end() ||
-                        it->degrade_level <  best->degrade_level ||
-                       (it->degrade_level == best->degrade_level && it->t_last_used < best->t_last_used)) {
+                    const bool better =
+                        best == states.end() ||
+                        (int) it->prompt.deep_reuse <  (int) best->prompt.deep_reuse ||
+                        (it->prompt.deep_reuse == best->prompt.deep_reuse && it->t_last_used <  best->t_last_used) ||
+                        (it->prompt.deep_reuse == best->prompt.deep_reuse && it->t_last_used == best->t_last_used && it->degrade_level < best->degrade_level);
+                    if (better) {
                         best = it;
                     }
                 }
@@ -2546,7 +2653,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             // [l2-spill] prefer moving the oldest resident entry to disk over
             // destroying it. Spilled entries keep their index in RAM but stop
             // counting toward the size limit.
-            auto it = lru_find(states, [](const server_prompt_cache_state & st) { return !st.spilled(); });
+            auto it = lru_find_inactive_first(states, active_seconds);
 
             if (it == states.end()) {
                 break; // nothing resident left to free
@@ -2586,6 +2693,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.deep_reuse  =*/ prompt.deep_reuse,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -2726,7 +2834,7 @@ void server_prompt_cache::update() {
             // [l2-spill] move the oldest resident entry to disk rather than
             // destroying it. Spilled entries stay in `states` (their token list
             // is the index) but no longer count toward the RAM limit.
-            auto it = lru_find(states, [](const server_prompt_cache_state & st) { return !st.spilled(); });
+            auto it = lru_find_inactive_first(states, active_seconds);
 
             if (it == states.end()) {
                 break; // everything resident has already been spilled
@@ -2776,7 +2884,7 @@ void server_prompt_cache::update() {
     // it is destroyed only when it cannot be spilled.
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens_resident() > limit_tokens_cur) {
-            auto it = lru_find(states, [](const server_prompt_cache_state & st) { return !st.spilled(); });
+            auto it = lru_find_inactive_first(states, active_seconds);
             if (it == states.end()) {
                 break;
             }

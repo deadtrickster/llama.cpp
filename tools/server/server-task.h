@@ -570,6 +570,12 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // [deep-reuse] true once this conversation has rolled back into its own deep
+    // history (a restore landed on a non-tip context checkpoint). A conversation
+    // that has never rolled back only ever grows append-only, so its deep
+    // checkpoints are dead weight and shed first under cache pressure.
+    bool deep_reuse = false;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
@@ -583,6 +589,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            deep_reuse,
         };
     }
 };
@@ -626,8 +633,8 @@ struct server_prompt_cache_state {
     // conversation instead of a perfect shape for a few.
     //
     //   0  full            checkpoints as placed
-    //   1  thinned         every other checkpoint dropped, newest kept
-    //   2  skeletal        no checkpoints; KV + draft only
+    //   1  middle dropped  newest + oldest kept
+    //   2  tip only        only the newest checkpoint kept
     //   3  no draft        MTP draft state dropped; restore loses acceptance
     //   4  exhausted       nothing left to shed - the caller spills
     int degrade_level = 0;
@@ -682,6 +689,16 @@ struct server_prompt_cache {
     // which also collapses the size_per_token estimate that drives limit_tokens.
     size_t limit_disk = 0;
 
+    // [deep-reuse] an entry with t_last_used newer than this many seconds is
+    // "active" and stays resident while older entries spill first; 0 = every
+    // resident entry is treated as active (LRU decides, the historical behaviour).
+    int64_t active_seconds = 0;
+
+    // [deep-reuse] a spilled entry older than this many seconds is reaped from
+    // disk regardless of size; 0 = size-only trimming (LRU by size, the
+    // historical behaviour).
+    int64_t reap_seconds = 0;
+
     // total bytes currently held on disk
     size_t disk_size() const;
 
@@ -711,6 +728,12 @@ struct server_prompt_cache {
     // [l2-persist] move every still-resident entry to disk. Called on shutdown and
     // on the sleep path, where the alternative is throwing the whole cache away.
     void spill_all();
+
+    // [deep-reuse] spill the resident entries that are older than active_seconds,
+    // leaving the active ones in RAM for fast restore. The periodic background
+    // spill calls this, not spill_all(), so an active conversation is not moved
+    // to disk every interval.
+    void spill_inactive();
 
     // [l2-persist] adopt this model's spill files left by a previous run. Only the
     // headers are read, so the entries come back marked spilled(): tokens resident

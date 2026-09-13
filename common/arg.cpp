@@ -1783,6 +1783,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_SPILL_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-active-seconds"}, "N",
+        string_format("[deep-reuse] an entry hit within N seconds is 'active' and stays resident in RAM "
+            "while older entries spill to disk first. 0 = LRU decides, no active/dead split (default: %d). "
+            "Requires --slot-save-path", params.cache_active_seconds),
+        [](common_params & params, int value) {
+            params.cache_active_seconds = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_ACTIVE_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-reap-seconds"}, "N",
+        string_format("[deep-reuse] a spilled entry idle longer than N seconds is reaped from disk regardless "
+            "of the size budget. 0 = size-only trimming (default: %d). Requires --slot-save-path", params.cache_reap_seconds),
+        [](common_params & params, int value) {
+            params.cache_reap_seconds = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_REAP_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

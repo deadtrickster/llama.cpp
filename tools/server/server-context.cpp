@@ -2017,8 +2017,10 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.slot_save_path, params_base.cache_disk_mib);
-            prompt_cache->model_key = build_prompt_cache_model_key();
-            prompt_cache->has_mtmd  = mctx != nullptr;
+            prompt_cache->model_key      = build_prompt_cache_model_key();
+            prompt_cache->has_mtmd       = mctx != nullptr;
+            prompt_cache->active_seconds = params_base.cache_active_seconds;
+            prompt_cache->reap_seconds   = params_base.cache_reap_seconds;
             prompt_cache->sweep_orphans();
 
             // [l2-persist] adopt whatever the previous run (or the pre-sleep cache)
@@ -5149,16 +5151,16 @@ private:
 
         // [l2-spill] periodic background spill, so a hard kill / OOM / power loss
         // loses at most --cache-spill-seconds worth of the RAM tier instead of all
-        // of it. spill_all() is incremental - it skips entries already on disk -
-        // so the steady-state cost is only the entries a turn made resident since
-        // the last pass. Runs on the update_slots cadence (idle: ~1 Hz).
+        // of it. Only INACTIVE entries (older than --cache-active-seconds) are
+        // moved; the active conversation stays resident for fast restore. Runs on
+        // the update_slots cadence (idle: ~1 Hz).
         {
             const int64_t interval_ms = (int64_t) params_base.cache_spill_seconds * 1000;
             if (interval_ms > 0 && prompt_cache) {
                 const int64_t now = ggml_time_ms();
                 if (t_last_cache_spill_ms == 0 || now - t_last_cache_spill_ms >= interval_ms) {
                     t_last_cache_spill_ms = now;
-                    prompt_cache->spill_all();
+                    prompt_cache->spill_inactive();
                 }
             }
         }
@@ -5943,6 +5945,11 @@ private:
                                         it->load_dft(ctx_dft, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.seq_id, it->data_spec);
+
+                                        // [deep-reuse] a restore from a non-tip checkpoint means this
+                                        // conversation rolled back into its own history, so its deep
+                                        // checkpoints are not dead weight - they may be used again.
+                                        slot.prompt.deep_reuse = true;
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);

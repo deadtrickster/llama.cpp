@@ -647,6 +647,8 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_disk_mib =  0; // [l2-spill] level-2 disk cache limit in MiB, 0 = unlimited
     int32_t cache_spill_seconds = 0; // [l2-spill] spill resident cache entries to disk every N seconds (0 = only on full/exit/sleep)
+    int32_t cache_active_seconds = 0; // [deep-reuse] an entry hit within N seconds stays resident; older spills first (0 = LRU decides)
+    int32_t cache_reap_seconds = 0;   // [deep-reuse] reap spilled entries idle longer than N seconds from disk (0 = size-only)
 
     // [preempt] decode quantum: after this many generated tokens a slot yields
     // to waiting work, snapshotting its state so it resumes identically.
