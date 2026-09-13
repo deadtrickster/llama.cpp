@@ -646,6 +646,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     int32_t cache_disk_mib =  0; // [l2-spill] level-2 disk cache limit in MiB, 0 = unlimited
+    int32_t cache_spill_seconds = 0; // [l2-spill] spill resident cache entries to disk every N seconds (0 = only on full/exit/sleep)
 
     // [preempt] decode quantum: after this many generated tokens a slot yields
     // to waiting work, snapshotting its state so it resumes identically.

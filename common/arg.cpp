@@ -1774,6 +1774,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-spill-seconds"}, "N",
+        string_format("[l2-spill] spill resident prompt-cache entries to disk every N seconds so a hard "
+            "kill or OOM only loses the last N seconds, not the whole RAM tier. 0 = spill only on "
+            "full/exit/sleep (default: %d). Requires --slot-save-path", params.cache_spill_seconds),
+        [](common_params & params, int value) {
+            params.cache_spill_seconds = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SPILL_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

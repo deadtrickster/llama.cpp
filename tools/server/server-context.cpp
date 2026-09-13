@@ -1403,6 +1403,10 @@ private:
 
     int64_t t_last_load_progress_ms = 0;
 
+    // [l2-spill] periodic background spill: last time spill_all() ran. 0 until the
+    // first one. --cache-spill-seconds drives how often; 0 keeps the old behaviour.
+    int64_t t_last_cache_spill_ms = 0;
+
     void destroy() {
         // [l2-persist] this runs on the sleep path too, where the model is unloaded
         // and reloaded around a swap. Without this the whole cache is discarded and
@@ -5142,6 +5146,22 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // [l2-spill] periodic background spill, so a hard kill / OOM / power loss
+        // loses at most --cache-spill-seconds worth of the RAM tier instead of all
+        // of it. spill_all() is incremental - it skips entries already on disk -
+        // so the steady-state cost is only the entries a turn made resident since
+        // the last pass. Runs on the update_slots cadence (idle: ~1 Hz).
+        {
+            const int64_t interval_ms = (int64_t) params_base.cache_spill_seconds * 1000;
+            if (interval_ms > 0 && prompt_cache) {
+                const int64_t now = ggml_time_ms();
+                if (t_last_cache_spill_ms == 0 || now - t_last_cache_spill_ms >= interval_ms) {
+                    t_last_cache_spill_ms = now;
+                    prompt_cache->spill_all();
+                }
+            }
+        }
 
         // [preempt] P2 / [seats] / [deadline]: put yielded generations back on a seat.
         //

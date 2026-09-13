@@ -2499,6 +2499,22 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
+    // [l2-compact] reaching here with entries still present means the new prompt
+    // is not a prefix-extension of any of them: the conversation was compacted
+    // (history replaced by a summary), so those surviving entries are the dead
+    // pre-compaction snapshots. Spill them once so a restore can still reach
+    // them, then drop them from the index - otherwise one conversation keeps
+    // every historical depth resident and floods the RAM/disk budget. This is
+    // correct for the single-active-conversation shape the server is sized for;
+    // a multi-conversation server would instead want to key entries by session
+    // and drop only the compacted one's own history.
+    if (!states.empty()) {
+        if (!disk_dir.empty()) {
+            spill_all();
+        }
+        states.clear();
+    }
+
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
