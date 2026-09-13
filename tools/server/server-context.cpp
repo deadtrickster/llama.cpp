@@ -1905,6 +1905,16 @@ private:
                 params_base.n_parallel, n_seq_max, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
 
         if (pool_elastic()) {
+            // [pool] start minimal and grow on demand. -c only sizes the ceiling
+            // (the KV buffer); pre-allocating it and then shrinking was the path
+            // that got a deep conversation stuck: the pool shrank to hand cells
+            // back for sequence ids and could not grow back past the headroom.
+            // Starting at the floor means the pool only ever grows with the
+            // conversation, so there is nothing to "grow back".
+            const uint32_t n_start = pool_min_ctx();
+            if (n_start < pool_size()) {
+                pool_resize(n_start, "starting minimal, growing on demand");
+            }
             SRV_INF("[pool] elastic: starts at %u cells, one conversation always has room for one id and %u cells (%s)\n",
                     pool_size(), pool_min_ctx(), params_base.pool_min_ctx > 0 ? "--pool-min-ctx" : "derived from n_batch");
             if (pool_selftest().on) {
