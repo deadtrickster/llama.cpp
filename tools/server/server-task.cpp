@@ -2424,6 +2424,8 @@ void server_prompt_cache::index_disk() {
         std::string path;
         size_t      bytes;
         int64_t     mtime;
+        int         n_tokens   = 0; // parsed from the filename
+        bool        superseded = false;
     };
 
     std::vector<candidate> found;
@@ -2453,24 +2455,88 @@ void server_prompt_cache::index_disk() {
             continue;
         }
 
+        int n_tokens = 0;
+        {
+            // name is l2p-<model_key>-<n_tokens>-<hash>.spill; the count sits right
+            // after the model_key and its trailing dash
+            const size_t p = prefix.size();
+            const size_t q = name.find('-', p);
+            if (q != std::string::npos) {
+                n_tokens = std::atoi(name.substr(p, q - p).c_str());
+            }
+        }
+
         found.push_back({ entry.path().string(), (size_t) bytes,
-                          (int64_t) mtime.time_since_epoch().count() });
+                          (int64_t) mtime.time_since_epoch().count(), n_tokens, false });
     }
 
     if (found.empty()) {
         return;
     }
 
-    // newest first, so a disk budget smaller than what is on disk keeps the most
-    // recently used entries and drops the rest, exactly as update() would have
+    // [l2-superseded] a mirror writes a fresh full snapshot each time a
+    // conversation grows, so the disk accumulates every intermediate depth of the
+    // same conversation (measured: 300+ files, ~1 TiB, most of it superseded).
+    // Age was the wrong axis to evict on - it dropped the newest snapshot of an
+    // old conversation while keeping dozens of stale snapshots of the live one.
+    // Mark a snapshot superseded when a strictly longer one with the same token
+    // prefix exists (same conversation, later point); those go first under budget.
+    //
+    // Deepest first: the deepest snapshot of a conversation is never superseded,
+    // and becomes a "root" that every earlier snapshot is tested against. A
+    // prefix test against the deepest snapshot alone is sufficient - if an earlier
+    // snapshot is a prefix of any later one, it is a prefix of the deepest one too.
     std::sort(found.begin(), found.end(),
-              [](const candidate & a, const candidate & b) { return a.mtime > b.mtime; });
+              [](const candidate & a, const candidate & b) { return a.n_tokens > b.n_tokens; });
+
+    std::vector<llama_tokens> roots;
+    size_t n_superseded = 0;
+    for (auto & c : found) {
+        std::ifstream f(c.path, std::ios::binary);
+        l2_spill_index_entry idx;
+        if (!f || !l2_read_header(f, c.path, has_mtmd, &idx) || idx.tokens.size() == 0) {
+            continue; // unreadable or empty: left where it is, not judged
+        }
+        f.close();
+
+        const auto & toks = idx.tokens.get_tokens();
+        bool superseded = false;
+        for (const auto & root : roots) {
+            if (root.size() > toks.size() &&
+                std::equal(toks.begin(), toks.end(), root.begin())) {
+                superseded = true;
+                break;
+            }
+        }
+        c.superseded = superseded;
+        if (superseded) {
+            n_superseded++;
+        } else {
+            roots.push_back(toks);
+        }
+    }
+
+    // keep order for the budget: every live (non-superseded) snapshot before every
+    // superseded one, newest first within each. Superseded files are only kept
+    // when the budget has room left after the live ones.
+    std::sort(found.begin(), found.end(), [](const candidate & a, const candidate & b) {
+        if (a.superseded != b.superseded) {
+            return !a.superseded;
+        }
+        return a.mtime > b.mtime;
+    });
+
+    if (n_superseded > 0) {
+        SRV_INF(" - L2: %zu superseded intermediate snapshot(s) found on disk; they are dropped first under the budget\n",
+                n_superseded);
+    }
 
     size_t budget = 0;
     size_t n_kept = 0;
     for (const auto & c : found) {
         if (limit_disk > 0 && budget + c.bytes > limit_disk) {
-            SRV_WRN(" - L2: disk budget exhausted while indexing, removing %s\n", c.path.c_str());
+            SRV_WRN(" - L2: disk budget exhausted while indexing, removing %s%s\n",
+                    c.path.c_str(), c.superseded ? " (superseded snapshot)" : "");
             std::remove(c.path.c_str());
             continue;
         }
