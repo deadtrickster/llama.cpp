@@ -9700,6 +9700,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 #endif
 
+    // narrow outputs over a long K (a 16384 -> 24 projection is 12 blocks for the mat-vec kernel);
+    // exercises the CUDA split-K path, with batch and broadcast dims so the slab indexing is checked
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        for (int m : {24, 25, 128}) {
+            for (int n : {1, 2, 3, 4, 8}) {
+                for (int k : {4096, 16384, 16384 + 256}) {
+                    test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 16384, {3, 1}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 16384, {3, 2}, {1, 1}));
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 16384, {1, 1}, {2, 1}));
+            }
+        }
+    }
+
 #if 1
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
@@ -10763,6 +10778,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // narrow-output mat-vec shapes from GLM-5.3-Flash (mHC projections 16384->24, ssm gates 4096->128)
+    for (int m : {24, 128}) {
+        for (int n : {1, 3}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, m == 24 ? 16384 : 4096, {1, 1}, {1, 1}));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
