@@ -56,6 +56,10 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // without this the base class answers false and a GLM-5.3 decode graph is rebuilt,
+    // re-allocated and re-captured on every step (measured: graphs reused = 0, ~1.8 ms/step)
+    bool can_reuse(const llm_graph_params & params) override;
+
     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
     ggml_tensor * pool_cells = nullptr;   // I32 [kpool*n_pools, n_stream]
     ggml_tensor * pool_bias  = nullptr;   // F32 [n_pools, n_tps, n_stream]
