@@ -2836,7 +2836,12 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_it(cons
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        // more of the new prompt reused (f_sim) at no worse a keep fraction is a better entry. the
+        // keep comparison must admit EQUALITY: every entry that is a pure prefix of the conversation
+        // has f_keep = 1.0, and with a strict test the first such entry the list happened to hold
+        // won for good - measured: an 83,701-token state restored while a 112,122-token one sat in
+        // the cache, and 28k tokens were prefilled again
+        if (f_keep_best <= f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
