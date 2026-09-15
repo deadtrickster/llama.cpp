@@ -1741,6 +1741,10 @@ void llama_kv_cache::set_kpool_dirty() {
     kpool_dirty = true;
 }
 
+llama_kpool_scan & llama_kv_cache::kpool_scan_for(llama_seq_id seq_id) const {
+    return kpool_scans[seq_id];
+}
+
 bool llama_kv_cache::get_kpool_dirty() const {
     return kpool_dirty;
 }

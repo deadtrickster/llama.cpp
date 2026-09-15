@@ -63,6 +63,90 @@ static void kpool_mask_row(
     }
 }
 
+// Bring a sequence's memoized scan up to date. Pass 1 (positions, pool index range) is keyed on
+// the cells' generation, the extent and the pool size; pass 2 (the cell -> pool map) additionally
+// on n_run, which the caller only knows after rebalancing the runs of a stream. n_run < 0 asks
+// for pass 1 only. Every value is computed exactly as the unmemoized scan computed it.
+static void kpool_scan_update(
+        llama_kpool_scan     & sc,
+        const llama_kv_cells & cells,
+        llama_seq_id           seq,
+        int64_t                n_kv,
+        uint32_t               r,
+        int64_t                n_run) {
+    const uint64_t gen = cells.generation();
+
+    const bool fresh = sc.gen == gen && sc.n_kv == n_kv && sc.r == r && sc.seq == seq;
+
+    if (!fresh) {
+        sc.gen   = gen;
+        sc.n_kv  = n_kv;
+        sc.r     = r;
+        sc.seq   = seq;
+        sc.n_run = -1;
+
+        sc.found = false;
+        sc.b_min = 0;
+        sc.b_max = 0;
+
+        sc.pos_at.resize(n_kv);
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const bool mine = !cells.is_empty(j) && cells.seq_has(j, seq);
+
+            sc.pos_at[j] = mine ? cells.pos_get(j) : -1;
+
+            if (!mine) {
+                continue;
+            }
+
+            const int64_t b = sc.pos_at[j]/r;
+            sc.b_min = sc.found ? std::min(sc.b_min, b) : b;
+            sc.b_max = sc.found ? std::max(sc.b_max, b) : b;
+            sc.found = true;
+        }
+    }
+
+    if (n_run < 0 || (fresh && sc.n_run == n_run)) {
+        return;
+    }
+
+    sc.n_run = n_run;
+
+    // anchor at the absolute p/kpool (vLLM, SGLang; not HF's valid_keys.argmax(-1)): the only
+    // anchor that keeps a pool's identity stable from prefill to the decodes that read it
+    sc.b_base = std::max(sc.b_min, sc.b_max - (n_run - 1));
+
+    sc.pool_of.assign(n_kv, -1);
+    sc.filled .assign(n_run, 0);
+    sc.cells  .assign(n_run*r, 0);
+
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (sc.pos_at[j] < 0) {
+            continue;
+        }
+
+        const llama_pos p  = sc.pos_at[j];
+        const int64_t   bo = p/r - sc.b_base;
+
+        if (bo < 0 || bo >= n_run) {
+            continue;
+        }
+
+        sc.pool_of[j] = (int32_t) bo;
+        sc.cells[bo*r + (p%r)] = (int32_t) j;
+        sc.filled[bo]++;
+    }
+
+    // pool_valid = grouped_valid_keys.all(-1): the compressor consumes all r keys
+    for (int64_t j = 0; j < n_kv; ++j) {
+        // != rather than <: two cells claiming one position overwrite each other
+        if (sc.pool_of[j] >= 0 && sc.filled[sc.pool_of[j]] != (int32_t) r) {
+            sc.pool_of[j] = -1;
+        }
+    }
+}
+
 void llama_kv_cache_set_input_kpool(
         const llama_kv_cache * kv,
               ggml_tensor    * cell_pool,
@@ -185,11 +269,6 @@ void llama_kv_cache_set_input_kpool(
     const bool   mask_f16 = sel_mask->type == GGML_TYPE_F16;
     const size_t mask_ts  = ggml_type_size(sel_mask->type);
 
-    // -1 marks a cell with no usable pool; host side only, never copied into cell_pool
-    std::vector<int32_t>   pool_of(n_kv);
-    std::vector<int32_t>   filled(n_pools);
-    std::vector<llama_pos> pos_at;
-
     std::vector<int64_t> run_off(n_ps);
     std::vector<int64_t> run_len(n_ps);
 
@@ -236,23 +315,11 @@ void llama_kv_cache_set_input_kpool(
 
             for (int64_t ps = 0; ps < n_ps; ++ps) {
                 const llama_seq_id seq = seq_of(s, ps);
-                const auto & cells = kv->get_cells(seq);
 
-                int64_t b_min = 0;
-                int64_t b_max = 0;
-                bool    found = false;
+                auto & sc = kv->kpool_scan_for(seq);
+                kpool_scan_update(sc, kv->get_cells(seq), seq, n_kv, (uint32_t) r, /*n_run=*/ -1);
 
-                for (int64_t j = 0; j < n_kv; ++j) {
-                    if (cells.is_empty(j) || !cells.seq_has(j, seq)) {
-                        continue;
-                    }
-                    const int64_t b = cells.pos_get(j)/r;
-                    b_min = found ? std::min(b_min, b) : b;
-                    b_max = found ? std::max(b_max, b) : b;
-                    found = true;
-                }
-
-                run_len[ps] = found ? b_max - b_min + 1 : 0;
+                run_len[ps] = sc.found ? sc.b_max - sc.b_min + 1 : 0;
                 n_want += run_len[ps];
             }
 
@@ -285,59 +352,20 @@ void llama_kv_cache_set_input_kpool(
             int32_t * cur_cell_pool   = dst_cell_pool ? dst_cell_pool + s*n_kv : nullptr;
             int32_t * part_pool_cells = cur_pool_cells + run_off[ps]*r;
 
-            std::fill(pool_of.begin(), pool_of.end(), -1);
-            std::fill(filled.begin(),  filled.end(),   0);
+            auto & sc = kv->kpool_scan_for(seq_of_pool);
+            kpool_scan_update(sc, cells, seq_of_pool, n_kv, (uint32_t) r, n_run);
 
-            pos_at.resize(n_kv);
-            for (int64_t j = 0; j < n_kv; ++j) {
-                pos_at[j] = cells.is_empty(j) || !cells.seq_has(j, seq_of_pool) ? -1 : cells.pos_get(j);
-            }
+            const int64_t b_base = sc.b_base;
 
-            // anchor at the absolute p/kpool (vLLM, SGLang; not HF's valid_keys.argmax(-1)): the only
-            // anchor that keeps a pool's identity stable from prefill to the decodes that read it
-            int64_t b_base = 0;
-            {
-                int64_t b_min = 0;
-                int64_t b_max = 0;
-                bool    found = false;
+            const std::vector<llama_pos> & pos_at  = sc.pos_at;
+            const std::vector<int32_t>   & pool_of = sc.pool_of;
+            const std::vector<int32_t>   & filled  = sc.filled;
 
+            // the stream's pool_cells were zero-filled above; the run's slots come from the memo
+            std::copy(sc.cells.begin(), sc.cells.end(), part_pool_cells);
+
+            if (cur_cell_pool) {
                 for (int64_t j = 0; j < n_kv; ++j) {
-                    if (pos_at[j] < 0) {
-                        continue;
-                    }
-                    const int64_t b = pos_at[j]/r;
-                    b_min = found ? std::min(b_min, b) : b;
-                    b_max = found ? std::max(b_max, b) : b;
-                    found = true;
-                }
-
-                b_base = std::max(b_min, b_max - (n_run - 1));
-            }
-
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (pos_at[j] < 0) {
-                    continue;
-                }
-
-                const llama_pos p  = pos_at[j];
-                const int64_t   bo = p/r - b_base;
-
-                if (bo < 0 || bo >= n_run) {
-                    continue;
-                }
-
-                pool_of[j] = (int32_t) bo;
-                part_pool_cells[bo*r + (p%r)] = (int32_t) j;
-                filled[bo]++;
-            }
-
-            // pool_valid = grouped_valid_keys.all(-1): the compressor consumes all r keys
-            for (int64_t j = 0; j < n_kv; ++j) {
-                // != rather than <: two cells claiming one position overwrite each other
-                if (pool_of[j] >= 0 && filled[pool_of[j]] != (int32_t) r) {
-                    pool_of[j] = -1;
-                }
-                if (cur_cell_pool) {
                     cur_cell_pool[j] = pool_of[j] < 0 ? 0 : pool_of[j];
                 }
             }

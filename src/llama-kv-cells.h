@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -37,7 +38,23 @@ class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
+    // incremented by every mutating method, so a consumer can memoize work derived from the
+    // cell state (the pooled-indexer scan is O(n_kv) per decode step otherwise) and redo it
+    // only when the cells actually changed
+    uint64_t generation() const {
+        return gen;
+    }
+
+    // drawn from one process-wide counter so no two states of any cells object share a value;
+    // a memo keyed on it cannot be fooled by an object that was replaced wholesale
+    // (llama_kv_cache: cells = std::move(cells_new)) and happened to reach the same count
+    static uint64_t next_generation() {
+        static std::atomic<uint64_t> counter{0};
+        return ++counter;
+    }
+
     void reset() {
+        gen = next_generation();
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
@@ -55,6 +72,7 @@ public:
     }
 
     void reset_shift() {
+        gen = next_generation();
         has_shift = false;
 
         for (uint32_t i = 0; i < shift.size(); ++i) {
@@ -67,6 +85,7 @@ public:
     }
 
     void resize(uint32_t n) {
+        gen = next_generation();
         pos.resize(n);
         ext.resize(n);
         shift.resize(n);
@@ -164,6 +183,7 @@ public:
 
     // set the state of cells [i, i + other.pos.size()) (used for save/restore the state of the cells)
     void set(uint32_t i, const llama_kv_cells & other) {
+        gen = next_generation();
         assert(i + other.pos.size() <= pos.size());
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
@@ -195,6 +215,7 @@ public:
 
     // set the state of cells [idxs[0], idxs[1], ..., idxs[idxs.size() - 1])
     void set(const std::vector<uint32_t> & idxs, const llama_kv_cells & other) {
+        gen = next_generation();
         assert(idxs.size() == other.pos.size());
 
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
@@ -226,6 +247,7 @@ public:
 
     // clear a non-empty cell
     void rm(uint32_t i) {
+        gen = next_generation();
         assert(i < pos.size());
         assert(pos[i] != -1);
 
@@ -242,6 +264,7 @@ public:
     // note: call only if the cell has seq_id
     // return true if the cell becomes empty
     bool seq_rm(uint32_t i, llama_seq_id seq_id) {
+        gen = next_generation();
         assert(i < pos.size());
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
@@ -265,6 +288,7 @@ public:
 
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
+        gen = next_generation();
         assert(i < pos.size());
 
         if (seq[i].test(seq_id)) {
@@ -338,6 +362,7 @@ public:
 
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
+        gen = next_generation();
         assert(i < pos.size());
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
@@ -420,6 +445,7 @@ public:
     // does not modify "has_shift"
     // note: call only if the cell is empty
     void pos_set(uint32_t i, llama_pos p) {
+        gen = next_generation();
         assert(i < pos.size());
         assert(pos[i] == -1);
         assert(seq[i].none());
@@ -430,6 +456,7 @@ public:
     }
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
+        gen = next_generation();
         assert(i < ext.size());
         ext[i] = p;
     }
@@ -438,6 +465,7 @@ public:
     // sets "has_shift" to true
     // note: call only if the cell is not empty
     bool pos_add(uint32_t i, llama_pos d) {
+        gen = next_generation();
         assert(i < pos.size());
         assert(pos[i] != -1);
 
@@ -467,6 +495,7 @@ public:
     // sets "has_shift" to true
     // note: call only if the cell is not empty
     void pos_div(uint32_t i, int d) {
+        gen = next_generation();
         assert(i < pos.size());
         assert(pos[i] != -1);
 
@@ -483,6 +512,8 @@ public:
     }
 
 private:
+    uint64_t gen = 0;
+
     bool has_shift = false;
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)

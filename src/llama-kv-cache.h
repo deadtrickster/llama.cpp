@@ -3,9 +3,11 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-kpool-scan.h"
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <map>
 #include <vector>
 
 struct llama_cparams;
@@ -176,6 +178,9 @@ public:
     bool get_kpool_dirty() const;
     void clear_kpool_dirty() const;
 
+    // the memoized pooled-indexer scan of a sequence (see llama_kpool_scan)
+    llama_kpool_scan & kpool_scan_for(llama_seq_id seq_id) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -284,6 +289,9 @@ private:
 
     // see set_kpool_dirty. mutable: its only consumer runs from set_input, holding a const cache
     mutable bool kpool_dirty = false;
+
+    // memoized pooled-indexer scans, one per sequence; same consumer, same reason for mutable
+    mutable std::map<llama_seq_id, llama_kpool_scan> kpool_scans;
 
     uint32_t n_seq_max = 1; // [seq-max] mutable under a unified cache, see seq_max_resize()
 
