@@ -3474,6 +3474,61 @@ struct test_softcap : public test_case {
     }
 };
 
+// fused GGML_OP_MUL + GGML_OP_ADD + GGML_UNARY_OP_SIGMOID + GGML_OP_SCALE:
+//   sigmoid(x*s + b)*scale + bias, s and b broadcast, x optionally a strided view
+// (the hyper-connection coefficient chain of DeepSeek-V4 / GLM-5.3)
+struct test_affine_sigmoid : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;    // x
+    const std::array<int64_t, 4> ne_s;  // broadcast into ne
+    const std::array<int64_t, 4> ne_b;  // broadcast into ne
+    const float scale;
+    const float bias;
+    const bool  view;                   // x is a row-strided view of a wider tensor
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "AFFINE_SIGMOID";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, ne, ne_s, ne_b, scale, bias, view);
+    }
+
+    test_affine_sigmoid(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne   = {4, 3, 1, 1},
+            std::array<int64_t, 4> ne_s = {1, 1, 1, 1},
+            std::array<int64_t, 4> ne_b = {4, 1, 1, 1},
+            float scale = 1.0f, float bias = 0.0f, bool view = false)
+        : type(type), ne(ne), ne_s(ne_s), ne_b(ne_b), scale(scale), bias(bias), view(view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (view) {
+            std::array<int64_t, 4> ne_w = ne;
+            ne_w[0] = 3*ne[0];
+            ggml_tensor * w = ggml_new_tensor(ctx, type, 4, ne_w.data());
+            ggml_set_name(w, "w");
+            x = ggml_view_4d(ctx, w, ne[0], ne[1], ne[2], ne[3], w->nb[1], w->nb[2], w->nb[3], ne[0]*ggml_element_size(w));
+        } else {
+            x = ggml_new_tensor(ctx, type, 4, ne.data());
+        }
+        ggml_set_name(x, "x");
+
+        ggml_tensor * s = ggml_new_tensor(ctx, type, 4, ne_s.data());
+        ggml_set_name(s, "s");
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_scale_bias(ctx, ggml_sigmoid(ctx, ggml_add(ctx, ggml_mul(ctx, x, s), b)), scale, bias);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9473,6 +9528,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
+    for (bool view : {false, true}) {
+        // hc pre/post coefficients: mixes view [4, n_tokens], scale [1], base [4]
+        test_cases.emplace_back(new test_affine_sigmoid(GGML_TYPE_F32, {4, 3, 1, 1}, {1, 1, 1, 1}, {4, 1, 1, 1}, 1.0f, 1e-6f, view));
+        test_cases.emplace_back(new test_affine_sigmoid(GGML_TYPE_F32, {4, 512, 1, 1}, {1, 1, 1, 1}, {4, 1, 1, 1}, 2.0f, 0.0f, view));
+        // other broadcast shapes
+        test_cases.emplace_back(new test_affine_sigmoid(GGML_TYPE_F32, {16, 5, 4, 3}, {16, 1, 1, 1}, {16, 5, 1, 1}, 0.5f, -1.0f, view));
+        test_cases.emplace_back(new test_affine_sigmoid(GGML_TYPE_F32, {16, 5, 4, 3}, {1, 5, 4, 1}, {1, 1, 1, 3}, 3.0f, 0.25f, view));
+    }
     test_cases.emplace_back(new test_silu_back());
 
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
@@ -10780,6 +10843,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // hyper-connection coefficient chain (mul, add, sigmoid, scale on a [4, n_tokens] view): fused into one launch on CUDA
+    test_cases.emplace_back(new test_affine_sigmoid(GGML_TYPE_F32, {4, 3, 1, 1}, {1, 1, 1, 1}, {4, 1, 1, 1}, 1.0f, 1e-6f, true));
     // SSM conv state concat, the non-contiguous dim-0 case (transposed tokens) from GLM-5.3-Flash KDA layers
     test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 24576, 1, 1}, 3, 0, 2));
 

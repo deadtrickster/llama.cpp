@@ -46,6 +46,7 @@
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
+#include "ggml-cuda/affine-sigmoid.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
@@ -3424,6 +3425,39 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // dst = sigmoid(x*s + b)*scale + bias, s and b broadcast: the hyper-connection coefficient chain
+    if (ops.size() == 4 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_ADD
+     && ops.begin()[2] == GGML_OP_UNARY && ops.begin()[3] == GGML_OP_SCALE
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID) {
+        const ggml_tensor * mul     = cgraph->nodes[node_idx];
+        const ggml_tensor * add     = cgraph->nodes[node_idx+1];
+        const ggml_tensor * sigmoid = cgraph->nodes[node_idx+2];
+        const ggml_tensor * scale   = cgraph->nodes[node_idx+3];
+
+        if (ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+
+        // the chain must run through src[0]; the broadcast operands are src[1]
+        if (add->src[0] != mul || sigmoid->src[0] != add || scale->src[0] != sigmoid) {
+            return false;
+        }
+
+        const ggml_tensor * x = mul->src[0];
+        const ggml_tensor * s = mul->src[1];
+        const ggml_tensor * b = add->src[1];
+
+        if (x->type != GGML_TYPE_F32 || s->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        if (!ggml_can_repeat(s, x) || !ggml_can_repeat(b, x) || !ggml_is_contiguous(scale)) {
+            return false;
+        }
+
+        return true;
+    }
+
     return false;
 }
 
@@ -4176,6 +4210,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID })) {
+        ggml_cuda_op_affine_sigmoid(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 3]);
+        return 3;
     }
 
     return 0;
