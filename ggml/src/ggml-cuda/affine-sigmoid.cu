@@ -32,9 +32,13 @@ static __global__ void affine_sigmoid_f32(
     const float sv = *(const float *) (s + (i0 % nes0)*nbs0 + (i1 % nes1)*nbs1 + (i2 % nes2)*nbs2 + (i3 % nes3)*nbs3);
     const float bv = *(const float *) (b + (i0 % neb0)*nbb0 + (i1 % neb1)*nbb1 + (i2 % neb2)*nbb2 + (i3 % neb3)*nbb3);
 
-    const float y = xv*sv + bv;
+    // bit-exact with the four separate ops: mul and add each round to f32 (no FMA contraction), the
+    // sigmoid is unary.cu's op_sigmoid, and the final scale/bias is scale.cu's `scale * x + bias`
+    // (which nvcc contracts, as it does there)
+    const float y  = __fadd_rn(__fmul_rn(xv, sv), bv);
+    const float sg = 1.0f / (1.0f + expf(-y));
 
-    dst[idx] = scale/(1.0f + expf(-y)) + bias;
+    dst[idx] = scale * sg + bias;
 }
 
 void ggml_cuda_op_affine_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * dst) {
