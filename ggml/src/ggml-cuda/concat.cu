@@ -1,5 +1,7 @@
 #include "concat.cuh"
 
+#include <algorithm>
+
 #include <stdint.h>
 
 // contiguous kernels
@@ -103,22 +105,30 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
           uint64_t   nb12,
           uint64_t   nb13,
            int64_t   ne0,
-           int64_t /*ne1*/,
-           int64_t /*ne2*/,
-           int64_t /*ne3*/,
+           int64_t   ne1,
+           int64_t   ne2,
+           int64_t   ne3,
           uint64_t   nb0,
           uint64_t   nb1,
           uint64_t   nb2,
           uint64_t   nb3) {
     static_assert(dim >= 0 && dim <= 3, "dim must be in [0, 3]");
 
-    const int64_t i3 = blockIdx.z;
-    const int64_t i2 = blockIdx.y;
-    const int64_t i1 = blockIdx.x;
+    // one thread per element over the flattened dst. a block per (i1, i2, i3) row left 250 of
+    // 256 threads idle on the SSM conv state concat, whose rows are d_conv + n_tokens elements
+    // long (measured: 15 us for 300 KB)
+    const int64_t n = ne0*ne1*ne2*ne3;
 
     const T * x;
 
-    for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
+    for (int64_t idx = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; idx < n; idx += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t i0 = idx % ne0;
+        int64_t       t  = idx / ne0;
+        const int64_t i1 = t % ne1;
+        t /= ne1;
+        const int64_t i2 = t % ne2;
+        const int64_t i3 = t / ne2;
+
         if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
             x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
         } else {
@@ -163,7 +173,9 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
-        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+        const int64_t n_elem  = ggml_nelements(dst);
+        const int64_t n_blocks = std::min<int64_t>((n_elem + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, 65535);
+        dim3 grid_dim(n_blocks, 1, 1);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,

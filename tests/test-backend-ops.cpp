@@ -10217,6 +10217,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F16, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_BF16, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I8, {11, 12, 13, 14}, 7, dim, v));
+            // SSM conv state ++ transposed tokens: a few elements per row, tens of thousands of rows
+            test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 24576, 1, 1}, 3, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I16, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {11, 12, 13, 14}, 7, dim, v));
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
@@ -10778,6 +10780,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // SSM conv state concat, the non-contiguous dim-0 case (transposed tokens) from GLM-5.3-Flash KDA layers
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 24576, 1, 1}, 3, 0, 2));
 
     // narrow-output mat-vec shapes from GLM-5.3-Flash (mHC projections 16384->24, ssm gates 4096->128)
     for (int m : {24, 128}) {
