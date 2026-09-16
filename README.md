@@ -43,8 +43,16 @@ Commit hashes are listed so any row can be bisected; each reason is one sentence
 | reuse the decode graph | `bf374b4b2` | the pooled-indexer input never answered `can_reuse`, so every step rebuilt, re-allocated and re-captured the graph | 72.1 → 76.7 t/s |
 | kernels: split-K, concat, batched gate fusion, hc-coefficient fusion | `950de14d1` `fd7a9c0f1` `b90dc6e66` `bd8ec7021` `655ab8cc0` | a 16384→24 projection ran 12 blocks; a concat idled 250/256 threads; shared expert never fused; four launches per 12 floats | 76.7 → 78.0 → 83.8 t/s (split-K last) |
 | memoize the pooled-indexer scan | `5b8f3d874` | the cell→pool scan rescanned the whole pool extent every step (7% of the thread); memoized on a cells generation counter | host work per step no longer grows with pool occupancy |
+| checkpoints where conversations actually branch | `50dc7e8c1` `ce4938254` `69c5e707d` | thinning left holes wider than a re-prefill; a restore landing above the branch point re-prefilled the whole tail; MTP entries refused a draft-less server | a branch re-prefills its own tail, not the shared preamble |
+| a second model: Qwen3.8-Flash-Next (`qwen4exp`) | `a213bfcc4` | the indexer cache did not follow the elastic pool, so the model asserted at load | loads and serves on the same server build |
+| pin the lazy-read table | `be988ee34` | 22 rows of a 54 GB host table were disk reads mid-step; the uploaded GPU weights held the page cache | warm decode 103 → 114 t/s (2 cards, Qwen) |
+| the draft context re-captured its CUDA graph every step | `8178a5594` `ac5348ebd` | catch-up and draft graphs shared one cache key; pipelined input copies alternated its first node's address | 2 captures per step gone; mean step 17.4 ms baseline |
+| hyper-connection glue fusions | `295905d9f` `ab99e3bf6` `0d4d9e699` | scale→unary→scale, repeat→mul→add and the stream mean were 14 launches per layer on a few kilobytes | 4584 → 3654 launches, 17.40 → 16.52 ms/step |
+| pipelined CUDA graph launch | `13bae0325` `eeecf9452` | `cudaGraphLaunch` costs the host 0.13 µs per node while the device waits; launch the split in norm-aligned chunks | 16.47 → 15.95 ms/step; GLM idle decode 83.8 → 85.9 t/s |
 
 Decode figures: 33k-token prompt, 200 generated tokens, n=6, idle server, 3 cards; they are this box's numbers, the mechanisms are not.
+Qwen figures: 2 cards, MTP draft with 2 drafted tokens (the launcher default; 5 measured 92.8 t/s against 104 at 2 or 3), backend sampling, `--load-mode mmap+mlock`;
+"mean step" is the nsys-measured wall time of one verify+draft cycle, which does not depend on what was sampled. Qwen end to end: warm decode 92.8 → 116–120 t/s, 4.65 → 3.9 s/turn.
 Every kernel change is checked against the CPU reference in `test-backend-ops` (new MUL_MAT, CONCAT, AFFINE_SIGMOID and MUL_MAT_VEC_FUSION cases).
 With split-K disabled (`GGML_CUDA_DISABLE_MMVQ_SPLIT_K=1`) temperature-0 output on the reference prompt is byte-identical through every commit;
 split-K changes the summation order, so it is judged on the distribution:
