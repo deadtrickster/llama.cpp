@@ -3615,6 +3615,51 @@ struct test_repeat_mul_add : public test_case {
     }
 };
 
+// [sigmoid ->] mul -> reshape -> (view, add)... -> scale (fused on CUDA): the mean over hyper-connection streams
+struct test_slice_mean : public test_case {
+    const ggml_type type;
+    const int64_t n_inner;
+    const int64_t n_slice;
+    const int64_t n_tokens;
+    const bool sigmoid;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SLICE_MEAN";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n_inner, n_slice, n_tokens, sigmoid, scale);
+    }
+
+    test_slice_mean(ggml_type type = GGML_TYPE_F32, int64_t n_inner = 2560, int64_t n_slice = 4, int64_t n_tokens = 3,
+            bool sigmoid = true, float scale = 0.25f)
+        : type(type), n_inner(n_inner), n_slice(n_slice), n_tokens(n_tokens), sigmoid(sigmoid), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, n_inner*n_slice, n_tokens);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, type, n_inner*n_slice, n_tokens);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * g = sigmoid ? ggml_sigmoid(ctx, b) : b;
+        ggml_tensor * gated = ggml_reshape_3d(ctx, ggml_mul(ctx, a, g), n_inner, n_slice, n_tokens);
+
+        const size_t row = ggml_row_size(gated->type, n_inner);
+        ggml_tensor * mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_inner, n_tokens, row*n_slice, 0));
+        for (int64_t c = 1; c < n_slice; ++c) {
+            mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, n_inner, n_tokens, row*n_slice, row*c));
+        }
+        ggml_tensor * out = ggml_scale(ctx, mixed, scale);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9632,6 +9677,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // hc combine: b [n_embd, 1, T] repeated over the streams, w [1, hc, T]
         test_cases.emplace_back(new test_repeat_mul_add(GGML_TYPE_F32, {2560, 4, 3, 1}, {2560, 1, 3, 1}, {1, 4, 3, 1}, add));
         test_cases.emplace_back(new test_repeat_mul_add(GGML_TYPE_F32, {16, 5, 4, 3}, {16, 1, 4, 1}, {16, 5, 1, 3}, add));
+    }
+    for (bool sigmoid : {false, true}) {
+        test_cases.emplace_back(new test_slice_mean(GGML_TYPE_F32, 2560, 4, 3, sigmoid, 0.25f));
+        test_cases.emplace_back(new test_slice_mean(GGML_TYPE_F32, 64, 3, 7, sigmoid, 1.0f/3.0f));
+        test_cases.emplace_back(new test_slice_mean(GGML_TYPE_F32, 16, 2, 1, sigmoid, 0.5f));
     }
     test_cases.emplace_back(new test_silu_back());
 

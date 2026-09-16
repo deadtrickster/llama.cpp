@@ -48,6 +48,7 @@
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/affine-sigmoid.cuh"
 #include "ggml-cuda/repeat-mul-add.cuh"
+#include "ggml-cuda/slice-mean.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
@@ -3052,6 +3053,128 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 
 // The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
 // 31 nodes, so k <= 15; larger values use the per-operation path.
+
+// [sigmoid ->] mul -> reshape [n_inner, n_slice, T] -> view slice 0 -> cont -> (view slice c, add)... -> scale:
+// the mean over the residual streams of a hyper-connection block's gated input
+struct ggml_cuda_slice_mean_match {
+    const ggml_tensor * a          = nullptr;
+    const ggml_tensor * b          = nullptr; // pre-sigmoid when sigmoid_b
+    bool                sigmoid_b  = false;
+    int64_t             n_inner    = 0;
+    int64_t             n_slice    = 0;
+    int64_t             n_tokens   = 0;
+    ggml_tensor *       dst        = nullptr;
+    int                 node_count = 0;
+};
+
+static bool ggml_cuda_match_slice_mean(const ggml_cgraph * cgraph, int node_idx, ggml_cuda_slice_mean_match & match) {
+    int i = node_idx;
+    if (i >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * sig = nullptr;
+    if (cgraph->nodes[i]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i]) == GGML_UNARY_OP_SIGMOID) {
+        sig = cgraph->nodes[i];
+        i++;
+    }
+    if (i >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * mul = cgraph->nodes[i];
+    if (mul->op != GGML_OP_MUL || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+    const ggml_tensor * a = mul->src[0];
+    const ggml_tensor * b = mul->src[1];
+    if (sig) {
+        if (b == sig) {
+            // a * sigmoid(b)
+        } else if (a == sig) {
+            std::swap(a, b);
+        } else {
+            return false;
+        }
+        b = sig->src[0];
+    }
+    if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) ||
+            !ggml_are_same_shape(a, mul) || !ggml_are_same_shape(b, mul)) {
+        return false;
+    }
+    i++;
+
+    // reshape to [n_inner, n_slice, T]
+    if (i >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_RESHAPE || cgraph->nodes[i]->src[0] != mul) {
+        return false;
+    }
+    const ggml_tensor * rs = cgraph->nodes[i];
+    const int64_t n_inner  = rs->ne[0];
+    const int64_t n_slice  = rs->ne[1];
+    const int64_t n_tokens = rs->ne[2]*rs->ne[3];
+    if (n_slice < 2 || n_slice > 16 || n_inner*n_slice*n_tokens != ggml_nelements(mul)) {
+        return false;
+    }
+    i++;
+
+    auto is_slice = [&](const ggml_tensor * v, int64_t c) {
+        return v->op == GGML_OP_VIEW && v->view_src == mul && v->type == GGML_TYPE_F32 &&
+            v->ne[0] == n_inner && v->ne[1] == n_tokens && v->ne[2] == 1 && v->ne[3] == 1 &&
+            v->nb[0] == sizeof(float) && v->nb[1] == (size_t) n_inner*n_slice*sizeof(float) &&
+            v->view_offs == (size_t) c*n_inner*sizeof(float);
+    };
+
+    // slice 0 and its cont
+    if (i + 1 >= cgraph->n_nodes || !is_slice(cgraph->nodes[i], 0)) {
+        return false;
+    }
+    const ggml_tensor * cont = cgraph->nodes[i + 1];
+    if (cont->op != GGML_OP_CONT || cont->src[0] != cgraph->nodes[i] || !ggml_is_contiguous(cont)) {
+        return false;
+    }
+    i += 2;
+
+    const ggml_tensor * prev = cont;
+    for (int64_t c = 1; c < n_slice; ++c) {
+        if (i + 1 >= cgraph->n_nodes || !is_slice(cgraph->nodes[i], c)) {
+            return false;
+        }
+        const ggml_tensor * add = cgraph->nodes[i + 1];
+        if (add->op != GGML_OP_ADD || add->src[0] != prev || add->src[1] != cgraph->nodes[i] || add->type != GGML_TYPE_F32) {
+            return false;
+        }
+        prev = add;
+        i += 2;
+    }
+
+    if (i >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_SCALE || cgraph->nodes[i]->src[0] != prev ||
+            !ggml_is_contiguous(cgraph->nodes[i])) {
+        return false;
+    }
+    ggml_tensor * scale = cgraph->nodes[i];
+    i++;
+
+    const int node_count = i - node_idx;
+    std::vector<ggml_op> ops(node_count);
+    for (int k = 0; k < node_count; ++k) {
+        ops[k] = cgraph->nodes[node_idx + k]->op;
+    }
+    const int output_idx = i - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+        return false;
+    }
+
+    match.a          = a;
+    match.b          = b;
+    match.sigmoid_b  = sig != nullptr;
+    match.n_inner    = n_inner;
+    match.n_slice    = n_slice;
+    match.n_tokens   = n_tokens;
+    match.dst        = scale;
+    match.node_count = node_count;
+    return true;
+}
+
 static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
 
 struct ggml_cuda_moe_weighted_reduction_match {
@@ -4267,6 +4390,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
         return 1;
+    }
+
+    {
+        ggml_cuda_slice_mean_match match;
+        if (ggml_cuda_match_slice_mean(cgraph, i, match)) {
+            ggml_cuda_op_slice_mean(*cuda_ctx, match.a, match.b, match.sigmoid_b, match.n_inner, match.n_slice, match.n_tokens, match.dst);
+            return match.node_count - 1;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
