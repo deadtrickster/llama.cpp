@@ -4771,16 +4771,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     enum ggml_status status = GGML_STATUS_SUCCESS;
     for (int i0 = 0; i0 < cgraph->n_nodes; ) {
         int i1 = std::min(cgraph->n_nodes, i0 + chunk);
-        // do not cut a fusable chain: advance until the first node of the next chunk does not read the last
-        // node of this one (the evaluate loop only fuses within one cgraph)
+        // the evaluate loop only fuses within one cgraph, so a cut must not fall inside a fusable chain.
+        // a normalization opens a sub-block and no fusion pattern reaches back across it: cut in front of
+        // the next one (a cut that merely avoids "next reads last" still split gate/up mat-mul pairs, and
+        // their fused kernel does not sum like the separate ones)
         while (i1 < cgraph->n_nodes) {
-            const ggml_tensor * last = cgraph->nodes[i1 - 1];
-            const ggml_tensor * next = cgraph->nodes[i1];
-            bool reads_last = false;
-            for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                reads_last |= next->src[j] == last || (next->src[j] && next->src[j]->view_src == last);
-            }
-            if (!reads_last) {
+            const ggml_op op = cgraph->nodes[i1]->op;
+            if (op == GGML_OP_RMS_NORM || op == GGML_OP_NORM || op == GGML_OP_GROUP_NORM || op == GGML_OP_L2_NORM) {
                 break;
             }
             i1++;
