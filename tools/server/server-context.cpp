@@ -658,10 +658,17 @@ struct server_slot {
     // quantum. 0 = not yet armed for this generation.
     uint64_t next_yield_at = 0;
 
+    // [divergence-checkpoint] token count at which the current prompt diverged from the cached one
+    // while no checkpoint sat at or below it; the re-prefill breaks a batch there and pins a
+    // checkpoint, so the next prompt sharing that prefix restores instead of re-prefilling.
+    // -1: none pending
+    int64_t divergence_n = -1;
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        divergence_n   = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -4623,7 +4630,7 @@ private:
                 // wider than max_gap, so the gap actually left never exceeds it
                 const bool gap_floor = max_gap > 0 && keep_dist > 0 && (dist - keep_dist) + step > max_gap;
 
-                if (it->id_task == id_task || keep_dist == 0 || dist >= std::max(step, keep_dist*CHECKPOINT_EXP_FACTOR) || gap_floor) {
+                if (it->id_task == id_task || it->pinned || keep_dist == 0 || dist >= std::max(step, keep_dist*CHECKPOINT_EXP_FACTOR) || gap_floor) {
                     if (it->id_task != id_task) {
                         keep_dist = dist;
                     }
@@ -5976,6 +5983,16 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    // [divergence-checkpoint] n_past is the length of the prefix shared with
+                                    // the cached prompt; whatever we restore from lies below it, and the
+                                    // tokens between are re-prefilled. Measured on a day of traffic: 220
+                                    // prompts diverged at the same ~2.5k-token preamble whose only checkpoint
+                                    // sat 22 tokens ABOVE the divergence, and each re-prefilled the preamble.
+                                    // Remember the point; the prompt loop checkpoints there and pins it -
+                                    // but only when the restore lands BELOW it (a checkpoint exactly at
+                                    // the shared prefix, the common case, is already what we want).
+                                    const int64_t n_diverge = n_past;
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt, slot.seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -5998,6 +6015,10 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                    }
+
+                                    if (n_past < n_diverge) {
+                                        slot.divergence_n = n_diverge;
                                     }
                                 }
                             }
@@ -6194,6 +6215,11 @@ private:
                             break;
                         }
 
+                        // [divergence-checkpoint] break where the prompt diverged from the cached one
+                        if (do_checkpoint && slot.divergence_n > 0 && slot.prompt.n_tokens() == slot.divergence_n) {
+                            break;
+                        }
+
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
                         // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
@@ -6226,6 +6252,7 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
                     const bool is_sched_start = is_checkpoint_due(n_tokens_start);
+                    const bool is_divergence_start = slot.divergence_n > 0 && n_tokens_start == slot.divergence_n;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -6245,7 +6272,7 @@ private:
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message, is due on the checkpoint_min_step schedule, or we are near the
                         // end of the prompt
-                        if (!is_user_start && !near_prompt_end && !is_sched_start) {
+                        if (!is_user_start && !near_prompt_end && !is_sched_start && !is_divergence_start) {
                             do_checkpoint = false;
                         }
                     }
@@ -6265,7 +6292,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_divergence_start ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -6273,6 +6300,16 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+
+                        if (is_divergence_start && !slot.prompt.checkpoints.empty()) {
+                            auto & cur = slot.prompt.checkpoints.back();
+                            cur.pinned = true;
+                            SLT_INF(slot, "pinned a context checkpoint at the divergence point (n_tokens = %" PRId64 ")\n", cur.n_tokens);
+                        }
+                    }
+
+                    if (is_divergence_start || slot.prompt.n_tokens() > slot.divergence_n) {
+                        slot.divergence_n = -1;
                     }
                 }
 

@@ -1238,6 +1238,10 @@ struct common_prompt_checkpoint {
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 
+    // survives distance-based thinning: placed where a prompt diverged from the cached one with
+    // no checkpoint at or below the divergence, so the next prompt sharing that prefix lands on it
+    bool pinned = false;
+
     llama_pos pos_min;
     llama_pos pos_max;
 
