@@ -445,6 +445,15 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // an MTP draft context decodes one to a few tokens at a time, so there is nothing to pipeline, and the
+        // double-buffered input copies that pipeline parallelism adds cost it a CUDA graph re-capture on every
+        // decode: the context alternates its catch-up and draft graphs, each rebuild sees the other copy's
+        // address in its first node, and the backend treats that as a changed graph (measured 2 captures,
+        // ~0.5 ms, per verify step)
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            pipeline_parallel = false;
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
