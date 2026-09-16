@@ -3529,6 +3529,48 @@ struct test_affine_sigmoid : public test_case {
     }
 };
 
+// GGML_OP_SCALE -> GGML_UNARY_OP_{SILU,SIGMOID} [-> GGML_OP_SCALE] (fused on CUDA)
+struct test_scale_unary : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const ggml_unary_op op;
+    const float s0;
+    const float b0;
+    const bool  scale_out;
+    const float s1;
+    const float b1;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_UNARY";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, ne, op, s0, b0, scale_out, s1, b1);
+    }
+
+    test_scale_unary(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {320, 3, 1, 1},
+            ggml_unary_op op = GGML_UNARY_OP_SILU,
+            float s0 = 0.25f, float b0 = 0.0f, bool scale_out = false, float s1 = 2.0f, float b1 = 0.0f)
+        : type(type), ne(ne), op(op), s0(s0), b0(b0), scale_out(scale_out), s1(s1), b1(b1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(x, "x");
+
+        ggml_tensor * out = ggml_unary(ctx, ggml_scale_bias(ctx, x, s0, b0), op);
+        if (scale_out) {
+            out = ggml_scale_bias(ctx, out, s1, b1);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9535,6 +9577,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // other broadcast shapes
         test_cases.emplace_back(new test_affine_sigmoid(GGML_TYPE_F32, {16, 5, 4, 3}, {16, 1, 1, 1}, {16, 5, 1, 1}, 0.5f, -1.0f, view));
         test_cases.emplace_back(new test_affine_sigmoid(GGML_TYPE_F32, {16, 5, 4, 3}, {1, 5, 4, 1}, {1, 1, 1, 3}, 3.0f, 0.25f, view));
+    }
+    for (ggml_unary_op op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+        // hc low-rank chain: silu(x/hc), and 2*sigmoid(x/hc) on [hc, n_tokens]
+        test_cases.emplace_back(new test_scale_unary(GGML_TYPE_F32, {320, 3, 1, 1}, op, 0.25f, 0.0f, false));
+        test_cases.emplace_back(new test_scale_unary(GGML_TYPE_F32, {4, 3, 1, 1},   op, 0.25f, 0.0f, true, 2.0f, 0.0f));
+        test_cases.emplace_back(new test_scale_unary(GGML_TYPE_F32, {16, 5, 4, 3},  op, -1.5f, 0.5f, true, 0.5f, -0.25f));
     }
     test_cases.emplace_back(new test_silu_back());
 
