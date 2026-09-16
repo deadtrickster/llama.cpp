@@ -17,6 +17,49 @@
 
 </div>
 
+## glm-all: GLM-5.3-Flash serving changes
+
+This branch carries the GLM-5.3-Flash (`glm5next`) port plus the serving changes below.
+Hardware is described only as "2 cards" (the two main GPUs), "3 cards" (plus a small third GPU over a slow link) and "CPU" (expert weights in host RAM).
+Commit hashes are listed so any row can be bisected; each reason is one sentence about the mechanism.
+
+| area | commits | why | effect |
+|---|---|---|---|
+| prompt-cache restore actually restores | `f86781985` `f7105d5d1` `1a5cc9b73` | disk restore dropped checkpoints so hybrid models re-prefilled everything; a failed save wiped the slot; `-1` meant a tighter limit | a restore costs the tail after the last checkpoint, not the prompt |
+| KV state buffers | `362322b03` `c8af5f217` | pinned, pooled state buffers let the driver DMA directly; checkpoints are immutable, so share them copy-on-write | slot swaps at DMA speed, no duplicate checkpoint memory |
+| cache save/load decisions | `e969bbcc9` `78bde7e63` `185f33458` `3e14258c5` | one `f_keep` boolean gated save and load and picked by list order; save on loss, always consult, longest prefix wins | similar conversations no longer destroy each other's tails |
+| disk tier: durable, self-describing spill files | `28b747fe8` `b2393a9b9` `7bed071c3` `2b998a669` | files named by model key and token hash carry a header, so a restart or another process can index them | the cache survives a restart |
+| disk tier: nothing lost on the way down | `f6e221927` `1597db29c` `427180c74` `3b7236a7d` `3c8b5b37a` | destructors, sleeps and router kills each lost the cache; spill explicitly, save live slots first, size the stop timeout | eviction, sleep and shutdown keep every conversation |
+| disk tier: write-through mirror and reaping | `5547557c3` `e1046ea07` `c7834ad8d` `332ecdfd8` `5c3f2b860` `ccdb386d8` `bf91ea247` `1804d5374` | a timed write-through mirror survives a hard kill; superseded snapshots reap first; sleep only under RAM pressure (`1804d5374` untested draft) | a crash loses seconds, the disk holds one snapshot per conversation |
+| speculative decoding around images | `04eccf41e` `13e4408f4` `7504bd2ef` `8dab9d5fb` `eb2165791` `99ac96151` `4ae930d8b` | the draft cannot consume an embedding batch and fell behind the target: HTTP 500 or silent acceptance collapse; resync it | image turns answer; acceptance recovers after the image |
+| cache reuse with a projector loaded | `083c04652` `e8169aeb1` `4bb229414` `83d0527c6` | reuse was gated on "projector present" instead of "prompt has media", so text turns on a vision server never reused | text turns reuse; media prompts keep exact-prefix matching |
+| decode preemption | `1b0d23781` `1ac1b607e` `7571942dc` `7bc92d229` `20ad100d4` `4a9d9a1b9` `55e6b39bf` `23abf9f04` | run-to-completion let one deep reasoning turn hold a seat for minutes; slots suspend at a quantum and resume | a cheap turn no longer waits behind a long one |
+| one elastic KV pool | `5a29b50f9` `052b09c8f` `76691521c` `f62ac65c6` `1f613518e` `e0dd42e00` `a6696fffd` `a23b7f524` `86894272d` `076a53244` `981be4145` `906f84951` `f52da8fc4` `c78a7f531` | cells, sequence ids and seats drew on one memory but cells were fixed; the pool now resizes, seats follow residency | no pre-sizing; whatever fits is resident and batched |
+| pool under pressure | `fb106a81a` `fcef1d130` `1397b97d8` `978b4c46e` `a62668208` | a full pool purged conversations unsaved and failed every slot; now one spills, shrinks keep restore room, restores ask first | pressure degrades one conversation instead of losing several |
+| memory fit | `257de77d2` `042ea80ea` `ad616d9e4` `0f81548c1` `d936f654c` `783128be7` | user placement made the fitter refuse, the recurrent cache allocated under `no_alloc`, test models could not exercise placement | the fitter sizes the context around whatever the user pinned |
+| recurrent state is not a function of position | `ae86607ed` `0a78ba758` `666038904` `31737f195` `675068409` | shifting cells left SSM state stale; invalidate by content instead, checkpoint on a schedule, thin exponentially away from the tip | correct reuse on hybrid models; checkpoints stop dominating the cache |
+| streaming and metrics | `ffec7c4fb` `bdb23b440` | a token ending in a partial UTF-8 character emitted no frame; throughput gauges read 0 until a generation ended | every token reaches the client; live rates while generating |
+| experts of three MoE layers moved from CPU to the third card | (config) | only activations cross the slow link; the CPU was the bottleneck, not the two cards | decode 45.3 → 72.1 t/s |
+| reuse the decode graph | `bf374b4b2` | the pooled-indexer input never answered `can_reuse`, so every step rebuilt, re-allocated and re-captured the graph | 72.1 → 76.7 t/s |
+| kernels: split-K, concat, batched gate fusion, hc-coefficient fusion | `950de14d1` `fd7a9c0f1` `b90dc6e66` `bd8ec7021` `655ab8cc0` | a 16384→24 projection ran 12 blocks; a concat idled 250/256 threads; shared expert never fused; four launches per 12 floats | 76.7 → 78.0 → 83.8 t/s (split-K last) |
+| memoize the pooled-indexer scan | `5b8f3d874` | the cell→pool scan rescanned the whole pool extent every step (7% of the thread); memoized on a cells generation counter | host work per step no longer grows with pool occupancy |
+
+Decode figures: 33k-token prompt, 200 generated tokens, n=6, idle server, 3 cards; they are this box's numbers, the mechanisms are not.
+Every kernel change is checked against the CPU reference in `test-backend-ops` (new MUL_MAT, CONCAT, AFFINE_SIGMOID and MUL_MAT_VEC_FUSION cases).
+With split-K disabled (`GGML_CUDA_DISABLE_MMVQ_SPLIT_K=1`) temperature-0 output on the reference prompt is byte-identical through every commit;
+split-K changes the summation order, so it is judged on the distribution:
+
+| wikitext-2 test, 4096-token chunks, 8-token ubatches (the mat-vec path) | PPL |
+|---|---|
+| split-K on, 10 chunks | 2.9700 ± 0.0396 |
+| split-K off, 10 chunks | 2.9657 ± 0.0394 |
+| paired per-chunk ΔNLL, 10 chunks | +0.0014 ± 0.0031 nats/token (t = 1.49) |
+| split-K on, 50 chunks | 3.2292 ± 0.0196 |
+| split-K off, 50 chunks | 3.2291 ± 0.0196 |
+| paired per-chunk ΔNLL, 50 chunks | +0.00003 ± 0.00061 nats/token (t = 0.05; 23 chunks up, 27 down) |
+
+For scale, the same first-token measurement puts the CPU→third-card expert move at a larger perturbation (max Δlogprob 0.44 over the top-50) than split-K (0.33).
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
