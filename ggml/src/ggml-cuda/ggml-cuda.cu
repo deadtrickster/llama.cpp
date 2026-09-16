@@ -4682,7 +4682,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, gg
 }
 #endif // USE_CUDA_GRAPH
 
-static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -4739,6 +4739,70 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
     return GGML_STATUS_SUCCESS;
+}
+
+// A captured graph of a few thousand nodes costs the host ~0.13 us per node in cudaGraphLaunch, and the
+// device starts on the first kernel only once the call returns: measured 300 us of idle GPU per device
+// per decode step on a 2200-node layer split. Launching the split as consecutive chunks on the same
+// stream lets the device run chunk k while the host submits chunk k+1; only the first chunk's submission
+// is exposed. GGML_CUDA_GRAPH_CHUNK sets the chunk size in nodes (0 disables).
+static int ggml_cuda_graph_chunk_nodes() {
+    static const int chunk = []() {
+        const char * env = getenv("GGML_CUDA_GRAPH_CHUNK");
+        return env ? atoi(env) : 512;
+    }();
+    return chunk;
+}
+
+static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    const int chunk = ggml_cuda_graph_chunk_nodes();
+
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    // the multi-stream graph optimization keys its regions on the whole graph; leave such graphs alone
+    const bool chunkable = chunk > 0 && cgraph->n_nodes >= 2*chunk && cuda_ctx->stream_context().concurrent_events.empty();
+#else
+    const bool chunkable = false;
+#endif
+    if (!chunkable) {
+        return ggml_backend_cuda_graph_compute_impl(backend, cgraph);
+    }
+
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+    for (int i0 = 0; i0 < cgraph->n_nodes; ) {
+        int i1 = std::min(cgraph->n_nodes, i0 + chunk);
+        // do not cut a fusable chain: advance until the first node of the next chunk does not read the last
+        // node of this one (the evaluate loop only fuses within one cgraph)
+        while (i1 < cgraph->n_nodes) {
+            const ggml_tensor * last = cgraph->nodes[i1 - 1];
+            const ggml_tensor * next = cgraph->nodes[i1];
+            bool reads_last = false;
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                reads_last |= next->src[j] == last || (next->src[j] && next->src[j]->view_src == last);
+            }
+            if (!reads_last) {
+                break;
+            }
+            i1++;
+        }
+        // a short tail is not worth its own launch
+        if (cgraph->n_nodes - i1 < chunk/4) {
+            i1 = cgraph->n_nodes;
+        }
+
+        ggml_cgraph view = ggml_graph_view(cgraph, i0, i1);
+        // the uid shortcut in the graph update check must not equate different chunks of one graph, nor a
+        // chunk with a later whole graph: uids are a counter, so the high bits are free to carry the chunk
+        view.uid = cgraph->uid != 0 ? (cgraph->uid | (1ull << 63) | ((uint64_t) i0 << 40)) : 0;
+
+        status = ggml_backend_cuda_graph_compute_impl(backend, &view);
+        if (status != GGML_STATUS_SUCCESS) {
+            return status;
+        }
+        i0 = i1;
+    }
+
+    return status;
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
