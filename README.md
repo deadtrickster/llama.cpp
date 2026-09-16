@@ -49,6 +49,9 @@ Commit hashes are listed so any row can be bisected; each reason is one sentence
 | the draft context re-captured its CUDA graph every step | `8178a5594` `ac5348ebd` | catch-up and draft graphs shared one cache key; pipelined input copies alternated its first node's address | 2 captures per step gone; mean step 17.4 ms baseline |
 | hyper-connection glue fusions | `295905d9f` `ab99e3bf6` `0d4d9e699` | scale→unary→scale, repeat→mul→add and the stream mean were 14 launches per layer on a few kilobytes | 4584 → 3654 launches, 17.40 → 16.52 ms/step |
 | pipelined CUDA graph launch | `13bae0325` `eeecf9452` | `cudaGraphLaunch` costs the host 0.13 µs per node while the device waits; launch the split in norm-aligned chunks | 16.47 → 15.95 ms/step; GLM idle decode 83.8 → 85.9 t/s |
+| quantize activations once per graph | `8dd776b5f` `a23f63d5d` | the same block input was quantized to q8_1 for each mat-vec that read it; one buffer per tensor per compute, in its own pool | Qwen −118 launches/step, device busy −0.26 ms; bit-identical |
+| batched top-k for the sparse indexer | `e56af5620` | one CUB top-k per row was 120k launches per 5k-token prefill; the multi-row radix select with a deterministic gather (the atomic one gave different continuations per run) | GLM 33k prefill 705 → 848 t/s |
+| a fusion that was not bit-exact | `1db055c23` | `-use_fast_math` rounds a fused `a * sigmoid(b)` differently from the two kernels on GLM; reverted for 0.04 ms | greedy output identical again |
 
 Decode figures: 33k-token prompt, 200 generated tokens, n=6, idle server, 3 cards; they are this box's numbers, the mechanisms are not.
 Qwen figures: 2 cards, MTP draft with 2 drafted tokens (the launcher default; 5 measured 92.8 t/s against 104 at 2 or 3), backend sampling, `--load-mode mmap+mlock`;
@@ -67,6 +70,26 @@ split-K changes the summation order, so it is judged on the distribution:
 | paired per-chunk ΔNLL, 50 chunks | +0.00003 ± 0.00061 nats/token (t = 0.05; 23 chunks up, 27 down) |
 
 For scale, the same first-token measurement puts the CPU→third-card expert move at a larger perturbation (max Δlogprob 0.44 over the top-50) than split-K (0.33).
+
+The batched top-k changes the order the selected keys are summed in, so it is judged the same way, prefill-shaped (`-ub 512`, the indexer's 512-row case):
+
+| wikitext-2 test, 4096-token chunks, 512-token ubatches | PPL |
+|---|---|
+| radix top-k, 50 chunks | 3.2347 ± 0.0197 |
+| per-row CUB top-k, 50 chunks | 3.2345 ± 0.0197 |
+| paired per-chunk ΔNLL, 50 chunks | +0.00006 ± 0.00010 nats/token (t = 0.63; 34 chunks up, 10 down) |
+
+### Before and after, all three models
+
+Same benches throughout: "idle" is a 33k-token prompt on an idle server (prefill and decode), "warm" is four ~35k-token turns of a live conversation, "short" is a 300-token sampled chat answer. "Before" is the launcher default of the morning of the Qwen work (GLM: the row above it); "after" is the pushed build with the launcher defaults it left (n_max 2, CPU sampling, `--load-mode mmap+mlock` for the lazy table).
+
+| model | prefill t/s | idle decode t/s | warm decode t/s / s per turn | short sampled t/s |
+|---|---|---|---|---|
+| GLM-5.3-Flash, 3 cards | 703 → 848 | 83.8 → 86.8 | (turn-to-turn noise ±15 on this model) | — |
+| Qwen3.8-Flash-Next, 2 cards | 1411 → 2243 | ~105 → 129 | 92.8 / 4.65 → 114 / 3.78 | ~80 → 111–118 |
+| Qwen3.8-27B dense, 2 cards | 3044 → 3167 | 81.3 → 86.0 | 77.2 / 5.16 → 99 / 4.32 | 57 → 76–88 |
+
+Backend sampling (`--backend-sampling`) is off in the launchers: it buys ~5 t/s of sampled decode and costs 17–25% of prefill on both Qwen models (a sampler graph rides along with every prompt microbatch: Flash 2243 → 1863, dense 3167 → 2364).
 
 ## Quick start
 
