@@ -1593,8 +1593,9 @@ void ggml_cuda_mul_mat_vec_q(
     while (src1_root->op == GGML_OP_RESHAPE && src1_root->view_src && src1_root->view_offs == 0) {
         src1_root = src1_root->view_src;
     }
+    static const bool q8_1_cache_disabled = getenv("GGML_CUDA_DISABLE_Q8_1_CACHE") != nullptr;
     const int64_t nrows_src1   = ne11*ne12*ne13;
-    const bool    src1_rowmajor = src1->nb[0] == ts_src1 && src1->nb[1] == (size_t) ne10*ts_src1 &&
+    const bool    src1_rowmajor = !q8_1_cache_disabled && src1->nb[0] == ts_src1 && src1->nb[1] == (size_t) ne10*ts_src1 &&
                                   src1->nb[2] == (size_t) ne11*ne10*ts_src1 && src1->nb[3] == (size_t) ne12*ne11*ne10*ts_src1;
 
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
