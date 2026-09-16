@@ -1570,6 +1570,37 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // [TAG_Q8_1_CACHE] activations quantized to q8_1 for a mat-vec, kept for the other mat-vecs of the
+    // same graph compute that read the same tensor (a decode step quantizes one block input for the
+    // q/k/v, gate, router and expert projections in turn). cleared at the start and end of each compute.
+    struct q8_1_cache_entry {
+        const ggml_tensor * tensor;
+        const void *        data;
+        int64_t             ne10;
+        int64_t             nrows;
+        int                 stream_no;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+    };
+    std::vector<q8_1_cache_entry> q8_1_cache;
+
+    // the cache has its own pool: the device pool is a stack and a cached buffer must not sit under
+    // a caller's temporaries (mul_mat_id sorts its rows around the mat-vec) when those are freed
+    std::unique_ptr<ggml_cuda_pool> q8_1_pools[GGML_CUDA_MAX_STREAMS];
+
+    ggml_cuda_pool & q8_1_pool() {
+        if (q8_1_pools[curr_stream_no] == nullptr) {
+            q8_1_pools[curr_stream_no] = new_pool_for_device(device, curr_stream_no);
+        }
+        return *q8_1_pools[curr_stream_no];
+    }
+
+    void q8_1_cache_clear() {
+        // the pool is a stack: release newest first
+        while (!q8_1_cache.empty()) {
+            q8_1_cache.pop_back();
+        }
+    }
 };
 
 struct ggml_cuda_mm_fusion_args_host {

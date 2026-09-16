@@ -4700,6 +4700,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t back
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // [TAG_Q8_1_CACHE] quantized activations live for one compute
+    cuda_ctx->q8_1_cache_clear();
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     ggml_cuda_graph_key graph_key = 0;
@@ -4750,6 +4753,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t back
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    cuda_ctx->q8_1_cache_clear();
 
     return GGML_STATUS_SUCCESS;
 }
