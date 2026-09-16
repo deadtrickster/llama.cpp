@@ -47,6 +47,7 @@
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/affine-sigmoid.cuh"
+#include "ggml-cuda/repeat-mul-add.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
@@ -3471,6 +3472,33 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // dst = [res +] repeat(b) * c: a hyper-connection block scattered back into the residual streams
+    if ((ops.size() == 2 || ops.size() == 3) && ops.begin()[0] == GGML_OP_REPEAT && ops.begin()[1] == GGML_OP_MUL
+     && (ops.size() == 2 || ops.begin()[2] == GGML_OP_ADD)) {
+        const ggml_tensor * repeat = cgraph->nodes[node_idx];
+        const ggml_tensor * mul    = cgraph->nodes[node_idx+1];
+        const ggml_tensor * add    = ops.size() == 3 ? cgraph->nodes[node_idx+2] : nullptr;
+        const ggml_tensor * dst    = add ? add : mul;
+
+        const ggml_tensor * b = repeat->src[0];
+        const ggml_tensor * c = mul->src[0] == repeat ? mul->src[1] : mul->src[0];
+
+        if (b->type != GGML_TYPE_F32 || c->type != GGML_TYPE_F32 || repeat->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_is_contiguous(dst) || !ggml_can_repeat(b, dst) || !ggml_can_repeat(c, dst)) {
+            return false;
+        }
+        if (add) {
+            const ggml_tensor * res = add->src[0] == mul ? add->src[1] : add->src[0];
+            if (res->type != GGML_TYPE_F32 || !ggml_are_same_shape(res, dst)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // dst = sigmoid(x*s + b)*scale + bias, s and b broadcast: the hyper-connection coefficient chain
     if (ops.size() == 4 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_ADD
      && ops.begin()[2] == GGML_OP_UNARY && ops.begin()[3] == GGML_OP_SCALE
@@ -4273,6 +4301,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_SIGMOID })) {
         ggml_cuda_op_affine_sigmoid(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 3]);
         return 3;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+        ggml_cuda_op_repeat_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_REPEAT, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_repeat_mul_add(*cuda_ctx, node, cgraph->nodes[i + 1], nullptr);
+        return 1;
     }
 
     return 0;

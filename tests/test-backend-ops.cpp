@@ -3571,6 +3571,50 @@ struct test_scale_unary : public test_case {
     }
 };
 
+// GGML_OP_REPEAT -> GGML_OP_MUL [-> GGML_OP_ADD] (fused on CUDA): dst = [res +] repeat(b) * c
+struct test_repeat_mul_add : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;    // dst / res
+    const std::array<int64_t, 4> ne_b;  // repeated into ne
+    const std::array<int64_t, 4> ne_c;  // broadcast into ne
+    const bool add;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "REPEAT_MUL_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne, ne_b, ne_c, add);
+    }
+
+    test_repeat_mul_add(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne   = {2560, 4, 3, 1},
+            std::array<int64_t, 4> ne_b = {2560, 1, 3, 1},
+            std::array<int64_t, 4> ne_c = {1, 4, 3, 1},
+            bool add = true)
+        : type(type), ne(ne), ne_b(ne_b), ne_c(ne_c), add(add) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_set_name(b, "b");
+        ggml_tensor * c = ggml_new_tensor(ctx, type, 4, ne_c.data());
+        ggml_set_name(c, "c");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_repeat_4d(ctx, b, ne[0], ne[1], ne[2], ne[3]), c);
+        if (add) {
+            ggml_tensor * res = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(res, "res");
+            out = ggml_add(ctx, res, out);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9583,6 +9627,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_scale_unary(GGML_TYPE_F32, {320, 3, 1, 1}, op, 0.25f, 0.0f, false));
         test_cases.emplace_back(new test_scale_unary(GGML_TYPE_F32, {4, 3, 1, 1},   op, 0.25f, 0.0f, true, 2.0f, 0.0f));
         test_cases.emplace_back(new test_scale_unary(GGML_TYPE_F32, {16, 5, 4, 3},  op, -1.5f, 0.5f, true, 0.5f, -0.25f));
+    }
+    for (bool add : {false, true}) {
+        // hc combine: b [n_embd, 1, T] repeated over the streams, w [1, hc, T]
+        test_cases.emplace_back(new test_repeat_mul_add(GGML_TYPE_F32, {2560, 4, 3, 1}, {2560, 1, 3, 1}, {1, 4, 3, 1}, add));
+        test_cases.emplace_back(new test_repeat_mul_add(GGML_TYPE_F32, {16, 5, 4, 3}, {16, 1, 4, 1}, {16, 5, 1, 3}, add));
     }
     test_cases.emplace_back(new test_silu_back());
 

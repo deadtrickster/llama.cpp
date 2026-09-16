@@ -370,6 +370,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
     w = ggml_scale(ctx0, w, 2.0f);
     w = ggml_reshape_3d(ctx0, w, 1, hc, nt);
 
+    // expand the weight chain first so that repeat, mul and add land next to each other in the
+    // graph, where the CUDA backend fuses them into one launch over the wide residual
+    ggml_build_forward_expand(gf, w);
+
     ggml_tensor * b = ggml_reshape_3d(ctx0, block_out, n_embd, 1, nt);
     b = ggml_repeat_4d(ctx0, b, n_embd, hc, nt, 1);
 
