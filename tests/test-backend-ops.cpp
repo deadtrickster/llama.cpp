@@ -3660,6 +3660,43 @@ struct test_slice_mean : public test_case {
     }
 };
 
+// GGML_UNARY_OP_* + GGML_OP_MUL with a broadcast operand (fused on CUDA)
+struct test_unary_mul_bcast : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const std::array<int64_t, 4> ne_b;  // broadcast into ne
+    const ggml_unary_op op;
+    const bool unary_on_bcast;          // f applied to the broadcast operand (else to the full one)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "UNARY_MUL_BCAST";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne, ne_b, op, unary_on_bcast);
+    }
+
+    test_unary_mul_bcast(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {48, 3, 1, 1}, std::array<int64_t, 4> ne_b = {48, 1, 1, 1},
+            ggml_unary_op op = GGML_UNARY_OP_SOFTPLUS, bool unary_on_bcast = false)
+        : type(type), ne(ne), ne_b(ne_b), op(op), unary_on_bcast(unary_on_bcast) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor(ctx, type, 4, ne_b.data());
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = unary_on_bcast ? ggml_mul(ctx, a, ggml_unary(ctx, b, op)) : ggml_mul(ctx, ggml_unary(ctx, a, op), b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_SILU_BACK
 struct test_silu_back : public test_case {
     const ggml_type type;
@@ -9682,6 +9719,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_slice_mean(GGML_TYPE_F32, 2560, 4, 3, sigmoid, 0.25f));
         test_cases.emplace_back(new test_slice_mean(GGML_TYPE_F32, 64, 3, 7, sigmoid, 1.0f/3.0f));
         test_cases.emplace_back(new test_slice_mean(GGML_TYPE_F32, 16, 2, 1, sigmoid, 0.5f));
+    }
+    for (ggml_unary_op op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS}) {
+        // gdn: softplus(alpha [48, T]) * A [48]; shared expert: y [n_embd, T] * sigmoid(gate [1, T])
+        test_cases.emplace_back(new test_unary_mul_bcast(GGML_TYPE_F32, {48, 3, 1, 1},   {48, 1, 1, 1}, op, false));
+        test_cases.emplace_back(new test_unary_mul_bcast(GGML_TYPE_F32, {2560, 3, 1, 1}, {1, 3, 1, 1},  op, true));
+        test_cases.emplace_back(new test_unary_mul_bcast(GGML_TYPE_F32, {16, 5, 4, 3},   {16, 1, 4, 1}, op, true));
     }
     test_cases.emplace_back(new test_silu_back());
 

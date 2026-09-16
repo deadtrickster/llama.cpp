@@ -3514,11 +3514,18 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         if (other->type != unary->type) {
             return false;
         }
-        if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0]) || !ggml_are_same_shape(other, unary)) {
+        if (!ggml_is_contiguous_1(other) || !ggml_is_contiguous_1(unary->src[0])) {
             return false;
         }
+        if (ggml_are_same_shape(other, unary)) {
+            return true;
+        }
 
-        return true;
+        // shapes differ: the broadcast kernel handles it for f32, with src1 repeating into src0
+        if (unary->type != GGML_TYPE_F32) {
+            return false;
+        }
+        return mul->src[0] == unary ? ggml_can_repeat(other, unary) : ggml_can_repeat(unary, other);
     }
 
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_SQR
@@ -4403,7 +4410,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        const ggml_tensor * other = mul->src[0] == node ? mul->src[1] : mul->src[0];
+        if (ggml_are_same_shape(other, node)) {
+            ggml_cuda_op_unary_mul(*cuda_ctx, node, mul);
+        } else {
+            ggml_cuda_op_unary_mul_bcast(*cuda_ctx, node, mul);
+        }
         return 1;
     }
 

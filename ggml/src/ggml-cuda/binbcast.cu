@@ -1,4 +1,5 @@
 #include "binbcast.cuh"
+#include "unary.cuh"
 #include <cstdint>
 #include <utility>
 
@@ -25,6 +26,20 @@ static __device__ __forceinline__ float op_mul(const float a, const float b) {
 static __device__ __forceinline__ float op_div(const float a, const float b) {
     return a / b;
 }
+
+// unary folded into a broadcast multiply: dst = f(a) * b or a * f(b), for the {UNARY, MUL} fusion
+// when the two operands do not share a shape (the gated kernel in unary.cu needs them equal).
+// the unaries are unary.cu's, so the fused result matches the separate launches bit for bit.
+static __device__ __forceinline__ float bb_silu(float x)     { return ggml_cuda_op_silu_single(x); }
+static __device__ __forceinline__ float bb_sigmoid(float x)  { return 1.0f / (1.0f + expf(-x)); }
+static __device__ __forceinline__ float bb_softplus(float x) { return (x > 20.0f) ? x : logf(1.0f + expf(x)); }
+
+static __device__ __forceinline__ float op_silu0_mul(const float a, const float b)     { return bb_silu(a) * b; }
+static __device__ __forceinline__ float op_sigmoid0_mul(const float a, const float b)  { return bb_sigmoid(a) * b; }
+static __device__ __forceinline__ float op_softplus0_mul(const float a, const float b) { return bb_softplus(a) * b; }
+static __device__ __forceinline__ float op_mul_silu1(const float a, const float b)     { return a * bb_silu(b); }
+static __device__ __forceinline__ float op_mul_sigmoid1(const float a, const float b)  { return a * bb_sigmoid(b); }
+static __device__ __forceinline__ float op_mul_softplus1(const float a, const float b) { return a * bb_softplus(b); }
 
 template <float (*bin_op)(const float, const float),
           typename src0_t,
@@ -444,6 +459,30 @@ void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+}
+
+void ggml_cuda_op_unary_mul_bcast(ggml_backend_cuda_context & ctx, ggml_tensor * unary, ggml_tensor * mul) {
+    const bool unary_is_src0 = mul->src[0] == unary;
+    GGML_ASSERT(unary_is_src0 || mul->src[1] == unary);
+
+    // the mul reads the unary's input directly; src0 is the full-shape operand, src1 broadcasts into it
+    const ggml_tensor * src0 = unary_is_src0 ? unary->src[0] : mul->src[0];
+    const ggml_tensor * src1 = unary_is_src0 ? mul->src[1]   : unary->src[0];
+
+    const ggml_unary_op op = ggml_get_unary_op(unary);
+    cudaStream_t stream = ctx.stream();
+
+#define GGML_CUDA_UNARY_MUL_BCAST(OP0, OP1) \
+    if (unary_is_src0) { ggml_cuda_op_bin_bcast<bin_bcast_cuda<OP0>>(src0, src1, mul, src0->data, src1->data, mul->data, stream); } \
+    else               { ggml_cuda_op_bin_bcast<bin_bcast_cuda<OP1>>(src0, src1, mul, src0->data, src1->data, mul->data, stream); }
+
+    switch (op) {
+        case GGML_UNARY_OP_SILU:     GGML_CUDA_UNARY_MUL_BCAST(op_silu0_mul,     op_mul_silu1);     break;
+        case GGML_UNARY_OP_SIGMOID:  GGML_CUDA_UNARY_MUL_BCAST(op_sigmoid0_mul,  op_mul_sigmoid1);  break;
+        case GGML_UNARY_OP_SOFTPLUS: GGML_CUDA_UNARY_MUL_BCAST(op_softplus0_mul, op_mul_softplus1); break;
+        default: GGML_ABORT("unsupported unary op for broadcast mul fusion");
+    }
+#undef GGML_CUDA_UNARY_MUL_BCAST
 }
 
 void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
