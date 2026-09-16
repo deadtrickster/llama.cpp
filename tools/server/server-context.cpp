@@ -4596,9 +4596,17 @@ private:
         // --ctx-checkpoints it does not leave the older history uncovered.
         //
         // Checkpoints belonging to the current task are never thinned, as before.
+        //
+        // [checkpoint-gap] The exponential rule leaves a divergence halfway back with a
+        // surviving checkpoint up to half that distance below it. Measured on a 33k
+        // conversation: a cut at 20k restored from 8,193 and re-prefilled 12,639 tokens.
+        // --checkpoint-max-gap keeps a checkpoint the rule would drop whenever the gap to
+        // the last kept one would otherwise exceed it, bounding that re-prefill at the
+        // cost of one checkpoint per gap of history. 0 leaves the rule alone.
         {
-            const int64_t tip  = slot.prompt.n_tokens();
-            const int64_t step = std::max<int64_t>(1, params_base.checkpoint_min_step);
+            const int64_t tip     = slot.prompt.n_tokens();
+            const int64_t step    = std::max<int64_t>(1, params_base.checkpoint_min_step);
+            const int64_t max_gap = params_base.checkpoint_max_gap;
 
             std::list<common_prompt_checkpoint> kept;
 
@@ -4611,7 +4619,11 @@ private:
                 // the tip is always retained, however close it is. It is the one a
                 // rollback is most likely to land on, and it is created within
                 // --checkpoint-min-step of the tip, so a distance test would drop it.
-                if (it->id_task == id_task || keep_dist == 0 || dist >= std::max(step, keep_dist*CHECKPOINT_EXP_FACTOR)) {
+                // keep this one if the NEXT candidate (about one step further back) would open a gap
+                // wider than max_gap, so the gap actually left never exceeds it
+                const bool gap_floor = max_gap > 0 && keep_dist > 0 && (dist - keep_dist) + step > max_gap;
+
+                if (it->id_task == id_task || keep_dist == 0 || dist >= std::max(step, keep_dist*CHECKPOINT_EXP_FACTOR) || gap_floor) {
                     if (it->id_task != id_task) {
                         keep_dist = dist;
                     }

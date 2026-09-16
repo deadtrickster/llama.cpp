@@ -1710,6 +1710,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-max-gap"}, "N",
+        string_format("floor on the exponential thinning of context checkpoints: two kept checkpoints are never further apart than N tokens, "
+                      "so a divergence deep in the conversation re-prefills at most N (default: %d, 0 = thinning alone)", params.checkpoint_max_gap),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("checkpoint-max-gap must be non-negative");
+            }
+            params.checkpoint_max_gap = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_MAX_GAP").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
