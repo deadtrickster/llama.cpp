@@ -109,6 +109,11 @@ struct llama_model_loader {
             return it == ranges.end() ? none : it->second;
         }
 
+        // every lazy range, by file index
+        const std::map<uint32_t, llama_mmap::ranges> & all() const {
+            return ranges;
+        }
+
         // lazy tensors are gathered on the host, so no offload setting applies to them
         static ggml_backend_buffer_type_t buft();
 

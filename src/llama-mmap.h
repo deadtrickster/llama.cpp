@@ -55,6 +55,9 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // pin [first, last) of the mapping in RAM (faults it in); false when the platform or the limit refuses
+    bool lock_range(size_t first, size_t last);
+
     static const bool SUPPORTED;
 
 private:

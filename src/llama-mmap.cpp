@@ -563,6 +563,32 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    bool lock_range(size_t first, size_t last) {
+#ifdef _POSIX_MEMLOCK_RANGE
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        first = first & ~(page_size - 1);
+        last  = std::min(size, (last + page_size - 1) & ~(page_size - 1));
+        if (last <= first) {
+            return true;
+        }
+        // the lazy ranges are MADV_RANDOM, and under that mlock faults one 4 KiB page per I/O: measured 0.34 GB/s
+        // cold, unchanged by readahead(2) or MADV_WILLNEED. With MADV_NORMAL the same lock runs at 5.8 GB/s,
+        // so lift the advice for the chunk and put it back after.
+        uint8_t * p = (uint8_t *) addr + first;
+        posix_madvise(p, last - first, POSIX_MADV_NORMAL);
+        const bool ok = mlock(p, last - first) == 0;
+        if (!ok) {
+            LLAMA_LOG_WARN("warning: failed to mlock %zu bytes at offset %zu: %s\n", last - first, first, strerror(errno));
+        }
+        posix_madvise(p, last - first, POSIX_MADV_RANDOM);
+        return ok;
+#else
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return false;
+#endif
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -627,6 +653,12 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    bool lock_range(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return false;
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -657,6 +689,13 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    bool lock_range(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        throw std::runtime_error("mmap not supported");
+    }
 #endif
 
     void * addr;
@@ -671,6 +710,7 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+bool llama_mmap::lock_range(size_t first, size_t last) { return pimpl->lock_range(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

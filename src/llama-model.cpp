@@ -32,6 +32,8 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <atomic>
+#include <thread>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1146,7 +1148,12 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        lazy_pin_stop = true;
+        if (lazy_pin_thread.joinable()) {
+            lazy_pin_thread.join();
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -1162,6 +1169,11 @@ struct llama_model::impl {
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
+
+    // lazy-read tensors are pinned after load, in the background, so that a step never waits on a
+    // page fault for a row (declared after mappings: joined before they are unmapped) [TAG_LAZY_PIN]
+    std::atomic<bool> lazy_pin_stop{false};
+    std::thread       lazy_pin_thread;
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
@@ -1853,6 +1865,46 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+    }
+
+    // [TAG_LAZY_PIN] --mlock skips lazy tensors at load time because faulting them in is what lazy avoids.
+    // But a lazy row that is not resident costs a synchronous disk read in the middle of a decode step
+    // (measured: ~22 major faults per step on a 54 GB n-gram table, 1.2-2.6 ms of a 19 ms step), and the
+    // page cache will not keep the table on its own: the just-uploaded GPU weights sit ahead of it in the LRU.
+    // So pin the lazy ranges in the background, chunk by chunk, while the model already serves.
+    if (use_mlock && use_mmap_buffer && ml.lazy.any()) {
+        auto ranges = ml.lazy.all();
+        auto * impl = pimpl.get();
+        size_t total = 0;
+        for (const auto & [idx, rs] : ranges) {
+            for (const auto & r : rs) {
+                total += r.second - r.first;
+            }
+        }
+        LLAMA_LOG_INFO("%s: pinning %zu MiB of lazy tensors in the background\n", __func__, total/1024/1024);
+
+        impl->lazy_pin_thread = std::thread([impl, ranges = std::move(ranges), total]() {
+            constexpr size_t chunk = 256ull*1024*1024;
+            const int64_t t_start = ggml_time_us();
+            size_t done = 0;
+            for (const auto & [idx, rs] : ranges) {
+                for (const auto & r : rs) {
+                    for (size_t off = r.first; off < r.second; off += chunk) {
+                        if (impl->lazy_pin_stop) {
+                            return;
+                        }
+                        const size_t end = std::min(r.second, off + chunk);
+                        if (!impl->mappings.at(idx)->lock_range(off, end)) {
+                            LLAMA_LOG_WARN("%s: lazy pin stopped after %zu MiB\n", __func__, done/1024/1024);
+                            return;
+                        }
+                        done += end - off;
+                    }
+                }
+            }
+            LLAMA_LOG_INFO("%s: pinned %zu MiB of lazy tensors in %.1f s\n", __func__,
+                    total/1024/1024, (ggml_time_us() - t_start)/1e6);
+        });
     }
 
     return true;
