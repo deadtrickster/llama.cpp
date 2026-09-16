@@ -193,6 +193,65 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     }
 }
 
+bool llama_memory_hybrid_idx::get_can_shift() const {
+    if (mem_idx && !mem_idx->get_can_shift()) {
+        return false;
+    }
+    return llama_memory_hybrid::get_can_shift();
+}
+
+// same rollback discipline as the base: the attention and recurrent halves first, the indexer
+// last, and any refusal puts the others back
+bool llama_memory_hybrid_idx::seq_max_resize(uint32_t n_seq_max) {
+    const uint32_t n_seq_max_old = get_mem_recr()->size;
+
+    if (!llama_memory_hybrid::seq_max_resize(n_seq_max)) {
+        return false;
+    }
+
+    if (mem_idx && !mem_idx->seq_max_resize(n_seq_max)) {
+        llama_memory_hybrid::seq_max_resize(n_seq_max_old);
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_memory_hybrid_idx::n_ctx_resize(uint32_t n_ctx) {
+    const uint32_t n_ctx_old = get_mem_attn()->get_size();
+
+    if (!llama_memory_hybrid::n_ctx_resize(n_ctx)) {
+        return false;
+    }
+
+    if (mem_idx && !mem_idx->n_ctx_resize(n_ctx)) {
+        llama_memory_hybrid::n_ctx_resize(n_ctx_old);
+        return false;
+    }
+
+    return true;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::n_ctx_cost(uint32_t n_ctx) const {
+    auto res = llama_memory_hybrid::n_ctx_cost(n_ctx);
+
+    if (mem_idx) {
+        for (const auto & [buft, bytes] : mem_idx->n_ctx_cost(n_ctx)) {
+            res[buft] += bytes;
+        }
+    }
+
+    return res;
+}
+
+void llama_memory_hybrid_idx::set_n_kv_limit(uint32_t n_kv) {
+    llama_memory_hybrid::set_n_kv_limit(n_kv);
+
+    if (mem_idx) {
+        mem_idx->set_n_kv_limit(n_kv);
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = llama_memory_hybrid::memory_breakdown();
 

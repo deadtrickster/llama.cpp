@@ -64,6 +64,16 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // the elastic pool and the memory fitter resize and bound the caches through the base class,
+    // which knows its own indexer and not this one: every one of these must reach mem_idx too, or
+    // the indexer cache falls out of step with the attention cache it mirrors cell for cell
+    // (qwen4exp asserts on exactly that at the first graph reserve)
+    bool get_can_shift() const override;
+    bool seq_max_resize(uint32_t n_seq_max) override;
+    bool n_ctx_resize(uint32_t n_ctx) override;
+    std::map<ggml_backend_buffer_type_t, size_t> n_ctx_cost(uint32_t n_ctx) const override;
+    void set_n_kv_limit(uint32_t n_kv) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
