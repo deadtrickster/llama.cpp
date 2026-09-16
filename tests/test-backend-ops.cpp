@@ -10486,6 +10486,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // a sparse-attention indexer during prefill: a microbatch of rows each selecting 2048 of n_kv keys
+    for (int nrows : {32, 512}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {33024, nrows, 1, 1}, 2048));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {33024, nrows, 1, 1}, 2048, true));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2304,  nrows, 1, 1}, 2048));
+    }
+
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
