@@ -358,3 +358,91 @@ def test_cached_conversation_larger_than_the_pool_grows_it_back():
                 "the pool did not grow for the restore"
         finally:
             sp.stop()
+
+
+# ---------------------------------------------------------------------------------------------------------
+# [seq] the id a resume is handed lives nowhere until the restore lands. Measured 2026-09-17 on GLM: the
+# resume of a suspended 200k-token generation acquired id 3 by raising the ceiling to 4, asked the pool to
+# grow for its cells, and the grow's own shrink rung - "cells short, ids idle: give the idle ids back" -
+# saw no record holding 3 and lowered the ceiling to 3 again. The restore into id 3 failed, its clean-up
+# seq_rm(3) hit common_memory's abort, and the server dumped core with three conversations on it.
+#
+# Driven here with the fake device: ids cost nothing (every raise succeeds) and the pool has a budget it
+# reaches with A and B on it. A is suspended for B; D takes A's id while A waits; A's resume then has to
+# raise for an id and cannot grow for its cells.
+# ---------------------------------------------------------------------------------------------------------
+
+def _wait_for(path: str, pattern: str, timeout_s: float) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if re.search(pattern, _log(path)):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_resume_keeps_the_id_it_was_handed_when_the_pool_cannot_grow():
+    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log)
+    sp.n_ctx = 4096           # the budget is the wall, not -c; a seat still holds at most n_ctx_train (2048)
+    sp.n_threads = 1
+    sp.n_gpu_layer = 0
+    sp.debug = True
+    # no CUDA device at all (a CUDA build otherwise puts the host copies on CUDA_Host, at another price):
+    # 1.2 KiB per cell on the CPU buffer, 2048 cells (2.4 MiB) fit the 2.5 MiB and 2304 do not; an id is free
+    sp.env = {"LLAMA_SERVER_POOL_SELFTEST": "2.5:0", "CUDA_VISIBLE_DEVICES": ""}
+    sp.start(timeout_seconds=120)
+    try:
+        prompt_a = "Alpha. " + _prompt_of(sp, 1500)
+        prompt_b = "Bravo. " + _prompt_of(sp, 20)
+        prompt_d = "Delta. " + _prompt_of(sp, 1000)
+
+        res = {}
+
+        def go(k, prompt, n):
+            try:
+                res[k] = _gen(sp, prompt, n)
+            except Exception as e:      # a died server shows up here
+                res[k] = e
+
+        # A ends under a seat's 2048; A and B together do not fit the budget, so A is suspended for B
+        ta = threading.Thread(target=go, args=("A", prompt_a, 500))
+        ta.start()
+        assert _wait_for(log, r"id\s+0 \| task \d+ \| n_gen = \d+, n_remaining", 60), "A never started generating"
+        tb = threading.Thread(target=go, args=("B", prompt_b, 600))
+        tb.start()
+
+        assert _wait_for(log, r"offloaded sequence \d+ mid-flight", 120), "the pool never suspended anyone"
+
+        # D takes the id A gave up and stays resident on it: A's resume has to raise for an id
+        r = _gen(sp, prompt_d, 4)
+        assert r.status_code == 200, r.body
+
+        ta.join(timeout=300)
+        tb.join(timeout=300)
+        text = _log(log)
+    finally:
+        sp.stop()
+
+    for k in "AB":
+        assert k in res, f"{k}: no response"
+        assert not isinstance(res[k], Exception), f"{k}: the server died: {res[k]!r}"
+
+    # PRECONDITIONS: A's resume raised the ceiling for its id, and the pool could not grow for its cells
+    i_raise = text.find("raised the sequence ceiling to 3")
+    assert i_raise >= 0, "the resume never needed a raise: nothing is proven"
+    assert re.search(r"more do not fit \(resuming a suspended generation\)", text), "the pool grew for the resume: nothing is proven"
+
+    # the id the resume holds is not "idle" for the grow's shrink rung: the ceiling stays where the raise
+    # put it until the restore has landed under that id
+    i_restored = text.find("restored task", i_raise)
+    assert i_restored > 0, "the suspended generation never came back"
+    between = text[i_raise:i_restored]
+    assert "lowered the sequence ceiling" not in between, (
+        "the grow's shrink rung took back the id the resume was handed")
+    assert "larger than n_seq_max" not in text
+    assert "failed to restore target KV state" not in text
+
+    assert res["A"].status_code == 200, f"A: {res['A'].body}"
+    assert res["A"].body["timings"]["predicted_n"] == 500, f"A was cut short: {res['A'].body['timings']}"
+    assert "resumed at" in text, "the suspended generation never resumed"

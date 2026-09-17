@@ -2262,10 +2262,17 @@ private:
         return nullptr;
     }
 
+    // [seq] an id handed out for a restore that has not landed yet: no record holds it, but the ceiling must
+    // not drop below it and nobody else may be given it. Measured 2026-09-17: the resume of a 200k-token
+    // generation acquired id 3 by raising the ceiling to 4, the pool grow that followed found the id idle
+    // (seq_id_highest() saw 2) and lowered the ceiling to 3, the restore into id 3 failed, and the clean-up
+    // seq_rm(3) aborted the server
+    llama_seq_id seq_id_reserved = -1;
+
     llama_seq_id seq_id_free() {
         const uint32_t n = seq_ceiling();
         for (uint32_t id = 0; id < n; ++id) {
-            if (seq_by_id(id) == nullptr) {
+            if ((llama_seq_id) id != seq_id_reserved && seq_by_id(id) == nullptr) {
                 return id;
             }
         }
@@ -2273,7 +2280,7 @@ private:
     }
 
     llama_seq_id seq_id_highest() const {
-        llama_seq_id res = -1;
+        llama_seq_id res = seq_id_reserved;
         for (const auto & s : seqs) {
             res = std::max(res, s.seq_id);
         }
@@ -2476,14 +2483,20 @@ private:
 
         if (llama_state_seq_set_data_ext(ctx_tgt, s.data_tgt.data(), s.data_tgt.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
             SRV_ERR("restore: failed to restore target KV state (%zu bytes) for task %d\n", s.data_tgt.size(), s.task->id);
-            seq_mem.seq_rm(id, -1, -1);
+            // an id past the ceiling (the restore failed for that very reason) has nothing to clear, and
+            // common_memory::seq_rm aborts on it
+            if ((uint32_t) id < seq_ceiling()) {
+                seq_mem.seq_rm(id, -1, -1);
+            }
             return false;
         }
         if (ctx_dft && !s.data_dft.empty()) {
             if (llama_state_seq_set_data_ext(ctx_dft, s.data_dft.data(), s.data_dft.size(), id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
                 // the target half is in; half a state is worse than none
                 SRV_ERR("restore: failed to restore draft KV state (%zu bytes) for task %d\n", s.data_dft.size(), s.task->id);
-                seq_mem.seq_rm(id, -1, -1);
+                if ((uint32_t) id < seq_ceiling()) {
+                    seq_mem.seq_rm(id, -1, -1);
+                }
                 return false;
             }
         }
@@ -3631,6 +3644,19 @@ private:
                 }
                 if (pool_has_room_for(s) && seq_restore(s, id)) {
                     return true;
+                }
+                // nothing is evicted for a state that does not fit even after every resident is gone: the
+                // room comes from a running generation finishing, and the residents are worth more waiting
+                {
+                    size_t reach = pool_cells_free();
+                    for (const auto & o : seqs) {
+                        if (o.seq_id >= 0 && !o.offloaded() && !o.mid_flight() && !seq_running(o)) {
+                            reach += seq_prompt(o).tokens.size();
+                        }
+                    }
+                    if (s.prompt.tokens.size() + 1 + slots.size() > reach) {
+                        break;
+                    }
                 }
                 if (!pool_evict_resident(/*force*/ pass == 1, "resuming a suspended generation")) {
                     break;
@@ -5469,6 +5495,7 @@ private:
                     // this one is skipped, not the list: a resident generation behind it may be holding exactly the cells
                     // it waits for, and has to run to free them.
                     bool may_wait = false;
+                    seq_id_reserved = id;
                     bool restored = seq_restore_with_room(s, id, may_wait);
                     while (!restored && force && may_wait) {
                         server_slot * t = pool_preempt_running(/*offload*/ true, s, "is past its suspension deadline and needs room");
@@ -5480,6 +5507,7 @@ private:
                         }
                         restored = seq_restore_with_room(s, id, may_wait);
                     }
+                    seq_id_reserved = -1;
 
                     if (!restored) {
                         if (may_wait) {
