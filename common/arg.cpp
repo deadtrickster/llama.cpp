@@ -3987,6 +3987,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--sleep-on-ram-pressure"},
+        "the idle sleep (--sleep-idle-seconds) only fires when the prompt cache holds 3/4 of --cache-ram or more,\n"
+        "so it is a RAM drain and a quiet server keeps its model and conversations loaded (default: off - sleep on idle alone)",
+        [](common_params & params) {
+            params.sleep_on_ram_pressure = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {

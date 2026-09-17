@@ -7224,11 +7224,16 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
-    // [sleep-pressure] hand the queue the RAM-pressure test: an idle server only
-    // sleeps when the prompt cache is actually near --cache-ram, so a quiet
-    // single conversation stays resident instead of being drained and reprefilled.
-    impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000,
-        [impl = impl.get()]() { return impl->prompt_cache ? impl->prompt_cache->under_ram_pressure() : false; });
+    // [sleep-pressure] with --sleep-on-ram-pressure the queue also gets the RAM-pressure test: an idle
+    // server then only sleeps when the prompt cache is actually near --cache-ram, so a quiet single
+    // conversation stays resident instead of being drained and reprefilled. Without it --sleep-idle-seconds
+    // means what it says (the gate was unconditional for four days and no idle server ever slept: the
+    // sleep tests were failing on it)
+    std::function<bool()> ram_pressure;
+    if (params.sleep_on_ram_pressure) {
+        ram_pressure = [impl = impl.get()]() { return impl->prompt_cache ? impl->prompt_cache->under_ram_pressure() : false; };
+    }
+    impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000, ram_pressure);
 }
 
 void server_context::terminate() {
