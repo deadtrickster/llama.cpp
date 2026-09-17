@@ -239,7 +239,8 @@ def test_ceiling_grows_on_a_recurrent_model():
 
     assert "seq_max_resize: 1 -> 2 cells" in text, "the recurrent rows were not reallocated"
     # the server asked the model what one more sequence costs; a recurrent model answers with its rows
-    m = re.search(r"raised the sequence ceiling to 2 \(CPU ([0-9.]+) MiB", text)
+    # the rows live wherever the model put them (CPU here, CUDA0 on a GPU box); the device is not the point
+    m = re.search(r"raised the sequence ceiling to 2 \([A-Za-z0-9_]+ ([0-9.]+) MiB", text)
     assert m and float(m.group(1)) > 0, "the raise did not report a per-sequence cost from the model"
     assert t["cache_n"] == n_a + 8 - 1 and t["prompt_n"] == 1, f"A was not resident after the raise: {t}"
 
@@ -585,6 +586,7 @@ def test_suspended_generation_gets_compute_within_the_deadline():
     sp.slot_resume_after = bound_ms
     sp.slot_deadline_preempt = True   # the teeth, default off: without it A only wins a seat that frees on its own
     sp.n_threads = 1              # the model's training context caps a generation at 2048 tokens; slow it instead
+    sp.n_gpu_layer = 0            # ... which only slows a CPU run: on a GPU 2000 tokens take ~450 ms, under the precondition
     sp.start(timeout_seconds=120)
     try:
         _wait_ready(sp)
