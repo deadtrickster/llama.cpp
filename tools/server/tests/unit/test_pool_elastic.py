@@ -31,7 +31,8 @@ SENTENCE = (
     "golden sword hidden deep within the enchanted forest of whispers. "
 )
 
-START = 512
+START = 512      # -c: the ceiling the pool may grow to
+FLOOR = 256      # where it starts: --pool-min-ctx, derived from -b 256 here
 
 
 def _mk(log_path: str, n_slots: int = 1, pool_static: bool = False) -> ServerProcess:
@@ -77,19 +78,19 @@ def test_prompt_larger_than_the_pool_grows_it():
         sp = _mk(log)
         sp.start(timeout_seconds=180)
         try:
-            assert "[pool] elastic: starts at 512 cells" in _log(log)
+            assert f"[pool] elastic: starts at {FLOOR} cells" in _log(log)
 
             prompt = _prompt_of(sp, 700)
             r = _complete(sp, prompt)
             assert r.status_code == 200, r.body
             assert r.body["tokens_evaluated"] >= 700
 
-            grows = _grow_lines(_log(log))
+            # the first resize is the start (-c down to the floor); the grows follow, a quarter at a time
+            grows = [(int(a), int(b)) for a, b in _grow_lines(_log(log)) if int(b) > int(a)]
             assert grows, "no [pool] resize line: the pool did not grow for a 700-token prompt"
-            n_from, n_to = int(grows[0][0]), int(grows[0][1])
-            assert n_from == START
-            assert n_to >= 768, f"grew to {n_to}, which does not hold 700 tokens"
-            assert n_to % 256 == 0
+            assert grows[0][0] == FLOOR
+            assert grows[-1][1] >= 768, f"grew to {grows[-1][1]}, which does not hold 700 tokens"
+            assert all(n_to % 256 == 0 for _, n_to in grows)
         finally:
             sp.stop()
 
@@ -171,11 +172,11 @@ def test_pool_static_keeps_the_old_refusal():
 # prices the device-less buffer type as a device of that size with that much per id - inert on CUDA. The
 # numbers below are worked from stories260K's 640 bytes per cell, padding of 256 and --pool-min-ctx 256
 # (derived from -b 256). llama_n_ctx_cost prices a cell at 1,152 bytes here (640 of KV plus the compute
-# buffer's share), so a 3072-cell pool costs 3.375 MiB; one id 1.25 MiB; a raise needs the id plus one more
-# in reserve, 2.5 MiB, and the fake device of 6.5 MiB has 1.875 MiB free, so the first raise is refused by
-# 0.625 MiB (569 cells) and the shrink gives back at least half the idle cells: 3072 -> 1792, below a
-# ~1,940-token entry. With the floor it gives back the 569 and stops at 2560; the raise is asked again
-# from there and the seat goes to C when B is done.
+# buffer's share). The pool starts at the floor and grows with A to 2304 cells, 2.6 MiB; one id 1.25 MiB;
+# a raise needs the id plus one more in reserve, 2.4 MiB, and the fake device of 5.75 MiB has 1.9 MiB free,
+# so B's raise is refused, the shrink gives back the 364 idle cells (to 2048) and A is evicted for the id.
+# C's raise is refused the same way, and the shrink then has A in the cache to leave room for: 2048 cells
+# hold 1943 plus the margin and B, nothing is idle beyond that floor, and the seat goes to C when B is done.
 #
 # What is asserted is the LOG LINE (the state_read_meta error must not appear) and the TOKEN COUNTS
 # (prompt_n 1, cache_n the conversation): a silent full prefill answers correctly, and a test that only
@@ -188,7 +189,7 @@ PROMPT_B = "In a small village by the sea an old fisherman mended his nets every
 PROMPT_C = "The mountain pass was closed by snow and the travellers waited in the inn"
 
 POOL_R    = 3072
-SELFTEST  = "6.5:1.25"
+SELFTEST  = "5.75:1.25"
 N_A       = 1900       # tokens in the cached conversation; n_ctx_train of tinyllama2 is 2048
 
 
@@ -203,8 +204,12 @@ def _mk_r(log_path: str, cache_dir: str, selftest: bool) -> ServerProcess:
     sp.cache_ram = 100
     sp.slot_save_path = cache_dir  # the disk tier: test (b) hands the entry across a restart
     sp.debug = True
+    # the fake device prices buffer types WITHOUT a device: on a CUDA build the cells would sit on a real
+    # card and nothing here would bite, so these run with no card in sight, at the CPU buffer's price
+    sp.n_gpu_layer = 0
+    sp.env = {"CUDA_VISIBLE_DEVICES": ""}
     if selftest:
-        sp.env = {"LLAMA_SERVER_POOL_SELFTEST": SELFTEST}
+        sp.env["LLAMA_SERVER_POOL_SELFTEST"] = SELFTEST
     return sp
 
 
@@ -300,7 +305,7 @@ def test_shrink_keeps_room_for_the_largest_cached_conversation():
 
             t = _return_of_a(sp, prompt_a)
             text = _log(sp.log_path)
-            assert "failed to find" not in text, "state_read_meta could not place the cached conversation"
+            assert "available cells in kv cache" not in text, "state_read_meta could not place the cached conversation"
             assert "failed to load prompt from cache" not in text
             assert t["prompt_n"] == 1 and t["cache_n"] == n_a - 1, \
                 f"A was prefilled again instead of restored: prompt_n={t['prompt_n']}, cache_n={t['cache_n']}"
@@ -335,14 +340,17 @@ def test_cached_conversation_larger_than_the_pool_grows_it_back():
         try:
             _pressure(sp)              # A stays on disk: nothing here touches it before the shrink
 
+            # the pool of the new server started at the floor and grew only for B and C: it is below the
+            # entry on disk, which the floor (RAM tier) never covered. (Before the pool started minimal
+            # the situation came from a shrink for an id; the fact is the same: too few cells for A.)
             text = _log(sp.log_path)
-            shrinks = _shrink_lines(text)
-            assert any(n_to < held + n_a + 2 for _, n_to, held in shrinks), \
-                f"the pool never shrank below the {n_a}-token entry ({shrinks}): the situation was not created, nothing is proven"
+            sizes = [int(b) for _, b in _grow_lines(text)]
+            assert sizes and sizes[-1] < n_a + 2, \
+                f"the pool holds the {n_a}-token entry already ({sizes}): the situation was not created, nothing is proven"
 
             t = _return_of_a(sp, prompt_a)
             text = _log(sp.log_path)
-            assert "failed to find" not in text, "state_read_meta could not place the cached conversation"
+            assert "available cells in kv cache" not in text, "state_read_meta could not place the cached conversation"
             assert "failed to load prompt from cache" not in text
             assert t["prompt_n"] == 1 and t["cache_n"] == n_a - 1, \
                 f"A was prefilled again instead of restored: prompt_n={t['prompt_n']}, cache_n={t['cache_n']}"
