@@ -180,13 +180,18 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
         return false;
     }
 
+    // [seq-max] cells are not sequence ids: a live sequence's state sits in whichever cell find_slot gave
+    // it, so a shrink to n_new can drop an occupied cell while only n_new sequences exist. Measured
+    // 2026-09-17 on the production server: the server had evicted sequence 3, the surviving state of
+    // another sequence sat in cell 3, the shrink was refused, the caller rolled the target context back
+    // (1.3 GB staged each way) and tried again on the next batch - one cycle per token. Move the rows of
+    // dropped cells into free cells below n_new instead, and refuse only when there is no room for them.
+    // The dropped sequence ids must own no tail; that is the caller's condition, as before.
+    std::vector<int32_t> cell_map(size);
+    for (uint32_t i = 0; i < size; ++i) {
+        cell_map[i] = (int32_t) i;
+    }
     if (n_new < size) {
-        for (uint32_t i = n_new; i < size; ++i) {
-            if (!cells[i].is_empty() || cells[i].pos >= 0) {
-                LLAMA_LOG_ERROR("%s: cannot shrink to %u cells: cell %u is in use\n", __func__, n_new, i);
-                return false;
-            }
-        }
         for (uint32_t s = n_new; s < size; ++s) {
             // cells[s].tail is the tail cell of sequence s
             if (cells[s].tail >= 0) {
@@ -194,11 +199,25 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
                 return false;
             }
         }
+        uint32_t j = 0; // next free cell below n_new
+        for (uint32_t i = n_new; i < size; ++i) {
+            if (cells[i].is_empty() && cells[i].pos < 0) {
+                continue;
+            }
+            while (j < n_new && !(cells[j].is_empty() && cells[j].pos < 0)) {
+                ++j;
+            }
+            if (j >= n_new) {
+                LLAMA_LOG_ERROR("%s: cannot shrink to %u cells: %u cells are in use\n", __func__, n_new, n_new + 1);
+                return false;
+            }
+            cell_map[i] = (int32_t) j++;
+        }
     }
 
     const int32_t  n_layer  = hparams.n_layer();
     const uint32_t n_groups = 1 + n_rs_seq;
-    const uint32_t n_copy   = std::min(size, n_new); // cells whose rows survive
+    const uint32_t n_copy   = size; // every cell's rows are staged; the map says where they land
 
     // per layer: where the tensors belong (not necessarily where the old ones are, after a host
     // fallback) and how they are typed, so the new ones match
@@ -394,11 +413,28 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
         }
     }
 
-    // 4. put the rows back: (cell, group j) -> row j*n_install + cell
+    // 4. put the rows back: (cell, group j) -> row j*n_install + cell_map[cell]. The old layout comes
+    // back unmapped when the allocation was refused (n_install == size); a grown layout keeps every cell
+    // where it was; a shrunk one lands the dropped cells' rows in the free cells the map picked for them
+    const bool remap = n_install == n_new && n_new < size;
     auto unstage = [&](ggml_tensor * t, const rows_t & groups) {
         const size_t row_bytes = t->nb[1];
         for (uint32_t j = 0; j < n_groups; ++j) {
-            ggml_backend_tensor_set(t, groups[j].data(), (size_t) j * n_install * row_bytes, groups[j].size());
+            if (!remap) {
+                const size_t n_rows = std::min<size_t>(groups[j].size() / row_bytes, n_install);
+                ggml_backend_tensor_set(t, groups[j].data(), (size_t) j * n_install * row_bytes, n_rows * row_bytes);
+                continue;
+            }
+            for (uint32_t i = 0; i < size; ++i) {
+                if (cell_map[i] < 0 || (uint32_t) cell_map[i] >= n_install) {
+                    continue;
+                }
+                if (i >= n_new && cells[i].is_empty() && cells[i].pos < 0) {
+                    continue; // a dropped empty cell: nothing to carry
+                }
+                ggml_backend_tensor_set(t, groups[j].data() + (size_t) i * row_bytes,
+                        ((size_t) j * n_install + cell_map[i]) * row_bytes, row_bytes);
+            }
         }
     };
 
@@ -425,9 +461,33 @@ bool llama_memory_recurrent::seq_max_resize(uint32_t n_new) {
 
     const uint32_t n_old = size;
 
+    if (n_new < size) {
+        // move the metadata of the dropped cells the same way, and point sources and tails at the new places.
+        // a cell's `tail` field belongs to the sequence of that index, not to the cell: it stays put
+        for (uint32_t i = n_new; i < size; ++i) {
+            const int32_t j = cell_map[i];
+            if (j == (int32_t) i) {
+                continue;
+            }
+            cells[j].pos    = cells[i].pos;
+            cells[j].src    = cells[i].src;
+            cells[j].src0   = cells[i].src0;
+            cells[j].seq_id = std::move(cells[i].seq_id);
+            cells[i].pos    = -1;
+            cells[i].src    = -1;
+            cells[i].src0   = -1;
+            cells[i].seq_id.clear();
+        }
+        for (uint32_t c = 0; c < n_new; ++c) {
+            if (cells[c].src  >= 0) cells[c].src  = cell_map[cells[c].src];
+            if (cells[c].src0 >= 0) cells[c].src0 = cell_map[cells[c].src0];
+            if (cells[c].tail >= 0) cells[c].tail = cell_map[cells[c].tail];
+        }
+    }
+
     size      = n_new;
     n_seq_max = n_new;
-    cells.resize(n_new);  // new cells are empty; dropped ones were verified empty above
+    cells.resize(n_new);  // dropped cells are empty now: their rows and metadata moved below n_new
     rs_idx.resize(n_new, 0);
     head = 0;             // a search hint only
 

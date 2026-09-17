@@ -300,6 +300,36 @@ int main(int argc, char ** argv) {
     CHECK(decode_tokens(ctx, Q, 3, 0) == 0, "decode on seq 3 after the raise to 4");
 
     llama_free(ctx);
+
+    // ---- a shrink that drops an OCCUPIED cell of a sequence that stays ----
+    // The recurrent module's cells are not sequence ids: a sequence's state sits in whichever cell it was
+    // given. Sequence 3 decodes first and takes cell 0; sequence 0 takes cell 1; sequence 3 is removed. One
+    // sequence, id 0, ceiling 1 is legitimate - and its state is in cell 1, which the shrink drops. This
+    // used to be refused ("cell 1 is in use"), and on the production server the caller then rolled its
+    // other memory back and retried on every batch. The shrink must move the row and sequence 0 must
+    // continue exactly as it does in a context that never held sequence 3.
+    {
+        llama_context * ref = make_ctx(model, 1);
+        CHECK(ref, "reference context (ceiling 1)");
+        CHECK(decode_tokens(ref, P, 0, 0) == 0, "ref: decode P");
+        CHECK(generate(ref, {0}, {greedy(ref, -1)}, {(llama_pos) P.size()}, N1, g) == 0, "ref: gen 0");
+        const std::vector<llama_token> R0e = g[0];
+        llama_free(ref);
+
+        llama_context * c4 = make_ctx(model, 4);
+        CHECK(c4, "context (ceiling 4)");
+        CHECK(decode_tokens(c4, Q, 3, 0) == 0, "decode Q on seq 3 first");
+        CHECK(decode_tokens(c4, P, 0, 0) == 0, "decode P on seq 0 second");
+        const llama_token p_first = greedy(c4, -1);
+        CHECK(llama_memory_seq_rm(llama_get_memory(c4), 3, -1, -1), "seq_rm 3");
+        CHECK(llama_set_n_seq_max(c4, 1), "shrink to 1 refused with only sequence 0 live (its state was in a dropped cell)");
+        CHECK(llama_n_seq_max(c4) == 1, "n_seq_max is %u after the shrink", llama_n_seq_max(c4));
+        CHECK(generate(c4, {0}, {p_first}, {(llama_pos) P.size()}, N1, g) == 0, "gen 0 after the compacting shrink");
+        CHECK(g[0] == R0e, "seq 0 after the compacting shrink diverged:\n  got %s\n  ref %s", show(g[0]).c_str(), show(R0e).c_str());
+        printf("compacting shrink: sequence 0 moved out of a dropped cell and continued identically\n");
+        llama_free(c4);
+    }
+
     llama_model_free(model);
     llama_backend_free();
 
