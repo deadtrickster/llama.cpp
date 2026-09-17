@@ -3494,9 +3494,9 @@ private:
     }
 
     // rung 2: the largest RUNNING generation with tokens pending gives up its seat and its cells (seat_release,
-    // then the offload copy); the resume pass brings it back when there is room. Only with company: alone in the
-    // batch there is nobody to make room for - it would be restored into the same full pool and suspended again,
-    // forever - and that is rung 3's case. A prefill cannot be suspended (half its prompt is in the KV;
+    // then the offload copy); the resume pass brings it back when there is room. Only with company: with no other
+    // sequence processing there is nobody to make room for - it would be restored into the same full pool and
+    // suspended again, forever - and that is rung 3's case. A prefill cannot be suspended (half its prompt is in the KV;
     // seat_release() refuses), nor a parent or child (shared cells, not explored): they fall through.
     bool pool_suspend_running(int32_t off) {
         // test hook: LLAMA_SERVER_POOL_NO_SUSPEND skips this rung so the terminal rung stays reachable by a
@@ -3508,22 +3508,46 @@ private:
         }
 
         const auto pending = batch_pending_slots(off);
-        if (pending.size() < 2) {
+
+        // company is what makes the copy worth taking: a second sequence in this batch, or one that is
+        // processing outside it - a prefill whose chunk was deferred out of the batch a moment ago
+        // (pool_defer_pending) and is waiting for exactly these cells. Measured 2026-09-17: an 86k
+        // generation alone in the batch next to a 242k prefill was refused here and fell through to the
+        // 500 - the prefill could be neither suspended nor evicted, and the generation was the only
+        // thing in the pool that could move.
+        bool company = pending.size() >= 2;
+        if (!company && pending.size() == 1) {
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && &slot != pending[0].first) {
+                    company = true;
+                    break;
+                }
+            }
+        }
+        if (!company) {
             return false;
         }
 
+        // the victim is any running generation, in this batch or deferred out of it (then it has no pending
+        // tokens here and there is nothing to drop from the batch, only the copy to take)
         server_slot * victim    = nullptr;
         int32_t       n_pending = 0;
 
-        for (const auto & [slot, n] : pending) {
-            if (slot->state != SLOT_STATE_GENERATING || !slot->task) {
+        for (auto & slot : slots) {
+            if (!slot.is_processing() || slot.state != SLOT_STATE_GENERATING || !slot.task) {
                 continue;
             }
-            if (slot->task->is_parent() || slot->task->is_child()) {
+            if (slot.task->is_parent() || slot.task->is_child()) {
                 continue;
             }
-            if (!victim || slot->prompt.n_tokens() > victim->prompt.n_tokens()) {
-                victim    = slot;
+            int32_t n = 0;
+            for (const auto & [ps, pn] : pending) {
+                if (ps == &slot) {
+                    n = pn;
+                }
+            }
+            if (!victim || slot.prompt.n_tokens() > victim->prompt.n_tokens()) {
+                victim    = &slot;
                 n_pending = n;
             }
         }

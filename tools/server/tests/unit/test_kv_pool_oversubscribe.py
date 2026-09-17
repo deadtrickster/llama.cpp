@@ -337,6 +337,72 @@ def test_pool_exhaustion_suspends_the_largest_running_sequence(extra_b):
         f"the surviving request was cut short: {b.body['timings']}")
 
 
+@pytest.mark.parametrize("n_b", [2016, 2030])
+def test_pool_exhaustion_suspends_a_generation_beside_a_deferred_prefill(n_b):
+    """Rung 2 with the company outside the batch. A generates on slot 0 with a
+    small prompt; while it runs, B arrives on slot 1 with a prompt that needs
+    most of the pool. B's prefill chunks are batched with A's decode token; the
+    chunk that no longer fits is deferred out of the batch (rung 0), and the
+    retry finds A's single token alone in it and still unplaceable.
+
+    Measured 2026-09-17 on the production server: an 86k generation alone in the
+    batch next to a 242k prefill. Rung 2 used to refuse for lack of company in
+    the batch, the prefill could be neither suspended (half in the KV) nor
+    evicted (running), and the terminal rung answered the generation with a 500.
+    The prefill IS the company: it is waiting for exactly the cells the
+    generation holds. Required: A is suspended with a copy, B's prompt
+    completes, nobody gets a 500, and A comes back and finishes.
+
+    n_b sets where the wall lands relative to B's 256-token chunks; both
+    parities must give the same answer. Which sequence is suspended depends on
+    which is larger when the wall is hit (B once its prompt is in), so the test
+    asks for a suspension, not for a particular victim."""
+    log_path = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log_path, n_ctx=2048, n_predict=4096)
+    sp.debug = True
+    # production interleaves decode-only batches between prefill chunks; after the deferral those batches
+    # carry the generation alone, with the prefill processing outside them - the shape rung 2 refused
+    sp.decode_per_prefill = 8
+    sp.start(timeout_seconds=120)
+    try:
+        _wait_ready(sp)
+        log = LogReader(log_path)
+        log.drain()
+
+        # B's prompt needs more of the 2048 pool than A leaves (20 in, generating): its prefill is what
+        # hits the wall, in its last chunk, while it still fits its own slot with the 8 tokens it asks for
+        prompt_b = _tokens(sp, SENTENCE * 80)[:n_b]
+        assert len(prompt_b) == n_b
+        toks_a = _tokens(sp, SENTENCE * 3)[:20]
+
+        a, b, done = [], [], {}
+        ta = threading.Thread(target=_gen_tokens, args=(sp, toks_a, 0, TWO_DEEP_N_PREDICT, a, done, "A"))
+        tb = threading.Thread(target=_gen_tokens, args=(sp, prompt_b, 1, 8, b, done, "B"))
+        ta.start(); tb.start()                   # A's 20-token prompt is in and generating before B's 1900 are batched
+        ta.join(timeout=300); tb.join(timeout=300)
+
+        assert sp.process is None or sp.process.poll() is None, "server died under pool exhaustion"
+        for name, out in (("A", a), ("B", b)):
+            assert out, f"{name}: no response"
+            assert not isinstance(out[0], Exception), f"{name}: {out[0]!r}"
+
+        text = log.drain()
+    finally:
+        sp.stop()
+
+    assert "Context size has been exceeded" in text, "the pool was never exhausted"
+
+    report = f"A: HTTP {a[0].status_code}, B: HTTP {b[0].status_code}"
+    assert "__TEST_TAG_POOL_EXHAUSTED_SPILL__" not in text, (
+        f"rung 3 fired: the generation was failed although it could have been suspended for the prefill ({report})")
+    assert "KV pool full: suspending" in text, f"no running generation was suspended ({report})"
+    assert "offloaded sequence" in text, "the suspended sequence was not copied out of the pool"
+
+    assert b[0].status_code == 200, f"the prefill that was waiting for the cells failed: {report}"
+    assert a[0].status_code == 200, f"the suspended generation did not come back: {report}"
+    assert a[0].body["timings"]["predicted_n"] == TWO_DEEP_N_PREDICT, f"the suspended generation was cut short: {a[0].body['timings']}"
+
+
 def test_pool_exhaustion_restores_the_suspended_sequence():
     """The restore side of the ladder. A was suspended for B; when B finishes,
     its finished conversation is all that stands between A's state and the
