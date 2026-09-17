@@ -737,6 +737,9 @@ struct server_prompt_cache {
     // read an entry's bulk buffers back from disk
     bool unspill(server_prompt_cache_state & state);
 
+    // [l2-copy] drop the disk-only earlier snapshots of the conversation `state` now holds on disk
+    void release_superseded(const server_prompt_cache_state & state);
+
     // delete spill files owned by processes that no longer exist
     void sweep_orphans() const;
 

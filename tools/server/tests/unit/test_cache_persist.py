@@ -144,3 +144,47 @@ def test_prompt_cache_survives_sleep_wake(tmp_path):
         server.stop()
 
     assert t_a2["cache_n"] == n_prompt_a - 1
+
+
+def test_restored_conversation_survives_a_crash(tmp_path):
+    """A conversation restored from disk lived only in its slot: the restore
+    was a move and the file was unlinked. Measured 2026-09-17 on GLM: a
+    144,700-token conversation came back from disk at 22:42, the server
+    crashed at 22:46, and its next turn found an 88k-token snapshot - the
+    60-second mirror writes cache entries, never live slots. The file stays
+    now: a restore is a copy, and the disk-only index entry that names the
+    file is released only once a longer snapshot of the conversation is on
+    disk (a later mirror, an eviction, a clean stop)."""
+    cache_dir = str(tmp_path)
+
+    server = make_server(cache_dir)
+    server.start()
+    try:
+        t_a = complete(server, PROMPT_A)
+        n_prompt_a = t_a["prompt_n"] + t_a["cache_n"]
+        complete(server, PROMPT_B)          # pushes A into the prompt cache
+    finally:
+        server.stop()                       # a clean stop spills A to disk
+    assert spill_files(cache_dir), "precondition: nothing on disk"
+
+    # A comes back from disk and keeps generating in its slot ...
+    server2 = make_server(cache_dir)
+    server2.start()
+    t_a2 = complete(server2, PROMPT_A)
+    assert t_a2["cache_n"] == n_prompt_a - 1, "precondition: A did not come back from disk"
+    # ... and the server dies with A live in the slot: no flush, no spill, no mirror
+    server2.process.kill()
+    server2.process.wait(timeout=10)
+    server2.process = None
+
+    assert spill_files(cache_dir), "the restore consumed the only copy of the conversation on disk"
+
+    server3 = make_server(cache_dir)
+    server3.start()
+    try:
+        t_a3 = complete(server3, PROMPT_A)
+    finally:
+        server3.stop()
+
+    assert t_a3["cache_n"] == n_prompt_a - 1, \
+        f"A was prefilled from scratch after the crash: prompt_n={t_a3['prompt_n']}, cache_n={t_a3['cache_n']}"

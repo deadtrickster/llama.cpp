@@ -2224,11 +2224,36 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state, bool release_
             state.prompt.n_tokens(), bytes / (1024.0 * 1024.0), t_ms,
             (bytes / 1e9) / (t_ms / 1000.0), path.c_str());
 
+    release_superseded(state);
+
     return true;
 }
 
 bool server_prompt_cache::mirror(server_prompt_cache_state & state) {
     return spill(state, /*release_ram*/ false);
+}
+
+// [l2-copy] `state` is on disk now: the disk-only index entries that are earlier snapshots of the same
+// conversation (a prefix of it, no RAM) have served their purpose and their files go. Called once a write
+// has landed, never before - between a longer snapshot's save into RAM and its mirror, the older file is
+// the only copy of the conversation a crash leaves
+void server_prompt_cache::release_superseded(const server_prompt_cache_state & state) {
+    for (auto it = states.begin(); it != states.end();) {
+        if (&*it == &state || it->resident || !it->spilled() ||
+            it->prompt.tokens.size() > state.prompt.tokens.size()) {
+            ++it;
+            continue;
+        }
+        const int len = it->prompt.tokens.get_common_prefix(state.prompt.tokens);
+        if (len != (int) it->prompt.tokens.size()) {
+            ++it;
+            continue;
+        }
+        SRV_INF(" - L2: releasing a superseded snapshot of %d tokens (%.3f MiB) under the new %d-token one\n",
+                (int) it->prompt.tokens.size(), it->spill_bytes / (1024.0 * 1024.0), (int) state.prompt.tokens.size());
+        std::remove(it->spill_path.c_str());
+        it = states.erase(it);
+    }
 }
 
 bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
@@ -2278,13 +2303,15 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
             (state.spill_bytes / 1e9) / (t_ms / 1000.0), state.spill_path.c_str());
 
     // [l2-fadvise] the restore just pulled the whole file through the page cache
-    // and nothing will read it again. The unlink below frees these pages too, so
-    // this mainly matters if the removal fails or is ever dropped.
+    // and nothing will read it again soon
     l2_drop_page_cache(state.spill_path, /*flush_first*/ false);
 
-    std::remove(state.spill_path.c_str());
-    state.spill_path.clear();
-    state.spill_bytes = 0;
+    // [l2-copy] the file stays: the entry is now mirrored (in RAM and on disk), exactly as after a mirror.
+    // Measured 2026-09-17: a 144,700-token conversation came back from disk at 22:42, the file was
+    // unlinked, the conversation lived only in its slot for four minutes, the server crashed at 22:46, and
+    // its next turn found an 88k-token snapshot on disk - the 60-second mirror writes cache entries, never
+    // live slots. Kept, the file is what a crash falls back to; the budget reaps it when it is superseded
+    // (release_superseded) or old.
 
     return true;
 }
@@ -2657,6 +2684,11 @@ size_t server_prompt_cache::n_tokens_resident() const {
 
 bool server_prompt_cache::contains(const server_prompt & prompt) const {
     for (auto it = states.begin(); it != states.end(); ++it) {
+        // [l2-copy] a disk-only index entry does not hold the state in RAM: a save is still worth it, and
+        // the snapshot it names is released once the new one is on disk
+        if (!it->resident) {
+            continue;
+        }
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
@@ -2696,10 +2728,22 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (len == (int) it->prompt.tokens.size()) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
-            // [l2-persist] this entry is gone for good, so its file is too -
-            // otherwise it would be re-indexed on the next start and eat budget
+            // [l2-copy] an entry with a file is not gone for good yet: the longer snapshot that supersedes
+            // it reaches disk at the next mirror (or an eviction), and until then this file is the only
+            // copy of the conversation a crash leaves. It stays as a disk-only index entry; spill() of the
+            // longer one releases it (release_superseded)
             if (it->spilled()) {
-                std::remove(it->spill_path.c_str());
+                it->data.main.clear(); it->data.main.shrink_to_fit();
+                it->data.drft.clear(); it->data.drft.shrink_to_fit();
+                for (auto & c : it->prompt.checkpoints) {
+                    c.data_tgt.clear();  c.data_tgt.shrink_to_fit();
+                    c.data_dft.clear();  c.data_dft.shrink_to_fit();
+                    c.data_spec.clear(); c.data_spec.shrink_to_fit();
+                }
+                it->prompt.checkpoints.clear();
+                it->resident = false;
+                ++it;
+                continue;
             }
 
             it = states.erase(it);
@@ -2930,9 +2974,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        if (it_best->spilled()) {
+            // [l2-copy] the state moved into the slot; the file keeps standing for the conversation until a
+            // longer snapshot of it is on disk. The entry stays as an index of that file: tokens for the
+            // prefix match, no RAM
+            server_prompt stub;
+            stub.tokens = it_best->prompt.tokens.clone();
 
-        states.erase(it_best);
+            prompt = std::move(it_best->prompt);
+
+            it_best->prompt   = std::move(stub);
+            it_best->resident = false;
+            it_best->t_last_used = ggml_time_us();
+        } else {
+            prompt = std::move(it_best->prompt);
+
+            states.erase(it_best);
+        }
     }
 
     return true;
