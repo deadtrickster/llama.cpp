@@ -337,7 +337,23 @@ static void soft_max_f32_cuda(const float *                                x,
 
     while (nth < ncols_x && nth < CUDA_SOFT_MAX_BLOCK_SIZE) nth *= 2;
     const dim3 block_dims(nth,     1, 1);
-    const dim3 block_nums(params.ne01, params.ne02, params.ne03);
+    dim3 block_nums(params.ne01, params.ne02, params.ne03);
+
+    // grid.y and grid.z are limited to 65535. Without a mask, sinks or ALiBi the kernel does not care which
+    // (i02, i03) a row belongs to, so the rows are laid out along grid.x instead (up to 2^31 - 1).
+    // Measured 2026-09-17: the pooled sparse-attention indexer softmaxes over pools of 4 cells, one row per
+    // (d_idx, pool), and after a packed KV move every pool is new at once - 312k cells / 4 = 78k pools on
+    // ne02, and the launch failed with "invalid argument", taking the server down.
+    soft_max_params p_flat = params;
+    if (block_nums.y > 65535 || block_nums.z > 65535) {
+        GGML_ASSERT(mask == nullptr && sinks == nullptr && params.max_bias == 0.0f &&
+                    "soft_max: more than 65535 rows on dim 2 or 3 with a mask, sinks or ALiBi");
+        block_nums  = dim3(params.nrows_x, 1, 1);
+        p_flat.ne01 = params.nrows_x;
+        p_flat.ne02 = 1;
+        p_flat.ne03 = 1;
+    }
+    const soft_max_params & params_l = p_flat;
     const size_t nbytes_shared = (GGML_PAD(ncols_x, WARP_SIZE) + WARP_SIZE)*sizeof(float);
     static_assert(CUDA_SOFT_MAX_BLOCK_SIZE == 1024, "These values need to be adjusted.");
 
@@ -347,7 +363,7 @@ static void soft_max_f32_cuda(const float *                                x,
 
 
     if (nbytes_shared <= smpbo) {
-        launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, nbytes_shared);
+        launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params_l, stream, block_dims, block_nums, nbytes_shared);
     } else {
         // Parallelize across SMs for top-p/dist-sampling
         // The heuristic for parallelizing rows across SMs vs parallelizing single row & looping over all rows was done on the basis of a B6000 GPU and
@@ -359,14 +375,14 @@ static void soft_max_f32_cuda(const float *                                x,
             ggml_cuda_pool_alloc<float> tmp_sums_alloc(ctx.pool(), ggml_cuda_info().devices[id].nsm * sizeof(float));
 
             void * kernel_args[] = { (void *) &x, (void *) &dst, (void *) &tmp_maxs_alloc.ptr,
-                                     (void *) &tmp_sums_alloc.ptr, (void *) const_cast<soft_max_params *>(&params) };
+                                     (void *) &tmp_sums_alloc.ptr, (void *) const_cast<soft_max_params *>(&params_l) };
             CUDA_CHECK(cudaLaunchCooperativeKernel((void *) soft_max_f32_parallelize_cols,
                                                    dim3(ggml_cuda_info().devices[id].nsm, 1, 1),
                                                    dim3(WARP_SIZE * 8, 1, 1), kernel_args, 0, stream));
         } else {
             const size_t nbytes_shared_low = WARP_SIZE * sizeof(float);
             soft_max_f32<false, 0, 0>
-                <<<block_nums, block_dims, nbytes_shared_low, stream>>>(x, mask, sinks, dst, params);
+                <<<block_nums, block_dims, nbytes_shared_low, stream>>>(x, mask, sinks, dst, params_l);
         }
     }
 }

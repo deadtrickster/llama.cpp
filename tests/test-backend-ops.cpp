@@ -10294,6 +10294,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+            // the pooled sparse-attention indexer's softmax: r-way over dim 0, one row per (d_idx, pool), and
+            // after a packed KV move every pool is new at once - 293k cells / r = more than 65,535 pools on
+            // dim 2, past CUDA's grid.y limit (measured 2026-09-17: "SOFT_MAX failed: invalid argument")
+            test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4, 8, 70000, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
             // inplace tests
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, mask, sinks, GGML_TYPE_F32, {1, 1}, 0.1f, 0.0f, true));
             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {16, 2, 32, 1}, mask, sinks, GGML_TYPE_F16, {1, 1}, 0.1f, 0.0f, true));
