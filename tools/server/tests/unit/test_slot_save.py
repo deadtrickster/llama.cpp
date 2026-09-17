@@ -548,3 +548,51 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+def test_slot_restore_grows_the_elastic_pool_across_restart():
+    """Production, every restart since the elastic pool: the slot file saved at
+    shutdown holds a conversation far larger than the pool's starting floor,
+    and state_read_meta finds every cell or fails - so the restore answered
+    "No available space in KV cache" and the file was thrown away. The restore
+    must make room the way a prompt-cache restore does: grow the pool for the
+    file's token count before loading it."""
+    server.n_ctx = 4096
+    server.n_slots = 1
+    server.n_batch = 256
+    server.kv_unified = True
+    server.pool_min_ctx = 512          # the floor the pool starts at; the saved state is well past it
+    server.start()
+
+    res = server.make_request("POST", "/tokenize", data={"content": "Once upon a time there lived a brave knight who "})
+    assert res.status_code == 200
+    per = len(res.body["tokens"])
+    prompt = "Once upon a time there lived a brave knight who " * (1500 // per + 1)
+
+    res = server.make_request("POST", "/completion", data={
+        "temperature": 0.0, "top_k": 1, "id_slot": 0, "cache_prompt": True,
+        "prompt": prompt, "n_predict": 4,
+    })
+    assert res.status_code == 200
+    content = res.body["content"]
+    prompt_n_full = res.body["timings"]["prompt_n"]
+    assert prompt_n_full > 1024, f"the prompt must exceed the pool floor by a margin: {prompt_n_full}"
+
+    res = server.make_request("POST", "/slots/0?action=save", data={"filename": "elastic_slot.bin"})
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+
+    server.stop()
+    server.start()
+
+    res = server.make_request("POST", "/slots/0?action=restore", data={"filename": "elastic_slot.bin"})
+    assert res.status_code == 200, f"the restore did not make room in the elastic pool: {res.body}"
+    assert res.body["n_restored"] == n_saved
+
+    res = server.make_request("POST", "/completion", data={
+        "temperature": 0.0, "top_k": 1, "id_slot": 0, "cache_prompt": True,
+        "prompt": prompt, "n_predict": 4,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["prompt_n"] <= 8, f"the restored prompt was reprocessed: {res.body['timings']}"
+    assert res.body["content"] == content

@@ -3682,6 +3682,50 @@ private:
         return false;
     }
 
+    // [pool-restore] the same ladder for a state whose size is known up front: a slot file (SLOT_RESTORE).
+    // The seat's own cells count as room, as above. false: it does not fit and the pool cannot grow.
+    bool pool_room_for_tokens(server_slot & slot, size_t n_tokens, const char * why) {
+        if (!pool_elastic()) {
+            return true;
+        }
+
+        auto need_more = [&]() -> size_t {
+            const size_t need = n_tokens + 1 + slots.size();
+            const size_t have = pool_cells_free() + (slot.bound() ? (size_t) slot.prompt.n_tokens() : 0);
+            return need > have ? need - have : 0;
+        };
+
+        size_t n_more = need_more();
+        if (n_more == 0) {
+            return true;
+        }
+
+        SRV_INF("[pool] %s: %zu tokens, %zu more cells than the pool has free\n", why, n_tokens, n_more);
+
+        for (int pass = 0; pass < 2; ++pass) {
+            for (;;) {
+                if (pool_grow(n_more, /*urgent*/ false, why)) {
+                    n_more = need_more();
+                    if (n_more == 0) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (!pool_evict_resident(/*force*/ pass == 1, why, &slot)) {
+                    break;
+                }
+                n_more = need_more();
+                if (n_more == 0) {
+                    return true;
+                }
+            }
+        }
+
+        SRV_WRN("[pool] %s: %zu tokens do not fit and the pool cannot grow (%u cells, %zu held, %zu free)\n",
+                why, n_tokens, pool_size(), pool_cells_held(), pool_cells_free());
+        return false;
+    }
+
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {
         if (cmpl_id.empty()) {
             return nullptr;
@@ -5010,6 +5054,13 @@ private:
                         llama_tokens packed;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->seq_id, nullptr, 0, &n_packed);
                         if (nread != 0) {
+                            // [pool-restore] the probe said how many tokens the file holds; the elastic pool starts at
+                            // its floor and state_read_meta finds every cell or fails, so make the room first, the
+                            // way a prompt-cache restore does. Measured 2026-09-17: every restart's slot restore
+                            // failed with "No available space in KV cache" against a 2048-cell pool.
+                            if (!pool_room_for_tokens(*slot, n_packed, "a slot file coming back")) {
+                                throw std::runtime_error("No available space in KV cache for the slot file");
+                            }
                             packed.resize(std::max<size_t>(1, n_packed));
                             nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->seq_id, packed.data(), packed.size(), &n_packed);
                         }
