@@ -506,3 +506,75 @@ def test_cached_conversation_comes_back_beside_a_running_generation():
     assert a[0].status_code == 200, f"A failed: {a[0].body}"
     assert a[0].body["timings"]["predicted_n"] == n_predict_a, f"A was cut short: {a[0].body['timings']}"
     assert "resumed at" in text, "the suspended generation never resumed"
+
+
+def test_pool_exhaustion_parks_a_prefill_when_no_generation_can_yield():
+    """Rung 2b. A generates on slot 0 (the test hook keeps rung 2 from
+    suspending it, as a prefill-shaped slot cannot be); B arrives with a
+    1500-token prompt and is still prefilling when the 2048 pool is full.
+    Nothing is finished, nothing is waiting, no generation may be suspended:
+    on the old code rung 3 answered the prefill 500 ("Context size has been
+    exceeded").
+
+    Measured 2026-09-17 on GLM: three prefills (129k, 163k, 48k tokens) on a
+    340k pool, and the 163k one - a 208k conversation 78% of the way in - got
+    the 500.
+
+    Now the prefill is parked: its prefix leaves with a copy, A goes on, and
+    B resumes through the prompt loop from where it stopped (not from zero)
+    once the pool has room. Both complete."""
+    log_path = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log_path, n_ctx=2048, n_predict=4096)
+    sp.n_gpu_layer = 0
+    sp.debug = True
+    saved = dict(os.environ)
+    os.environ["LLAMA_SERVER_POOL_NO_SUSPEND"] = "1"
+    try:
+        sp.start(timeout_seconds=120)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    try:
+        _wait_ready(sp)
+        log = LogReader(log_path)
+        log.drain()
+
+        prompt_a = "Alpha. " + _prompt_of(sp, 600)
+        prompt_b = "Bravo. " + _prompt_of(sp, 1500)
+
+        out, done = {}, {}
+        ta = threading.Thread(target=_gen_tokens, args=(sp, prompt_a, 0, 600, out.setdefault("A", []), done, "A"))
+        ta.start()
+        acc = []
+        assert _wait_log(log, r"id\s+0 \| task \d+ \| n_gen = \d+, n_remaining", 60, acc), "A never started generating"
+
+        tb = threading.Thread(target=_gen_tokens, args=(sp, prompt_b, 1, 4, out.setdefault("B", []), done, "B"))
+        tb.start()
+        for t in (ta, tb):
+            t.join(timeout=300)
+
+        assert sp.process is None or sp.process.poll() is None, "server died under pool exhaustion"
+        acc.append(log.drain())
+        text = "".join(acc)
+    finally:
+        sp.stop()
+
+    for name in "AB":
+        assert out[name], f"{name}: no response"
+        assert not isinstance(out[name][0], Exception), f"{name}: {out[name][0]!r}"
+    report = {name: out[name][0].status_code for name in "AB"}
+
+    # PRECONDITION: the pool really ran out with the prefill in it
+    assert "Context size has been exceeded" in text, f"the pool was never exhausted ({report})"
+
+    assert "__TEST_TAG_POOL_EXHAUSTED_SPILL__" not in text, f"rung 3 fired: the prefill was failed instead of parked ({report})"
+    assert "__TEST_TAG_POOL_PARK_PREFILL__" in text, f"no prefill was parked ({report})"
+    assert re.search(r"parked at \d+ of \d+ prompt tokens", text), "the parked prefill did not leave its seat"
+    m = re.search(r"resumed prefill at (\d+) of (\d+) prompt tokens", text)
+    assert m, "the parked prefill never resumed"
+    assert 0 < int(m.group(1)) < int(m.group(2)), f"the resume did not continue from the parked prefix: {m.group(0)}"
+
+    for name in "AB":
+        assert report[name] == 200, f"{name} failed: {out[name][0].body}"
+    for name, n in (("B", 4), ("A", 600)):
+        assert out[name][0].body["timings"]["predicted_n"] == n, f"{name} was cut short: {out[name][0].body['timings']}"

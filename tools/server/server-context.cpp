@@ -460,6 +460,10 @@ struct server_sequence {
     // mid-flight generation: non-null while a yielded task waits for a seat
     std::unique_ptr<const server_task> task;
 
+    // [park] the task was still prefilling when it left its seat: `prompt` is the prefix of its prompt that
+    // is in the state, and the resume goes back through the prompt loop, not the generation loop
+    bool in_prefill = false;
+
     // OFFLOADED only: the whole KV state, target and draft
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
@@ -553,6 +557,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // [park] this seat resumed a parked prefill: the prefix in `prompt` is reused whatever cache_prompt says
+    bool prefill_resumed = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -668,6 +675,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        prefill_resumed = false;
         divergence_n   = -1;
 
         last_nl_pos    = 0;
@@ -873,13 +881,22 @@ struct server_slot {
     bool seat_release() {
         GGML_ASSERT(seq && seq->slot == this);
 
-        if (is_processing() && (state != SLOT_STATE_GENERATING || !task)) {
+        // [park] a prefill can leave too: what is in the KV is the prompt's first prompt.n_tokens() tokens
+        // (the batch's pending ones were cut off by slot_drop_pending), a state the prompt loop resumes from
+        // exactly as it continues a cached prefix
+        // (SLOT_STATE_DONE_PROMPT is a prefill whose last chunk is in the batch: once that is cut off it is
+        // a prefill again)
+        const bool in_prefill = state == SLOT_STATE_PROCESSING_PROMPT || state == SLOT_STATE_DONE_PROMPT;
+
+        if (is_processing() && ((state != SLOT_STATE_GENERATING && !in_prefill) || !task)) {
             return false;
         }
 
         server_sequence & s = *seq;
 
         const bool mid_flight = is_processing();
+
+        s.in_prefill = mid_flight && in_prefill;
 
         // the backend sampler binding belongs to the id; seat_acquire() or the next launch on this id re-binds it
         llama_set_sampler(ctx_tgt, seq_id, nullptr);
@@ -928,8 +945,13 @@ struct server_slot {
         seq_id = -1;
 
         if (mid_flight) {
-            SLT_INF(*this, "suspended after %d generated tokens (sequence %d stays resident, zero copy)\n",
-                    s.n_decoded_at_suspend, s.seq_id);
+            if (s.in_prefill) {
+                SLT_INF(*this, "parked at %d of %d prompt tokens (sequence %d stays resident, zero copy)\n",
+                        s.prompt.n_tokens(), s.task->n_tokens(), s.seq_id);
+            } else {
+                SLT_INF(*this, "suspended after %d generated tokens (sequence %d stays resident, zero copy)\n",
+                        s.n_decoded_at_suspend, s.seq_id);
+            }
 
             // hand the seat back WITHOUT release(): task has already moved out, and callback_on_reset() must
             // NOT run - it publishes a FINISHED generation's stats. seat_acquire() restores `stats`; the final
@@ -995,8 +1017,21 @@ struct server_slot {
         sampler_bind(*task);
 
         has_next_token = true;
-        state          = SLOT_STATE_GENERATING;
         t_seated_us    = ggml_time_us();
+
+        if (s.in_prefill) {
+            // [park] back to the prompt loop: it finds `prompt` as a prefix of the task's tokens and continues
+            // from there, the way it continues any cached prefix
+            state = SLOT_STATE_STARTED;
+            s.in_prefill = false;
+            prefill_resumed = true;
+
+            SLT_INF(*this, "resumed prefill at %d of %d prompt tokens after %" PRId64 " ms parked (sequence %d)\n",
+                    prompt.n_tokens(), task->n_tokens(), ggml_time_ms() - s.t_suspended_ms, seq_id);
+            return;
+        }
+
+        state = SLOT_STATE_GENERATING;
 
         SLT_INF(*this, "resumed at %d generated tokens after %" PRId64 " ms suspended (sequence %d)\n",
                 s.n_decoded_at_suspend, ggml_time_ms() - s.t_suspended_ms, seq_id);
@@ -3545,7 +3580,7 @@ private:
         // test. With two or more live sequences every exhaustion otherwise has a rung 0-2 move.
         static const bool disabled = std::getenv("LLAMA_SERVER_POOL_NO_SUSPEND") != nullptr;
 
-        if (disabled || !params_base.kv_unified) {
+        if (!params_base.kv_unified) {
             return false;
         }
 
@@ -3576,6 +3611,9 @@ private:
         int32_t       n_pending = 0;
 
         for (auto & slot : slots) {
+            if (disabled) {
+                break; // the test hook: no generation is suspended; a prefill may still be parked
+            }
             if (!slot.is_processing() || slot.state != SLOT_STATE_GENERATING || !slot.task) {
                 continue;
             }
@@ -3594,6 +3632,36 @@ private:
             }
         }
 
+        // rung 2b: no generation to suspend - every sequence in the pool is a prefill. Park the largest one:
+        // its prefix stays a valid state, the copy goes out, and it comes back through the prompt loop when
+        // the pool has room (measured 2026-09-17: three prefills of 129k, 163k and 48k tokens on a 340k pool,
+        // and the 163k one - a 208k-token conversation 78% of the way in - was answered 500 by rung 3)
+        static const bool no_park = std::getenv("LLAMA_SERVER_POOL_NO_PARK") != nullptr;
+
+        bool parking = false;
+        if (!victim && !no_park) {
+            for (auto & slot : slots) {
+                if (!slot.is_processing() || !slot.task ||
+                    (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT)) {
+                    continue;
+                }
+                if (slot.task->is_parent() || slot.task->is_child()) {
+                    continue;
+                }
+                int32_t n = 0;
+                for (const auto & [ps, pn] : pending) {
+                    if (ps == &slot) {
+                        n = pn;
+                    }
+                }
+                if (!victim || slot.prompt.n_tokens() - n > victim->prompt.n_tokens() - n_pending) {
+                    victim    = &slot;
+                    n_pending = n;
+                }
+            }
+            parking = victim != nullptr;
+        }
+
         if (!victim) {
             return false;
         }
@@ -3609,8 +3677,13 @@ private:
 
         batch_drop_pending(slot, off);
 
-        SLT_WRN(slot, "KV pool full: suspending the largest running generation with a copy (%d tokens in the KV, %d pending, %zu sequences in the batch)\n",
-                slot.prompt.n_tokens(), n_pending, pending.size());
+        if (parking) {
+            SLT_WRN(slot, "KV pool full: parking the largest prefill with a copy (%d of %d prompt tokens in the KV, %d pending, %zu sequences in the batch)\n",
+                    slot.prompt.n_tokens(), slot.task->n_tokens(), n_pending, pending.size());
+        } else {
+            SLT_WRN(slot, "KV pool full: suspending the largest running generation with a copy (%d tokens in the KV, %d pending, %zu sequences in the batch)\n",
+                    slot.prompt.n_tokens(), n_pending, pending.size());
+        }
 
         server_sequence * s = slot.seq;
 
@@ -3619,7 +3692,7 @@ private:
 
         seq_offload(*s);
 
-        SRV_DBG("%s", "__TEST_TAG_POOL_SUSPEND__\n");
+        SRV_DBG("%s", parking ? "__TEST_TAG_POOL_PARK_PREFILL__\n" : "__TEST_TAG_POOL_SUSPEND__\n");
 
         return true;
     }
@@ -5948,7 +6021,10 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
-                        slot.stats.update_prompt_start();
+                        // [park] a resumed prefill's clock started before it was parked
+                        if (!slot.prefill_resumed) {
+                            slot.stats.update_prompt_start();
+                        }
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -6022,7 +6098,7 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt || slot.prefill_resumed) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
