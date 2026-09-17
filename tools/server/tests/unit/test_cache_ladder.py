@@ -44,6 +44,13 @@ SPILLED = re.compile(r"L2: spilled\s+(\d+) tokens")
 MIN_STEP = 64
 N_BATCH = 32
 
+# what one entry weighs on mamba-130m: a 2.67 MiB recurrent state plus one checkpoint of the same size
+# every MIN_STEP tokens of a ~1600-token conversation, 72 MiB at level 0, ~37 MiB thinned (level 1),
+# 2.67 MiB skeletal (level 2). The tier has to hold a full entry or two and not six: an entry over the
+# limit on its own is refused outright, before the ladder, and nothing degrades (the file was written
+# against 8 MiB and never run; that was what it measured)
+RAM_MIB = 200
+
 
 def _mk(log, cache_ram_mib, disk=None):
     sp = ServerProcess()
@@ -92,7 +99,7 @@ def test_degrades_before_it_spills():
     ladder was skipped and eviction is still a cliff."""
     global server
     log = os.path.join(tempfile.mkdtemp(), "srv.log")
-    server = _mk(log, cache_ram_mib=8)
+    server = _mk(log, cache_ram_mib=RAM_MIB)
     server.start(timeout_seconds=120)
     reader = LogReader(log)
 
@@ -118,7 +125,7 @@ def test_degradation_is_spread_not_concentrated():
     conversation is stripped bare while its neighbour keeps everything."""
     global server
     log = os.path.join(tempfile.mkdtemp(), "srv.log")
-    server = _mk(log, cache_ram_mib=8)
+    server = _mk(log, cache_ram_mib=RAM_MIB)
     server.start(timeout_seconds=120)
     reader = LogReader(log)
 
@@ -146,7 +153,7 @@ def test_lru_order_within_a_rung():
     touched most recently must not be the first to lose fidelity."""
     global server
     log = os.path.join(tempfile.mkdtemp(), "srv.log")
-    server = _mk(log, cache_ram_mib=8)
+    server = _mk(log, cache_ram_mib=RAM_MIB)
     server.start(timeout_seconds=120)
 
     for i in range(5):
@@ -171,7 +178,7 @@ def test_a_degraded_entry_still_restores():
     degraded must still come back from cache rather than reprocessing whole."""
     global server
     log = os.path.join(tempfile.mkdtemp(), "srv.log")
-    server = _mk(log, cache_ram_mib=8)
+    server = _mk(log, cache_ram_mib=RAM_MIB)
     server.start(timeout_seconds=120)
 
     first = _distinct(0)
@@ -193,11 +200,12 @@ def test_spill_only_after_the_ladder_is_exhausted():
     global server
     disk = tempfile.mkdtemp()
     log = os.path.join(tempfile.mkdtemp(), "srv.log")
-    server = _mk(log, cache_ram_mib=8, disk=disk)
+    server = _mk(log, cache_ram_mib=RAM_MIB, disk=disk)
     server.start(timeout_seconds=120)
     reader = LogReader(log)
 
-    for i in range(10):
+    # skeletal entries are 5.3 MiB: RAM_MIB holds ~37 of them, the 38th spills one
+    for i in range(42):
         _turn(server, _distinct(i))
 
     text = reader.drain()

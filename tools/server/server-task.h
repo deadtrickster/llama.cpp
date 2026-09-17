@@ -642,11 +642,13 @@ struct server_prompt_cache_state {
     //   0  full            checkpoints as placed
     //   1  middle dropped  newest + oldest kept
     //   2  tip only        only the newest checkpoint kept
-    //   3  no draft        MTP draft state dropped; restore loses acceptance
-    //   4  exhausted       nothing left to shed - the caller spills
+    //   3  no draft        MTP draft state dropped; restore loses acceptance. Nothing left to shed -
+    //                      the caller spills. (Was 4 with no rung to it: an entry parked at 3 answered
+    //                      can_degrade() and degrade() refused, and the ladder removed a whole entry while
+    //                      its neighbours were still at 0.)
     int degrade_level = 0;
 
-    static constexpr int DEGRADE_MAX = 4;
+    static constexpr int DEGRADE_MAX = 3;
 
     bool can_degrade() const { return resident && degrade_level < DEGRADE_MAX; }
 

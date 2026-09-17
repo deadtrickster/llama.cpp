@@ -2735,8 +2735,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
                         best = it;
                     }
                 }
-                if (best != states.end() && degrade(*best)) {
-                    continue;
+                // a rung that frees nothing still charges the level, so the next pass picks the next entry;
+                // falling through here removed a full entry while its neighbours had every rung left
+                if (best != states.end()) {
+                    const int level = best->degrade_level;
+                    if (degrade(*best) || best->degrade_level != level) {
+                        continue;
+                    }
                 }
             }
 
