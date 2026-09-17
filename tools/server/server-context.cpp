@@ -3461,17 +3461,26 @@ private:
             return n;
         }
         for (const auto & slot : slots) {
-            if (slot.spec_i_batch.empty() || slot.i_batch < 0) {
+            // a speculative group is described by spec_i_batch alone: i_batch stays -1 for it (measured
+            // 2026-09-17 23:3x on GLM with draft-mtp - this skipped every group, the cut never moved, and the
+            // 500 came back as "speculative batch index 2 is not inside the current sub-batch [0, 2)")
+            if (slot.spec_i_batch.empty()) {
                 continue;
             }
-            int32_t lo = slot.i_batch;
-            int32_t hi = slot.i_batch;
+            int32_t lo = slot.spec_i_batch.front();
+            int32_t hi = slot.spec_i_batch.front();
             for (const auto i : slot.spec_i_batch) {
                 lo = std::min(lo, i);
                 hi = std::max(hi, i);
             }
+            if (slot.i_batch >= 0) {
+                lo = std::min(lo, slot.i_batch);
+                hi = std::max(hi, slot.i_batch);
+            }
             if (lo < cut && cut <= hi) {
-                cut = lo > off ? lo : hi + 1;
+                const int32_t moved = lo > off ? lo : hi + 1;
+                SRV_DBG("[spec] sub-batch cut moved from %d to %d: slot %d's group is [%d, %d]\n", cut, moved, slot.id, lo, hi);
+                cut = moved;
                 break;
             }
         }
