@@ -3660,70 +3660,95 @@ private:
     // restore replaces them (state_read_meta seq_rm's the destination first). The entry is looked up again
     // after every step - an eviction's save can reshape the cache. false: the conversation will be prefilled,
     // and the log says why.
-    bool pool_room_for_restore(server_slot & slot, const server_tokens & tokens_new) {
-        if (!pool_elastic() || !prompt_cache) {
-            return true; // static pool: the restore is attempted as before
-        }
-
-        const char * why = "a cached conversation coming back";
-
-        auto need_more = [&](size_t & n_tokens) -> size_t {
-            const server_prompt_cache_state * cand = prompt_cache->find(slot.prompt, tokens_new);
-            if (cand == nullptr) {
-                n_tokens = 0;
-                return 0;
+    // [pool-restore] the cells a state coming back can have, beyond the free ones: the seat's own, every finished
+    // resident's (evictable, rung 1) and every running generation's (suspendable with a copy, rung 3). What is
+    // held by a parent/child task or by a prefill in progress stays. This is the ceiling the ladder can reach:
+    // asking for more than this evicts and copies for a restore that then fails anyway (measured 2026-09-17: a
+    // 33k-token resident was purged for a 115k restore that could not fit, and rebuilt later at 136 s)
+    size_t pool_cells_reclaimable(const server_slot & keep) const {
+        size_t n = pool_cells_free() + (keep.bound() ? (size_t) keep.prompt.n_tokens() : 0);
+        for (const auto & s : seqs) {
+            if (s.seq_id < 0 || s.offloaded() || s.mid_flight() || s.slot == &keep) {
+                continue;
             }
-            n_tokens = cand->prompt.tokens.size();
-            const size_t need = n_tokens + 1 + slots.size();
-            const size_t have = pool_cells_free() + (slot.bound() ? (size_t) slot.prompt.n_tokens() : 0);
-            return need > have ? need - have : 0;
-        };
-
-        size_t n_tokens = 0;
-        size_t n_more   = need_more(n_tokens);
-        if (n_more == 0) {
-            return true;
-        }
-
-        SRV_INF("[pool] %s: %zu tokens, %zu more cells than the pool has free\n", why, n_tokens, n_more);
-
-        for (int pass = 0; pass < 2; ++pass) {
-            for (;;) {
-                if (pool_grow(n_more, /*urgent*/ false, why)) {
-                    n_more = need_more(n_tokens);
-                    if (n_more == 0) {
-                        return true;
-                    }
+            if (seq_running(s)) {
+                const server_slot * slot = s.slot;
+                if (slot == nullptr || slot->state != SLOT_STATE_GENERATING || !slot->task ||
+                    slot->task->is_parent() || slot->task->is_child()) {
                     continue;
                 }
-                if (!pool_evict_resident(/*force*/ pass == 1, why, &slot)) {
-                    break;
-                }
-                n_more = need_more(n_tokens);
-                if (n_more == 0) {
-                    return true;
-                }
             }
+            n += seq_prompt(s).tokens.size();
         }
-
-        SRV_WRN("[pool] %s: %zu tokens do not fit and the pool cannot grow (%u cells, %zu held, %zu free); it will be prefilled\n",
-                why, n_tokens, pool_size(), pool_cells_held(), pool_cells_free());
-        return false;
+        return n;
     }
 
-    // [pool-restore] the same ladder for a state whose size is known up front: a slot file (SLOT_RESTORE).
-    // The seat's own cells count as room, as above. false: it does not fit and the pool cannot grow.
-    bool pool_room_for_tokens(server_slot & slot, size_t n_tokens, const char * why) {
-        if (!pool_elastic()) {
-            return true;
+    // [pool-restore] rung 3 of the restore ladder: the pool cannot grow and no finished resident is left, yet
+    // the state coming back does not fit beside the running generations. Prefilling it instead does not fit
+    // either - the prefill fills the pool and the batch ladder suspends a running generation THEN, minutes in
+    // (measured 2026-09-17: a 115k-token conversation with a perfect cache hit was refused here and prefilled;
+    // 61k tokens and 5 minutes later pool_suspend_running took the 200k generation whose cells the restore
+    // needed). So the suspension the batch ladder would take later is taken now, and the restore lands.
+    // The victim: the smallest running generation that alone makes the room; else the largest, and again.
+    // false: nothing suspended - no running generation can be, or the caller keeps the only one
+    bool pool_suspend_for_room(size_t n_more, const server_slot & keep, const char * why) {
+        if (!params_base.kv_unified) {
+            return false;
         }
 
-        auto need_more = [&]() -> size_t {
-            const size_t need = n_tokens + 1 + slots.size();
-            const size_t have = pool_cells_free() + (slot.bound() ? (size_t) slot.prompt.n_tokens() : 0);
-            return need > have ? need - have : 0;
-        };
+        std::vector<server_slot *> cands;
+        for (auto & slot : slots) {
+            if (&slot == &keep || slot.state != SLOT_STATE_GENERATING || !slot.task || !slot.bound()) {
+                continue;
+            }
+            if (slot.task->is_parent() || slot.task->is_child()) {
+                continue;
+            }
+            cands.push_back(&slot);
+        }
+        if (cands.empty()) {
+            return false;
+        }
 
+        std::sort(cands.begin(), cands.end(), [](const server_slot * a, const server_slot * b) {
+            return a->prompt.n_tokens() < b->prompt.n_tokens();
+        });
+
+        server_slot * victim = nullptr;
+        for (auto * slot : cands) {
+            if ((size_t) slot->prompt.n_tokens() >= n_more) {
+                victim = slot;
+                break;
+            }
+        }
+        if (victim == nullptr) {
+            victim = cands.back();
+        }
+
+        server_slot &     slot = *victim;
+        server_sequence * s    = slot.seq;
+
+        SLT_WRN(slot, "KV pool full: suspending this running generation with a copy (%d tokens in the KV, %zu more cells needed) - %s\n",
+                slot.prompt.n_tokens(), n_more, why);
+
+        if (!slot.seat_release()) {
+            // a generating seat with a task always releases; if it ever does not, nothing was touched
+            return false;
+        }
+
+        seq_offload(*s);
+
+        SRV_DBG("%s", "__TEST_TAG_POOL_SUSPEND_FOR_ROOM__\n");
+
+        return true;
+    }
+
+    // [pool-restore] the ladder for a state coming back into `slot`: the pool grows for it (rung 0), finished
+    // residents are evicted (rung 1, a refused save forced on the second pass), running generations are
+    // suspended with a copy (rung 3). The seat's own cells count as room: a re-seated conversation's state
+    // replaces what the slot holds. `need_more` says how many cells are still missing, 0 when it fits.
+    // false: it does not fit and the ladder cannot make it fit; nothing was evicted or copied for it then
+    bool pool_room_for(server_slot & slot, const std::function<size_t()> & need_more, size_t n_tokens, const char * why) {
         size_t n_more = need_more();
         if (n_more == 0) {
             return true;
@@ -3733,12 +3758,26 @@ private:
 
         for (int pass = 0; pass < 2; ++pass) {
             for (;;) {
-                if (pool_grow(n_more, /*urgent*/ false, why)) {
+                // urgent: the reserve (an id and --pool-min-ctx cells for a newcomer) is not held back from a
+                // restore, because a restore refused for it is prefilled into the same cells a moment later,
+                // by a batch that grows the pool urgently anyway (measured 2026-09-17: a 1943-token restore was
+                // refused by 0.4 MiB of reserve and the prefill that replaced it grew the pool past it)
+                if (pool_grow(n_more, /*urgent*/ true, why)) {
                     n_more = need_more();
                     if (n_more == 0) {
                         return true;
                     }
                     continue;
+                }
+                if (pass == 0) {
+                    // nothing is given up for a restore that cannot fit even after everything is given up
+                    const size_t reach = pool_cells_reclaimable(slot);
+                    const size_t need  = n_tokens + 1 + slots.size();
+                    if (need > reach) {
+                        SRV_WRN("[pool] %s: %zu tokens do not fit and the pool cannot grow (%u cells, %zu held, %zu free, %zu reachable); it will be prefilled\n",
+                                why, n_tokens, pool_size(), pool_cells_held(), pool_cells_free(), reach);
+                        return false;
+                    }
                 }
                 if (!pool_evict_resident(/*force*/ pass == 1, why, &slot)) {
                     break;
@@ -3750,9 +3789,61 @@ private:
             }
         }
 
-        SRV_WRN("[pool] %s: %zu tokens do not fit and the pool cannot grow (%u cells, %zu held, %zu free)\n",
+        while (pool_suspend_for_room(n_more, slot, why)) {
+            n_more = need_more();
+            if (n_more == 0) {
+                return true;
+            }
+        }
+
+        SRV_WRN("[pool] %s: %zu tokens do not fit and the pool cannot grow (%u cells, %zu held, %zu free); it will be prefilled\n",
                 why, n_tokens, pool_size(), pool_cells_held(), pool_cells_free());
         return false;
+    }
+
+    // [pool-restore] a cached conversation coming back into `slot` for a prompt `tokens_new`: room for the entry
+    // find() would pick. A static pool (--pool-static) skips the grow rung on its own and still evicts and
+    // suspends for it; without --kv-unified the server does not know who holds what, and the restore is
+    // attempted as before
+    bool pool_room_for_restore(server_slot & slot, const server_tokens & tokens_new) {
+        if (!params_base.kv_unified || !prompt_cache) {
+            return true;
+        }
+
+        const server_prompt_cache_state * cand = prompt_cache->find(slot.prompt, tokens_new);
+        if (cand == nullptr) {
+            return true;
+        }
+
+        const size_t n_tokens = cand->prompt.tokens.size();
+
+        // found again on every step: an eviction on the way saves a state into the cache and can change the pick
+        auto need_more = [&]() -> size_t {
+            const server_prompt_cache_state * cur = prompt_cache->find(slot.prompt, tokens_new);
+            if (cur == nullptr) {
+                return 0;
+            }
+            const size_t need = cur->prompt.tokens.size() + 1 + slots.size();
+            const size_t have = pool_cells_free() + (slot.bound() ? (size_t) slot.prompt.n_tokens() : 0);
+            return need > have ? need - have : 0;
+        };
+
+        return pool_room_for(slot, need_more, n_tokens, "a cached conversation coming back");
+    }
+
+    // [pool-restore] the same ladder for a state whose size is known up front: a slot file (SLOT_RESTORE)
+    bool pool_room_for_tokens(server_slot & slot, size_t n_tokens, const char * why) {
+        if (!params_base.kv_unified) {
+            return true;
+        }
+
+        auto need_more = [&]() -> size_t {
+            const size_t need = n_tokens + 1 + slots.size();
+            const size_t have = pool_cells_free() + (slot.bound() ? (size_t) slot.prompt.n_tokens() : 0);
+            return need > have ? need - have : 0;
+        };
+
+        return pool_room_for(slot, need_more, n_tokens, why);
     }
 
     server_slot * get_slot_by_cmpl_id(const std::string & cmpl_id) {

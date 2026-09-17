@@ -421,3 +421,88 @@ def test_pool_exhaustion_restores_the_suspended_sequence():
         assert r.body["timings"]["predicted_n"] == TWO_DEEP_N_PREDICT, (
             f"{name} was cut short: {r.body['timings']}")
     assert b_first, "A came back before B was done with the pool"
+
+
+def _wait_log(log: "LogReader", pattern: str, timeout_s: float, acc: list) -> bool:
+    """Drains the log into acc until pattern appears in what was read."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        acc.append(log.drain())
+        if re.search(pattern, "".join(acc)):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_cached_conversation_comes_back_beside_a_running_generation():
+    """The restore side of the ladder, rung 3. C is a finished conversation in
+    the prompt cache; A is generating a long reply and holds most of the pool
+    with it. C's next turn arrives. Its cached state does not fit in what is
+    free, nothing idle is left to evict, and the pool cannot grow. Prefilling
+    C instead does not fit either: the prefill fills the pool and the batch
+    ladder suspends A THEN, after most of C has been prefilled for nothing.
+
+    Measured 2026-09-17 on GLM: a 115k-token conversation with a perfect cache
+    hit was refused room, prefilled at 210 t/s, and 61k tokens and 5 minutes in
+    the batch ladder suspended the 200k-token generation whose cells the
+    restore had needed all along.
+
+    So the restore ladder must take that suspension itself: A is suspended
+    with a copy, C's state comes back (prompt_n is the new turn, not the whole
+    conversation), and A resumes and completes in full once C is done."""
+    log_path = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log_path, n_ctx=2048, n_predict=4096)
+    sp.debug = True
+    sp.n_gpu_layer = 0        # A has to still be generating when C's turn arrives: on a GPU it is done in 100 ms
+    sp.start(timeout_seconds=120)
+    try:
+        _wait_ready(sp)
+        log = LogReader(log_path)
+
+        # three conversations that share no prefix: the cache must not match across them
+        prompt_c = "Charlie. " + _prompt_of(sp, 900)
+        prompt_d = "Delta. " + _prompt_of(sp, 60)
+        prompt_a = "Alpha. " + _prompt_of(sp, 1200)
+
+        n_c = len(_tokens(sp, prompt_c))
+
+        # C: a finished conversation on slot 1 ...
+        t_c1 = _complete(sp, prompt_c, id_slot=1)
+        assert t_c1["prompt_n"] >= 900
+
+        # ... pushed out of its sequence into the prompt cache by a newcomer on the same seat
+        _complete(sp, prompt_d, id_slot=1)
+
+        log.drain()
+        acc = []
+
+        # A: a long generation on slot 0, holding 1200+ cells while it runs
+        n_predict_a = 300
+        a, done = [], {}
+        ta = threading.Thread(target=_gen_tokens, args=(sp, prompt_a, 0, n_predict_a, a, done, "A"))
+        ta.start()
+        assert _wait_log(log, r"id\s+0 \| task \d+ \| n_gen = \d+, n_remaining", 60, acc), "A never started generating"
+
+        # C's next turn: 900 cached tokens that do not fit beside A and D
+        t_c2 = _complete(sp, prompt_c + " And then the knight", id_slot=1)
+        ta.join(timeout=300)
+        acc.append(log.drain())
+        text = "".join(acc)
+    finally:
+        sp.stop()
+
+    assert a and not isinstance(a[0], Exception), f"A: {a!r}"
+
+    # PRECONDITION: C's cached state was found and did not fit the free cells (else nothing below is exercised)
+    assert "found better prompt" in text, "precondition: C's cached state was not found"
+    assert re.search(r"failed to find \d+ available cells|more cells than the pool has free", text), (
+        "precondition: the cached state fit without the ladder")
+
+    assert t_c2["cache_n"] >= n_c - 1, (
+        f"C was prefilled from scratch instead of restored: prompt_n={t_c2['prompt_n']}, cache_n={t_c2['cache_n']}")
+    assert "__TEST_TAG_POOL_SUSPEND_FOR_ROOM__" in text, (
+        "the restore was refused instead of suspending the running generation for it")
+
+    assert a[0].status_code == 200, f"A failed: {a[0].body}"
+    assert a[0].body["timings"]["predicted_n"] == n_predict_a, f"A was cut short: {a[0].body['timings']}"
+    assert "resumed at" in text, "the suspended generation never resumed"
