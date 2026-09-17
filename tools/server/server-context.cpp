@@ -6814,7 +6814,23 @@ private:
 
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
+        //
+        // [spec] a group entirely outside this view is a LATER sub-batch's: the halving retry under pool
+        // pressure cuts between groups (batch_cut_off_spec_groups), decodes [0, 9) and leaves slot 1's
+        // [9, 18) for the next round, and this check answered that slot 500 (measured 2026-09-17 on GLM:
+        // "speculative batch index 4 is not inside the current sub-batch [0, 4)"). Only a group that is
+        // partly inside the view is the error the TODO is about
         iterate(slots, [&](server_slot & slot) {
+            if (slot.spec_i_batch.empty()) {
+                return;
+            }
+            bool any_in = is_inside_view(slot.i_batch);
+            for (auto & i : slot.spec_i_batch) {
+                any_in |= is_inside_view(i);
+            }
+            if (!any_in) {
+                return;
+            }
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));

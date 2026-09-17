@@ -1,3 +1,4 @@
+import threading
 import pytest
 from utils import *
 
@@ -203,3 +204,49 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+def test_sub_batch_cut_keeps_a_later_draft_group_whole():
+    """Two slots each verifying a draft group (1 sampled token + n_max drafts) on a
+    pool that runs out: llama_decode refuses the 18-token batch, the retry halves
+    n_batch, and the cut lands between the two groups - [0, 9) is decoded, slot
+    1's group [9, 18) waits for the next sub-batch. post_decode used to refuse
+    that ("speculative batch index 9 is not inside the current sub-batch
+    [0, 9)"), a 500 for the slot whose group was simply LATER, not split.
+    Measured 2026-09-17 on GLM: a 9-token batch, n_batch halved to 4, slot 1
+    answered 500 mid-turn. A group entirely outside the view is somebody else's
+    sub-batch; only a split group is an error."""
+    global server
+    create_server()
+    server.n_slots = 2
+    server.n_ctx = 256              # stories15M trains at 256: the pool is 256 cells, two seats of up to 256
+    server.kv_unified = True
+    server.kv_unified_per_slot = 256
+    server.pool_static = True
+    server.n_predict = 4096
+    server.spec_synth_rates = [1.0] * server.spec_draft_n_max   # every draft accepted: full groups every step
+    server.start()
+
+    # ~19 tokens each plus 140 generated: 318 cells on a 256-cell pool
+    prompt_a = "Alpha. " + " ".join(f"a{i}" for i in range(8))
+    prompt_b = "Bravo. " + " ".join(f"b{i}" for i in range(8))
+    out = {}
+
+    def go(k, prompt, id_slot):
+        try:
+            out[k] = server.make_request("POST", "/completion", data={
+                "prompt": prompt, "id_slot": id_slot, "n_predict": 140, "ignore_eos": True,
+                "temperature": 0.0, "cache_prompt": True}, timeout=300)
+        except Exception as e:
+            out[k] = e
+
+    ta = threading.Thread(target=go, args=("A", prompt_a, 0))
+    tb = threading.Thread(target=go, args=("B", prompt_b, 1))
+    ta.start(); tb.start()
+    ta.join(timeout=300); tb.join(timeout=300)
+
+    for k in "AB":
+        assert k in out and not isinstance(out[k], Exception), f"{k}: {out.get(k)!r}"
+        assert out[k].status_code == 200, f"{k}: {out[k].body}"
+        assert "speculative batch index" not in str(out[k].body)
+        assert out[k].body["timings"]["predicted_n"] == 140, f"{k} was cut short: {out[k].body['timings']}"
