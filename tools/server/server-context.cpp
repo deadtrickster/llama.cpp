@@ -3401,6 +3401,35 @@ private:
     }
 
     // the processing slots with tokens pending in the batch from `off` on, with how many each
+    // [spec] a sub-batch must not end inside a slot's speculative group (its sampled token plus the drafts it
+    // verifies): post_decode samples and accepts the group as one, and refuses a split one. The halving
+    // retry under pool pressure cut exactly there - measured 2026-09-17 on the production server: two slots
+    // with three tokens each, a 6-token batch with no room, n_batch halved to 4, HTTP 500 "speculative
+    // batch index 4 is not inside the current sub-batch [0, 4)". Move the cut back to the group's start,
+    // or, when the group opens the sub-batch, past its end: a group is decoded whole or not at all.
+    int32_t batch_cut_off_spec_groups(int32_t off, int32_t n) const {
+        int32_t cut = off + n;
+        if (cut >= batch.size()) {
+            return n;
+        }
+        for (const auto & slot : slots) {
+            if (slot.spec_i_batch.empty() || slot.i_batch < 0) {
+                continue;
+            }
+            int32_t lo = slot.i_batch;
+            int32_t hi = slot.i_batch;
+            for (const auto i : slot.spec_i_batch) {
+                lo = std::min(lo, i);
+                hi = std::max(hi, i);
+            }
+            if (lo < cut && cut <= hi) {
+                cut = lo > off ? lo : hi + 1;
+                break;
+            }
+        }
+        return cut - off;
+    }
+
     std::vector<std::pair<server_slot *, int32_t>> batch_pending_slots(int32_t off) {
         std::vector<std::pair<server_slot *, int32_t>> res;
         for (auto & slot : slots) {
@@ -4698,7 +4727,7 @@ private:
                 // wider than max_gap, so the gap actually left never exceeds it
                 const bool gap_floor = max_gap > 0 && keep_dist > 0 && (dist - keep_dist) + step > max_gap;
 
-                if (it->id_task == id_task || it->pinned || keep_dist == 0 || dist >= std::max(step, keep_dist*CHECKPOINT_EXP_FACTOR) || gap_floor) {
+                if (it->id_task == id_task || it->pinned || it->turn_start || keep_dist == 0 || dist >= std::max(step, keep_dist*CHECKPOINT_EXP_FACTOR) || gap_floor) {
                     if (it->id_task != id_task) {
                         keep_dist = dist;
                     }
@@ -5491,7 +5520,7 @@ private:
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            const int32_t n_tokens = batch_cut_off_spec_groups(off, std::min(n_batch, batch.size() - off));
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -6380,6 +6409,29 @@ private:
                             auto & cur = slot.prompt.checkpoints.back();
                             cur.pinned = true;
                             SLT_INF(slot, "pinned a context checkpoint at the divergence point (n_tokens = %" PRId64 ")\n", cur.n_tokens);
+                        }
+
+                        // [turn-start] the checkpoint at the start of the last user message is where a retry,
+                        // an edit or a regeneration of that turn lands. It belongs to this task, which protects
+                        // it for the reply; the next task's thinning pass used to be free to drop it. Measured
+                        // 2026-09-17: a client that got a 500 recorded nothing and re-sent the conversation
+                        // without its previous reply, so its prompt diverged one exchange back, at 103,866; the
+                        // nearest checkpoint left was 101,544 and 12.3k tokens were re-prefilled. The last two
+                        // turn starts are kept: the current turn's for a retry of it, the previous one's for a
+                        // retry that drops the last exchange.
+                        if (is_last_user_message && !slot.prompt.checkpoints.empty()) {
+                            slot.prompt.checkpoints.back().turn_start = true;
+                            int n_keep = 2;
+                            for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
+                                if (!it->turn_start) {
+                                    continue;
+                                }
+                                if (n_keep > 0) {
+                                    n_keep--;
+                                } else {
+                                    it->turn_start = false;
+                                }
+                            }
                         }
                     }
 

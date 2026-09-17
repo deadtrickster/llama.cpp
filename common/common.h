@@ -1242,6 +1242,10 @@ struct common_prompt_checkpoint {
     // no checkpoint at or below the divergence, so the next prompt sharing that prefix lands on it
     bool pinned = false;
 
+    // the start of a user message: where a retry, an edit or a regeneration of that turn lands.
+    // survives thinning; the server keeps it on the last two turn boundaries
+    bool turn_start = false;
+
     llama_pos pos_min;
     llama_pos pos_max;
 

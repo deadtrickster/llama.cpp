@@ -2068,19 +2068,29 @@ bool server_prompt_cache::degrade(server_prompt_cache_state & state) {
                 // [deep-reuse] thin: drop the middle checkpoints, keep the newest
                 // (a near-tip rollback lands there) and the oldest (a deep anchor
                 // still lets a rollback reach far back without reprocessing from 0).
+                // The pinned ones stay too: a divergence point and the last turn
+                // starts are where the next prompt of this conversation lands.
+                // Measured 2026-09-17: a pinned checkpoint at 103,866 was dropped
+                // here, and the retry that diverged exactly there re-prefilled
+                // 12.3k tokens from 101,544.
                 auto & ckpts = state.prompt.checkpoints;
                 if (ckpts.size() > 2) {
-                    ckpts.erase(std::next(ckpts.begin()), std::prev(ckpts.end()));
+                    for (auto it = std::next(ckpts.begin()); it != std::prev(ckpts.end()); ) {
+                        it = (it->pinned || it->turn_start) ? std::next(it) : ckpts.erase(it);
+                    }
                 }
             } break;
         case 1:
             {
-                // drop the oldest anchor too, keeping only the newest checkpoint:
-                // the conversation is still restorable near the tip, and anything
-                // older reprocesses from the start.
+                // drop the oldest anchor too, keeping only the newest checkpoint and
+                // the pinned ones: the conversation is still restorable near the tip
+                // and at its turn boundaries, and anything older reprocesses from
+                // the start.
                 auto & ckpts = state.prompt.checkpoints;
                 if (ckpts.size() > 1) {
-                    ckpts.erase(ckpts.begin(), std::prev(ckpts.end()));
+                    for (auto it = ckpts.begin(); it != std::prev(ckpts.end()); ) {
+                        it = (it->pinned || it->turn_start) ? std::next(it) : ckpts.erase(it);
+                    }
                 }
             } break;
         case 2:
@@ -2101,9 +2111,15 @@ bool server_prompt_cache::degrade(server_prompt_cache_state & state) {
         return false;
     }
 
-    SRV_INF(" - cache ladder: degraded entry (%d tokens) level %d -> %d, freed %.3f MiB, now %.3f MiB\n",
+    std::string kept;
+    for (const auto & c : state.prompt.checkpoints) {
+        kept += kept.empty() ? "" : " ";
+        kept += std::to_string(c.n_tokens);
+        kept += c.pinned ? "p" : c.turn_start ? "t" : "";
+    }
+    SRV_INF(" - cache ladder: degraded entry (%d tokens) level %d -> %d, freed %.3f MiB, now %.3f MiB; checkpoints kept at [%s]\n",
             (int) state.prompt.n_tokens(), from, state.degrade_level,
-            (before - after) / (1024.0 * 1024.0), after / (1024.0 * 1024.0));
+            (before - after) / (1024.0 * 1024.0), after / (1024.0 * 1024.0), kept.c_str());
 
     return true;
 }
