@@ -222,8 +222,10 @@ struct server_batch {
 
     // remove the tokens of a slot from index `from` on, then re-render
     // returns old index -> new index, -1 for removed tokens, so the caller can remap slot batch indices
+    // [scheduler] also called while the batch is still being BUILT (pool_make_room takes a victim's pending
+    // tokens out before decode): then there is nothing to re-render, the normal render before decode does it
     std::vector<int32_t> remove_from(llama_seq_id seq_id, int32_t from) {
-        GGML_ASSERT(batch_rendered);
+        const bool was_rendered = batch_rendered;
 
         std::vector<int32_t> map(tokens.size(), -1);
         std::vector<token>   kept;
@@ -244,13 +246,15 @@ struct server_batch {
         tokens = std::move(kept);
         embd   = std::move(embd_kept);
 
-        // same as clear(): render() writes through batch.token
-        if (batch.token == nullptr) {
-            batch.token = tokens_ptr;
-            batch.embd  = nullptr;
+        if (was_rendered) {
+            // same as clear(): render() writes through batch.token
+            if (batch.token == nullptr) {
+                batch.token = tokens_ptr;
+                batch.embd  = nullptr;
+            }
+            batch_rendered = false;
+            render();
         }
-        batch_rendered = false;
-        render();
 
         return map;
     }
@@ -560,6 +564,7 @@ struct server_slot {
 
     // [park] this seat resumed a parked prefill: the prefix in `prompt` is reused whatever cache_prompt says
     bool prefill_resumed = false;
+    bool pool_waiting = false; // refused admission this tick (pool_admit); the wait is logged once per episode
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -676,6 +681,7 @@ struct server_slot {
 
         spec_is_replay = false;
         prefill_resumed = false;
+        pool_waiting   = false;
         divergence_n   = -1;
 
         last_nl_pos    = 0;
@@ -3404,26 +3410,6 @@ private:
     // stream, and one sequence's wall is nobody else's.
     //
 
-    // [pool] rung -1: the batch found no room for its tokens from `off` on, and the pool can grow. Nobody is
-    // evicted for cells the device would have given. A deadline-forced batch may spend the reserve.
-    bool pool_grow_pending(int32_t off) {
-        if (!pool_elastic()) {
-            return false;
-        }
-        size_t n_pending = 0;
-        for (const auto & [slot, n] : batch_pending_slots(off)) {
-            n_pending += n;
-            GGML_UNUSED(slot);
-        }
-        if (n_pending == 0) {
-            return false;
-        }
-        const size_t free_cells = pool_cells_free();
-        const size_t margin     = 1 + slots.size();
-        const size_t n_more     = n_pending + margin > free_cells ? n_pending + margin - free_cells : n_pending;
-        return pool_grow(n_more, /*urgent*/ false, "a batch found no room");
-    }
-
     // rung 1: a finished conversation with cells leaves the pool - the shallowest first, cells being what is
     // short here (SEQ_NEED_CELLS, see seq_evictable). A refused save keeps it unless `force`. `keep` is a seat
     // being prepared for a task, whose own sequence is not a candidate (the restore drops its cells anyway)
@@ -3599,170 +3585,6 @@ private:
         }
     }
 
-    // rung 0: the batch got some of its tokens in before the wall (off > 0), so the ones after it simply wait
-    // for the next batch. Nothing is copied or failed. It matters for WHO the ladder picks next: n_batch halves
-    // down to 1 on the way here, the last free cells go to whichever slot was batched first, and what is left
-    // pending is then only the slot batched after it - the small innocent one, as a rule. The batch that follows
-    // fails with nothing placed, every sequence in it pending, and rung 2 can choose the largest.
-    bool pool_defer_pending(int32_t off) {
-        if (off == 0) {
-            return false;
-        }
-
-        int n_deferred = 0;
-
-        for (const auto & [slot, n_pending] : batch_pending_slots(off)) {
-            if (!slot_drop_pending(*slot, n_pending)) {
-                continue; // stays pending; the rungs below deal with it
-            }
-
-            if (slot->state == SLOT_STATE_DONE_PROMPT) {
-                // its last prompt chunk was in the pending part: it is a prompt in progress again
-                slot->state = SLOT_STATE_PROCESSING_PROMPT;
-            }
-            if (slot->state == SLOT_STATE_GENERATING) {
-                // the sampled token stays in `sampled` and is batched again; the draft is drawn again
-                slot->spec_draft.clear();
-                slot->spec_i_batch.clear();
-            }
-
-            batch_drop_pending(*slot, off);
-
-            SLT_DBG(*slot, "KV pool full after %d of this batch's tokens: %d pending tokens wait for the next batch\n", off, n_pending);
-
-            n_deferred++;
-        }
-
-        return n_deferred > 0;
-    }
-
-    // rung 2: the largest RUNNING generation with tokens pending gives up its seat and its cells (seat_release,
-    // then the offload copy); the resume pass brings it back when there is room. Only with company: with no other
-    // sequence processing there is nobody to make room for - it would be restored into the same full pool and
-    // suspended again, forever - and that is rung 3's case. A prefill cannot be suspended (half its prompt is in the KV;
-    // seat_release() refuses), nor a parent or child (shared cells, not explored): they fall through.
-    bool pool_suspend_running(int32_t off) {
-        // test hook: LLAMA_SERVER_POOL_NO_SUSPEND skips this rung so the terminal rung stays reachable by a
-        // test. With two or more live sequences every exhaustion otherwise has a rung 0-2 move.
-        static const bool disabled = std::getenv("LLAMA_SERVER_POOL_NO_SUSPEND") != nullptr;
-
-        if (!params_base.kv_unified) {
-            return false;
-        }
-
-        const auto pending = batch_pending_slots(off);
-
-        // company is what makes the copy worth taking: a second sequence in this batch, or one that is
-        // processing outside it - a prefill whose chunk was deferred out of the batch a moment ago
-        // (pool_defer_pending) and is waiting for exactly these cells. Measured 2026-09-17: an 86k
-        // generation alone in the batch next to a 242k prefill was refused here and fell through to the
-        // 500 - the prefill could be neither suspended nor evicted, and the generation was the only
-        // thing in the pool that could move.
-        bool company = pending.size() >= 2;
-        if (!company && pending.size() == 1) {
-            for (const auto & slot : slots) {
-                if (slot.is_processing() && &slot != pending[0].first) {
-                    company = true;
-                    break;
-                }
-            }
-        }
-        if (!company) {
-            return false;
-        }
-
-        // the victim is any running generation, in this batch or deferred out of it (then it has no pending
-        // tokens here and there is nothing to drop from the batch, only the copy to take)
-        server_slot * victim    = nullptr;
-        int32_t       n_pending = 0;
-
-        for (auto & slot : slots) {
-            if (disabled) {
-                break; // the test hook: no generation is suspended; a prefill may still be parked
-            }
-            if (!slot.is_processing() || slot.state != SLOT_STATE_GENERATING || !slot.task) {
-                continue;
-            }
-            if (slot.task->is_parent() || slot.task->is_child()) {
-                continue;
-            }
-            int32_t n = 0;
-            for (const auto & [ps, pn] : pending) {
-                if (ps == &slot) {
-                    n = pn;
-                }
-            }
-            if (!victim || slot.prompt.n_tokens() > victim->prompt.n_tokens()) {
-                victim    = &slot;
-                n_pending = n;
-            }
-        }
-
-        // rung 2b: no generation to suspend - every sequence in the pool is a prefill. Park the largest one:
-        // its prefix stays a valid state, the copy goes out, and it comes back through the prompt loop when
-        // the pool has room (measured 2026-09-17: three prefills of 129k, 163k and 48k tokens on a 340k pool,
-        // and the 163k one - a 208k-token conversation 78% of the way in - was answered 500 by rung 3)
-        static const bool no_park = std::getenv("LLAMA_SERVER_POOL_NO_PARK") != nullptr;
-
-        bool parking = false;
-        if (!victim && !no_park) {
-            for (auto & slot : slots) {
-                if (!slot.is_processing() || !slot.task ||
-                    (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT)) {
-                    continue;
-                }
-                if (slot.task->is_parent() || slot.task->is_child()) {
-                    continue;
-                }
-                int32_t n = 0;
-                for (const auto & [ps, pn] : pending) {
-                    if (ps == &slot) {
-                        n = pn;
-                    }
-                }
-                if (!victim || slot.prompt.n_tokens() - n > victim->prompt.n_tokens() - n_pending) {
-                    victim    = &slot;
-                    n_pending = n;
-                }
-            }
-            parking = victim != nullptr;
-        }
-
-        if (!victim) {
-            return false;
-        }
-
-        server_slot & slot = *victim;
-
-        if (!slot_drop_pending(slot, n_pending)) {
-            return false;
-        }
-
-        slot.spec_draft.clear();
-        slot.spec_i_batch.clear();
-
-        batch_drop_pending(slot, off);
-
-        if (parking) {
-            SLT_WRN(slot, "KV pool full: parking the largest prefill with a copy (%d of %d prompt tokens in the KV, %d pending, %zu sequences in the batch)\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), n_pending, pending.size());
-        } else {
-            SLT_WRN(slot, "KV pool full: suspending the largest running generation with a copy (%d tokens in the KV, %d pending, %zu sequences in the batch)\n",
-                    slot.prompt.n_tokens(), n_pending, pending.size());
-        }
-
-        server_sequence * s = slot.seq;
-
-        const bool released = slot.seat_release();
-        GGML_ASSERT(released);
-
-        seq_offload(*s);
-
-        SRV_DBG("%s", parking ? "__TEST_TAG_POOL_PARK_PREFILL__\n" : "__TEST_TAG_POOL_SUSPEND__\n");
-
-        return true;
-    }
-
     // [seq] the restore side of the ladder: an offloaded generation's state comes back under `id` once the pool
     // has room for it. Finished residents are evicted to make that room (rung 1; a refused save is forced on the
     // second pass, as everywhere). false: not restored, the record untouched, the id left free. `may_wait` says
@@ -3817,7 +3639,7 @@ private:
     // [pool-restore] the prompt-cache restore side of the ladder, defect (b) of the 2026-09-07 incident: a cached
     // conversation about to be loaded into `slot` (prompt_load -> state_seq_set_data -> state_read_meta) needs
     // its cells BEFORE state_read_meta asks for them - it finds them all or fails, and the fallback is a full
-    // prefill (141k tokens, 8.4 minutes on GLM, past the client's timeout, looping). pool_admit, pool_grow_pending
+    // prefill (141k tokens, 8.4 minutes on GLM, past the client's timeout, looping). pool_admit (then the ret = 1 ladder's pool_grow_pending)
     // and seq_restore_with_room were pool-grow hooks; this path was not. Room is made the way the ladder makes
     // it: the pool grown from the device (idle ids given back first when the device says no - pool_grow's two
     // passes), then finished residents evicted for their cells, the shallowest first; a refused save is forced
@@ -3906,6 +3728,145 @@ private:
         SRV_DBG("%s", "__TEST_TAG_POOL_SUSPEND_FOR_ROOM__\n");
 
         return true;
+    }
+
+    // [scheduler] make `n_more` cells free for `keep` before a batch is built: grow, then move the cheapest
+    // thing that holds cells - a yielded resident (a copy nobody is computing on), a finished resident (to the
+    // prompt cache), a running generation (a copy), a prefill (parked). The victim's pending tokens leave the
+    // batch. Decided BEFORE llama_decode, against the memory's own count, so decode never returns "no room"
+    // in steady state and there is no batch to repair mid-flight (tools/server/POOL-SCHEDULER.md, stage 2).
+    bool pool_make_room(size_t n_more, const server_slot * keep, const char * why) {
+        static const bool no_suspend = std::getenv("LLAMA_SERVER_POOL_NO_SUSPEND") != nullptr;
+        static const bool no_park    = std::getenv("LLAMA_SERVER_POOL_NO_PARK") != nullptr;
+
+        if (pool_grow(n_more, /*urgent*/ true, why)) {
+            return true;
+        }
+        if (pool_offload_waiting()) {
+            return true;
+        }
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pool_evict_resident(/*force*/ pass == 1, why, keep)) {
+                return true;
+            }
+        }
+
+        // a running generation (largest first) unless the hook forbids it; else a prefill (largest first)
+        server_slot * victim  = nullptr;
+        bool          parking = false;
+        if (!no_suspend) {
+            for (auto & slot : slots) {
+                if (&slot == keep || !slot.is_processing() || slot.state != SLOT_STATE_GENERATING || !slot.task || !slot.bound()) {
+                    continue;
+                }
+                if (slot.task->is_parent() || slot.task->is_child()) {
+                    continue;
+                }
+                if (!victim || slot.prompt.n_tokens() > victim->prompt.n_tokens()) {
+                    victim = &slot;
+                }
+            }
+        }
+        if (!victim && !no_park) {
+            for (auto & slot : slots) {
+                if (&slot == keep || !slot.is_processing() || !slot.task || !slot.bound() ||
+                    (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT)) {
+                    continue;
+                }
+                if (slot.task->is_parent() || slot.task->is_child()) {
+                    continue;
+                }
+                if (!victim || slot.prompt.n_tokens() > victim->prompt.n_tokens()) {
+                    victim = &slot;
+                }
+            }
+            parking = victim != nullptr;
+        }
+        if (!victim) {
+            return false;
+        }
+
+        server_slot & slot = *victim;
+
+        // its tokens in the batch built so far were never decoded: cut the prompt back to the KV
+        int32_t n_pending = 0;
+        for (int32_t i = 0; i < batch.size(); i++) {
+            n_pending += batch.tokens[i].seq_id == slot.seq_id;
+        }
+        if (!slot_drop_pending(slot, n_pending)) {
+            return false;
+        }
+        slot.spec_draft.clear();
+        slot.spec_i_batch.clear();
+        batch_drop_pending(slot, 0);
+
+        if (parking) {
+            SLT_WRN(slot, "KV pool full: parking the largest prefill with a copy (%d of %d prompt tokens in the KV, %d pending, %zu more cells needed) - %s\n",
+                    slot.prompt.n_tokens(), slot.task->n_tokens(), n_pending, n_more, why);
+        } else {
+            SLT_WRN(slot, "KV pool full: suspending the largest running generation with a copy (%d tokens in the KV, %d pending, %zu more cells needed) - %s\n",
+                    slot.prompt.n_tokens(), n_pending, n_more, why);
+        }
+
+        // the batch's compatibility anchor (lora, embeddings) must stay a seated slot with tokens in the batch
+        if (batch.slot_batched == &slot) {
+            batch.slot_batched = nullptr;
+            for (auto & other : slots) {
+                if (&other == &slot || !other.is_processing() || !other.task) {
+                    continue;
+                }
+                for (const auto & t : batch.tokens) {
+                    if (t.seq_id == other.seq_id) {
+                        batch.slot_batched = &other;
+                        break;
+                    }
+                }
+                if (batch.slot_batched) {
+                    break;
+                }
+            }
+        }
+
+        server_sequence * s = slot.seq;
+        const bool released = slot.seat_release();
+        GGML_ASSERT(released);
+        seq_offload(*s);
+
+        SRV_DBG("%s", parking ? "__TEST_TAG_POOL_PARK_PREFILL__\n" : "__TEST_TAG_POOL_SUSPEND__\n");
+        return true;
+    }
+
+    // [scheduler] may `slot` put `n_need` more tokens in the batch this tick? Every token in the batch needs a
+    // cell, so the batch built so far counts against the free cells. Room is made if it can be; false means the
+    // slot simply is not in this batch and tries again next tick - nothing is halved, nothing is failed.
+    bool pool_admit(server_slot & slot, int32_t n_need, const char * why) {
+        if (!params_base.kv_unified || n_need <= 0) {
+            return true;
+        }
+        for (;;) {
+            const size_t need = (size_t) batch.size() + (size_t) n_need;
+            const size_t free = pool_cells_free();
+            if (need <= free) {
+                slot.pool_waiting = false;
+                return true;
+            }
+            // the victim is chosen by cost alone (POOL-SCHEDULER.md: the largest C_j), the asking slot included:
+            // a deep generation asking for its next cell beside a shallow one is the one to move out
+            if (!pool_make_room(need - free, nullptr, why)) {
+                // once per wait, not per tick: a slot refused every tick beside a running decode is normal,
+                // and the line per tick was measured at 49 GB of log in one test (2026-09-18)
+                if (!slot.pool_waiting) {
+                    SLT_WRN(slot, "KV pool full: %s waits (%d cells needed, %zu free, %d in the batch)\n",
+                            why, n_need, free, batch.size());
+                    SRV_DBG("%s", "__TEST_TAG_POOL_ADMIT_WAIT__\n");
+                    slot.pool_waiting = true;
+                }
+                return false;
+            }
+            if (!slot.is_processing() || !slot.task) {
+                return false; // it was the victim: suspended or parked, nothing of it goes in the batch
+            }
+        }
     }
 
     // [pool-restore] the ladder for a state coming back into `slot`: the pool grows for it (rung 0), finished
@@ -4257,15 +4218,19 @@ private:
             return false;
         }
 
-        server_slot & slot = *victim;
-
         int32_t n_pending = 0;
         for (int32_t i = off; i < batch.size(); i++) {
-            if (batch.tokens[i].seq_id == slot.seq_id) {
+            if (batch.tokens[i].seq_id == victim->seq_id) {
                 n_pending++;
             }
         }
 
+        return fail_slot_under_pressure(*victim, n_pending, off, err);
+    }
+
+    // fail `slot` with `err`: its KV up to the pending tokens is spilled to the prompt cache, its pending
+    // tokens (n_pending of them, from batch offset `off` on) leave the batch
+    bool fail_slot_under_pressure(server_slot & slot, int32_t n_pending, int32_t off, const std::string & err) {
         SLT_ERR(slot, "%s n_tokens = %d, n_pending = %d\n", err.c_str(), slot.prompt.n_tokens(), n_pending);
 
         send_error(slot, err);
@@ -4294,14 +4259,16 @@ private:
         slot.prompt_clear();
         slot.i_batch = -1;
 
-        const auto map = batch.remove_from(slot.seq_id, off);
+        if (n_pending > 0) {
+            const auto map = batch.remove_from(slot.seq_id, off);
 
-        for (auto & s : slots) {
-            if (s.i_batch >= 0) {
-                s.i_batch = map[s.i_batch];
-            }
-            for (auto & i : s.spec_i_batch) {
-                i = map[i];
+            for (auto & s : slots) {
+                if (s.i_batch >= 0) {
+                    s.i_batch = map[s.i_batch];
+                }
+                for (auto & i : s.spec_i_batch) {
+                    i = map[i];
+                }
             }
         }
 
@@ -5755,6 +5722,24 @@ private:
 
         GGML_ASSERT(batch.slot_batched || batch.size() == 0);
 
+        // [pool] nothing decodes this tick and a slot was refused admission: no decode will finish and free
+        // cells, pool_make_room found nothing to move, so the wait would be forever - and the loop would spin
+        // (measured 2026-09-18: 49 GB of log). The deepest waiter fails; its KV is spilled, not destroyed.
+        if (batch.size() == 0) {
+            batch.slot_batched = nullptr; // set when the generating slots were collected, before admission refused them
+
+            server_slot * stuck = nullptr;
+            for (auto & slot : slots) {
+                if (slot.pool_waiting && slot.is_processing() && (!stuck || slot.prompt.n_tokens() > stuck->prompt.n_tokens())) {
+                    stuck = &slot;
+                }
+            }
+            if (stuck) {
+                SLT_WRN(*stuck, "KV pool full and nothing runs: the wait cannot end (%d tokens held)\n", stuck->prompt.n_tokens());
+                fail_slot_under_pressure(*stuck, 0, 0, "Context size has been exceeded.");
+            }
+        }
+
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;
             auto & alora_scale       = batch.alora_scale;
@@ -6005,8 +5990,19 @@ private:
             }
         });
 
-        // update the batch with the sampled/drafted tokens
+        // update the batch with the sampled/drafted tokens - each admitted against the pool first: its sampled
+        // token plus the draft it verifies. A generation that does not fit waits this tick; its draft stays
+        // for the next one (the "previous draft to reuse" branch above)
         iterate(generating, [&](server_slot & slot) {
+            // an earlier slot's admission may have suspended this one (pool_make_room): its task moved to
+            // its sequence record and it is no longer in this batch
+            if (!slot.is_processing() || !slot.task || slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+            const int32_t n_need = 1 + (int32_t) slot.spec_draft.size();
+            if (!pool_admit(slot, n_need, "a generation's next step")) {
+                return;
+            }
             slot.handle_last_sampled_token(batch);
         });
 
@@ -6540,7 +6536,13 @@ private:
                     };
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // [scheduler] the chunk this prefill may add: what the batch has left, capped by what the
+                    // pool can seat - made room for if it can be, else the prefill waits this tick
+                    int32_t n_chunk = std::min(n_batch - batch.size(), slot.task->n_tokens() - slot.prompt.n_tokens());
+                    if (n_chunk <= 0 || !pool_admit(slot, n_chunk, "a prefill chunk")) {
+                        return;
+                    }
+                    while (n_chunk-- > 0 && slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -6756,19 +6758,14 @@ private:
         });
 
         if (ret != 0) {
-            if (n_batch == 1 && ret == 1) {
-                SRV_ERR("Context size has been exceeded. off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
-
-                // [seq] T2.5: the pool has no cell for a single token. The ladder, one move per retry; rung 1
-                // ran on the way down (below), so here it only catches what finished since. This used to
-                // error, release and clear EVERY processing slot; then one; now one only when nothing else can go.
-                if (pool_grow_pending(off)                     ||
-                    pool_defer_pending(off)                    ||
-                    pool_evict_resident(false, "KV pool full") ||
-                    pool_offload_waiting()                     ||
-                    pool_suspend_running(off)                  ||
-                    pool_evict_resident(true,  "KV pool full") ||
-                    fail_slot_under_pressure(off, "Context size has been exceeded.")) {
+            if (ret == 1) {
+                // [scheduler] the batch was admitted against the memory's own count of free cells (pool_admit);
+                // the KV refusing it anyway is a bug in that accounting, not a signal to repair the batch.
+                // It is made loud, and ONE slot is failed so the rest of the batch goes on - never a halving,
+                // which is what stranded a speculative group's logits (sampling.cpp:154, 2026-09-18).
+                SRV_ERR("KV refused an admitted batch: off = %d, n_tokens = %d, n_batch = %d, %zu free, %d in the batch - failing one slot\n",
+                        off, batch_view.n_tokens, n_batch, pool_cells_free(), batch.size());
+                if (fail_slot_under_pressure(off, "Context size has been exceeded.")) {
                     return false; // retry the rest of the batch
                 }
             }
@@ -6810,15 +6807,11 @@ private:
                 }
             }
 
-            // retry with half the batch size to try to find a free slot in the KV cache. A finished conversation
-            // goes first (rung 1, cheap and due anyway); the copies wait until halving has proved them necessary
-            if (!pool_grow_pending(off) && !pool_evict_resident(false, "KV pool full")) {
-                n_batch /= 2;
-            }
+            // [scheduler] nothing to halve: an error ret was thrown above; reaching here is ret == 1 with no
+            // slot left pending in this view
+            SRV_WRN("KV refused the view and no slot was pending in it, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
 
-            SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
-
-            return false; // retry with the updated n_batch
+            return false; // retry the rest of the batch
         } else {
             // success, apply batch metrics
             metrics_post_decode(off, batch_view.n_tokens, has_output);

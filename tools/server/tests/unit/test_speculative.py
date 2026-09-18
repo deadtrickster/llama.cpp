@@ -206,14 +206,6 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
 
 
-@pytest.mark.xfail(strict=False, reason=(
-    "the halving retry under pool pressure drops n_batch BELOW a speculative group's size (8 < 9 here; "
-    "2 < 3 and 4->2 < 3 in the two production aborts of 2026-09-18), the cut cannot keep the group whole, "
-    "and sampling reads a group index whose batch slot carries no logits: get_logits_ith 'invalid logits "
-    "id N' -> GGML_ASSERT(logits != nullptr) in sampling.cpp:154, the server dies. Reproduces ~2 of 3 runs "
-    "with pool_cells_free() from the memory, ~1 of 3 with the old held-count (a thread-timing race decides "
-    "whether both groups share the batch at the wall). Removed by admission-before-decode, "
-    "tools/server/POOL-SCHEDULER.md stage 2, which deletes the halving loop. Flips to strict pass there."))
 def test_sub_batch_cut_keeps_a_later_draft_group_whole():
     """Two slots each verifying a draft group (1 sampled token + n_max drafts) on a
     pool that runs out: llama_decode refuses the 18-token batch, the retry halves

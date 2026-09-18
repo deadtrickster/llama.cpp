@@ -382,7 +382,7 @@ def _wait_for(path: str, pattern: str, timeout_s: float) -> bool:
 
 
 def test_resume_keeps_the_id_it_was_handed_when_the_pool_cannot_grow():
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log)
     sp.n_ctx = 4096           # the budget is the wall, not -c; a seat still holds at most n_ctx_train (2048)
     sp.n_threads = 1
@@ -519,7 +519,7 @@ def _two_generations(sp: ServerProcess, n_a: int, n_b: int, gen: int):
                          "(tools/server/POOL-SCHEDULER.md); this guard pairs a resize with an unrelated earlier "
                          "refusal and misfires once pool_cells_free() comes from the memory (llama_memory_n_cells_free)")
 def test_pool_refuses_crumb_grows_at_the_wall():
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=3)
     sp.n_ctx = 8192
     sp.n_batch = 512
@@ -597,7 +597,7 @@ def _n_generations(sp: ServerProcess, convs, gen: int):
 
 
 def test_suspended_generation_waits_for_a_batch_of_room():
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=3)
     sp.n_ctx = 8192
     sp.n_batch = 512
@@ -611,10 +611,10 @@ def test_suspended_generation_waits_for_a_batch_of_room():
     # free - and at this pool size the quarter step (2+ MiB) never fits, so it asks for exactly what it
     # needs: 256 cells, 0.4, fits. The old code restored the generation into that and took it out again
     # a few tokens later; now it needs an eighth of the pool of growth and waits for a generation to end
-    sp.env = {"LLAMA_SERVER_POOL_SELFTEST": "8.4:0", "CUDA_VISIBLE_DEVICES": ""}
+    sp.env = {"LLAMA_SERVER_POOL_SELFTEST": "7.4:0", "CUDA_VISIBLE_DEVICES": ""}
     sp.start(timeout_seconds=120)
     try:
-        # three conversations of ~1721 cells on a wall near 5000: the third's growth fills it
+        # three conversations of ~1721 cells on a wall near 4500 (7.4 MiB: with the KV counting its own free cells - stage 1 - the old 8.4 put the wall at the last 40 tokens and nothing had to be suspended): the third's growth fills it
         res = _n_generations(sp, [("A", 1000), ("B", 1000), ("C", 1000)], 700)
         text = _log(log)
     finally:

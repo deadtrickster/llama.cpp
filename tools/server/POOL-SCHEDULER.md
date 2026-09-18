@@ -1,6 +1,7 @@
 # The KV pool scheduler
 
-Status: design, 2026-09-18. Replaces the reactive pressure ladder in `server-context.cpp`.
+Status: stages 1 and 2 implemented 2026-09-18 (`llama_memory_n_cells_free`, `pool_admit` / `pool_make_room`);
+stages 3 and 4 open. Replaces the reactive pressure ladder in `server-context.cpp`.
 
 ## Why
 
@@ -93,6 +94,21 @@ restore), which they already do.
 
 The emergent-wall tests of 2026-09-18 (`LLAMA_SERVER_POOL_SELFTEST` calibrated to a budget) were
 the wrong strategy for this subsystem: they raced the device and went red/green by timing.
+
+## What stage 2 taught (measured, 2026-09-18)
+
+- The victim is chosen by cost alone, the asking slot included. Protecting the asker (`keep`) made the
+  shallow generation the victim beside a deep one asking for its next cell; the tests that name the
+  largest as the victim, and the restore that expects the deep one to wait, both need the asker eligible.
+- A refused slot with an EMPTY batch behind it can never be admitted: nothing runs, so nothing finishes
+  and frees cells, and `pool_make_room` already found nothing to move. It fails and spills. Letting it
+  "wait" spun the update loop at full speed - 49 GB of log from one test on a tmpfs.
+- The wait is logged once per episode (`slot.pool_waiting`), not per tick.
+- Anything collected before admission can point at a slot admission then moved out: the `generating`
+  list and `batch.slot_batched` both did (`GGML_ASSERT(task)`, `seq_id = -1` in the batch). Collect,
+  admit, then trust nothing collected without re-checking `is_processing()`.
+- The emergent-wall tests survive stage 2 with their budgets recalibrated (the KV's own free count is
+  larger than the old held count, so a wall calibrated against the latter lands ~300 cells later).
 
 ## Order of work
 
