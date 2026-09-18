@@ -2378,33 +2378,78 @@ struct state_buf_pool {
     std::mutex        mtx;
     std::vector<slab> slabs;
     size_t            locked_total = 0;
+    size_t            pooled_total = 0;   // bytes held by the free slabs: resident (MAP_POPULATE), owned by nobody
+    size_t            pool_cap     = default_pool_cap();
 
     // Cap on how much this process will keep locked. mlock competes with the
     // page cache, so an unbounded pool would be antisocial on a shared box.
     static constexpr size_t LOCKED_CAP  = 24ull<<30;   // 24 GiB
     static constexpr size_t MAX_SLABS   = 12;
 
+    // Cap on how many BYTES the free slabs may hold, on top of the count. Measured 2026-09-18 on lab2x1:
+    // with 262144-token conversations a slab is ~24 GB, twelve of them are ~290 GB, and the kernel
+    // OOM-killed the server at 174 GB anonymous RSS while the prompt cache reported 45 GB - the rest was
+    // this pool. 32 GiB keeps one deep conversation's slab warm for the next save (the 4x DMA path) and
+    // no more; LLAMA_STATE_BUF_POOL_MIB overrides, 0 keeps nothing.
+    static size_t default_pool_cap() {
+        if (const char * v = std::getenv("LLAMA_STATE_BUF_POOL_MIB")) {
+            return (size_t) std::strtoull(v, nullptr, 10) << 20;
+        }
+        return 32ull<<30;
+    }
+
+    // Best fit, and never a slab far bigger than the request: first fit handed a 300 MB checkpoint a 24 GB
+    // slab, which then sat resident behind a 300 MB size() for the checkpoint's whole life.
     uint8_t * take(size_t need, size_t & cap_out) {
         std::lock_guard<std::mutex> lk(mtx);
+        const size_t waste_bound = std::max<size_t>(need * 2, need + (64ull<<20));
+        auto best = slabs.end();
         for (auto it = slabs.begin(); it != slabs.end(); ++it) {
-            if (it->cap >= need) {
-                uint8_t * p = it->ptr; cap_out = it->cap;
-                slabs.erase(it);
-                return p;                    // already populated and locked
+            if (it->cap >= need && it->cap <= waste_bound && (best == slabs.end() || it->cap < best->cap)) {
+                best = it;
             }
         }
-        return nullptr;
+        if (best == slabs.end()) {
+            return nullptr;
+        }
+        uint8_t * p = best->ptr; cap_out = best->cap;
+        pooled_total -= best->cap;
+        slabs.erase(best);
+        return p;                        // already populated and locked
     }
 
     void give(uint8_t * p, size_t cap) {
-        std::lock_guard<std::mutex> lk(mtx);
-        if (slabs.size() >= MAX_SLABS) { unmap(p, cap); return; }
+        std::unique_lock<std::mutex> lk(mtx);
+        if (slabs.size() >= MAX_SLABS || pooled_total + cap > pool_cap) {
+            lk.unlock();
+            unmap(p, cap);
+            return;
+        }
         slabs.push_back({p, cap});
+        pooled_total += cap;
+    }
+
+    // drop free slabs until the pool is under `cap` (set_cap, and a cap of 0 empties it)
+    void trim_to(size_t cap) {
+        std::vector<slab> drop;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            pool_cap = cap;
+            while (!slabs.empty() && pooled_total > pool_cap) {
+                drop.push_back(slabs.back());
+                pooled_total -= slabs.back().cap;
+                slabs.pop_back();
+            }
+        }
+        for (const auto & s : drop) {
+            unmap(s.ptr, s.cap);
+        }
     }
 
     void unmap(uint8_t * p, size_t cap) {
         munlock(p, cap);
         munmap(p, cap);
+        std::lock_guard<std::mutex> lk(mtx);
         if (locked_total >= cap) locked_total -= cap; else locked_total = 0;
     }
 
@@ -2429,6 +2474,20 @@ struct state_buf_pool {
 state_buf_pool & pool() { static state_buf_pool p; return p; }
 
 } // namespace
+
+void common_state_buf_pool_stats(size_t & n_slabs, size_t & bytes) {
+    auto & p = pool();
+    std::lock_guard<std::mutex> lk(p.mtx);
+    n_slabs = p.slabs.size();
+    bytes = 0;
+    for (const auto & s : p.slabs) {
+        bytes += s.cap;
+    }
+}
+
+void common_state_buf_pool_set_cap(size_t bytes) {
+    pool().trim_to(bytes);
+}
 
 common_state_buf::payload::~payload() {
     if (ptr) pool().give(ptr, cap);

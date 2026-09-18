@@ -1220,6 +1220,7 @@ public:
     uint8_t *       data()       { detach(); return buf_ ? buf_->ptr : nullptr; }
 
     size_t size()  const { return size_; }
+    size_t capacity() const { return buf_ ? buf_->cap : 0; } // the mapping's bytes (resident: MAP_POPULATE)
     bool   empty() const { return size_ == 0; }
 
     void clear() { size_ = 0; }     // keeps the mapping for reuse
@@ -1233,6 +1234,10 @@ private:
     std::shared_ptr<payload> buf_;
     size_t                   size_ = 0;
 };
+
+// the pool of freed slabs behind common_state_buf: bytes kept for reuse, and the cap on them
+void common_state_buf_pool_stats(size_t & n_slabs, size_t & bytes);
+void common_state_buf_pool_set_cap(size_t bytes);
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;
