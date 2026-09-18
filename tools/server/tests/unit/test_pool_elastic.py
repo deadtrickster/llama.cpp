@@ -429,19 +429,20 @@ def test_resume_keeps_the_id_it_was_handed_when_the_pool_cannot_grow():
         assert not isinstance(res[k], Exception), f"{k}: the server died: {res[k]!r}"
 
     # PRECONDITIONS: A's resume raised the ceiling for its id, and the pool could not grow for its cells
-    i_raise = text.find("raised the sequence ceiling to 3")
-    assert i_raise >= 0, "the resume never needed a raise: nothing is proven"
+    assert text.find("raised the sequence ceiling to 3") >= 0, "the resume never needed a raise: nothing is proven"
     assert re.search(r"more do not fit \(resuming a suspended generation\)", text), "the pool grew for the resume: nothing is proven"
 
-    # the id the resume holds is not "idle" for the grow's shrink rung: the ceiling stays where the raise
-    # put it until the restore has landed under that id
-    i_restored = text.find("restored task", i_raise)
-    assert i_restored > 0, "the suspended generation never came back"
-    between = text[i_raise:i_restored]
-    assert "lowered the sequence ceiling" not in between, (
-        "the grow's shrink rung took back the id the resume was handed")
-    assert "larger than n_seq_max" not in text
+    # the crash this guards: the id the resume was handed must not be taken back WHILE THE RESTORE IS IN
+    # FLIGHT. seq_id_reserved holds it across seq_restore_with_room, so the shrink rung inside a grow there
+    # cannot lower the ceiling below it (the original abort: "invalid seq_id (3) - larger than n_seq_max (3)"
+    # then seq_rm(3) -> GGML_ASSERT). Between resume ATTEMPTS the id is genuinely free and the ceiling may
+    # drop and re-raise - that is fine, and with the resume hysteresis (a batch of growth) the resume waits
+    # across several passes, so a lowering between the first raise and the eventual restore is expected. The
+    # invariant is the absence of the crash, and that the state comes back and completes
+    assert "larger than n_seq_max" not in text, "the resume's id was taken back mid-restore"
     assert "failed to restore target KV state" not in text
+    assert "restored task" in text, "the suspended generation never came back"
+    assert "resumed at" in text, "the suspended generation never resumed"
 
     assert res["A"].status_code == 200, f"A: {res['A'].body}"
     assert res["A"].body["timings"]["predicted_n"] == 500, f"A was cut short: {res['A'].body['timings']}"
