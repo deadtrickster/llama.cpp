@@ -1613,6 +1613,34 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
         case GGML_BACKEND_SPLIT_AXIS_2: {
             // Exploit that tensors are contiguous to splice it with simple tensors as "chunks".
             const size_t chunk_size_full = tensor->nb[split_state.axis + 1];
+            if (size == 0) {
+                return;
+            }
+            if (size < chunk_size_full && offset / chunk_size_full == (offset + size - 1) / chunk_size_full) {
+                // A read inside ONE chunk: walk the sub-chunks the simple tensors contribute to it. A KV
+                // resize fences its device copies with a one-byte read of the new tensor (llama_kv_cache::
+                // n_ctx_resize); demanding whole chunks there aborted every tensor-mode server start.
+                const int64_t i = offset / chunk_size_full;
+                size_t in_chunk = offset - (size_t) i * chunk_size_full;
+                size_t done = 0;
+                for (size_t j = 0; j < n_bufs && done < size; j++) {
+                    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    const size_t chunk_size_j = simple_tensor->nb[split_state.axis + 1];
+                    if (chunk_size_j == 0) {
+                        continue;
+                    }
+                    if (in_chunk >= chunk_size_j) {
+                        in_chunk -= chunk_size_j;
+                        continue;
+                    }
+                    const size_t n = std::min(size - done, chunk_size_j - in_chunk);
+                    ggml_backend_tensor_get(simple_tensor, (char *) data + done, (size_t) i * chunk_size_j + in_chunk, n);
+                    done += n;
+                    in_chunk = 0;
+                }
+                GGML_ASSERT(done == size);
+                return;
+            }
             GGML_ASSERT(offset % chunk_size_full == 0);
             GGML_ASSERT(size   % chunk_size_full == 0);
             const int64_t i_start =  offset        /chunk_size_full;

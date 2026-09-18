@@ -153,6 +153,7 @@ llama_build(test-memory-can-shift.cpp)
 llama_build(test-save-load-state.cpp)
 llama_build(test-seq-max-resize.cpp)
 llama_build(test-memory-cells-free.cpp)
+llama_build(test-kv-resize-tensor.cpp)
     llama_build(test-n-ctx-resize.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -273,6 +274,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
             LABEL main
             ARGS "${MODEL_DIR}/${cells_model}.gguf"
         )
+    endforeach()
+    foreach(resize_model qwen35-dense)
+        llama_test(
+            test-kv-resize-tensor
+            NAME test-kv-resize-tensor-${resize_model}
+            LABEL main
+            ARGS "${MODEL_DIR}/${resize_model}.gguf"
+        )
+        set_tests_properties(test-kv-resize-tensor-${resize_model} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
 
     # the sequence ceiling of a live context: raised, lowered, refused without a throw (recurrent and hybrid)
