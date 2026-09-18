@@ -325,3 +325,7 @@ const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn()
 const llama_memory_recurrent_context * llama_memory_hybrid_iswa_context::get_recr() const {
     return static_cast<const llama_memory_recurrent_context *>(ctx_recr.get());
 }
+
+int64_t llama_memory_hybrid_iswa::n_cells_free() const {
+    return llama_memory_min_cells_free({(mem_attn ? mem_attn->n_cells_free() : -1)});
+}

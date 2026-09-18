@@ -4546,6 +4546,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+int64_t llama_memory_n_cells_free(llama_memory_t mem) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->n_cells_free();
+}
+
 // llama state API
 
 // deprecated

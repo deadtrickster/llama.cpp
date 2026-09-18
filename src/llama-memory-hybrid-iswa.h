@@ -58,6 +58,8 @@ public:
 
     bool get_can_shift() const override;
 
+
+    int64_t n_cells_free() const override;
     bool seq_max_resize(uint32_t n_seq_max) override;
     std::map<ggml_backend_buffer_type_t, size_t> seq_max_cost(uint32_t n_seq_max) const override;
 

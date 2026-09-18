@@ -167,6 +167,9 @@ public:
     //
 
     uint32_t get_size()     const;
+
+    // [pool] size - used, the minimum over streams
+    int64_t n_cells_free() const override;
     uint32_t get_n_stream() const;
     uint32_t get_n_seq_max() const { return n_seq_max; }
 

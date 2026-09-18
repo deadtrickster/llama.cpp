@@ -260,3 +260,7 @@ const llama_kv_cache_context * llama_kv_cache_dsa_context::get_lid()  const {
 
     return static_cast<const llama_kv_cache_context *>(ctx_lid.get());
 }
+
+int64_t llama_kv_cache_dsa::n_cells_free() const {
+    return llama_memory_min_cells_free({(kv_mla ? kv_mla->n_cells_free() : -1), (kv_lid ? kv_lid->n_cells_free() : -1)});
+}

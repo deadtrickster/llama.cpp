@@ -837,6 +837,10 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // [pool] KV cells the memory can still place (size - used, min over its cell-backed parts).
+    // -1 when the memory has no token cells (recurrent state)
+    LLAMA_API int64_t llama_memory_n_cells_free(llama_memory_t mem);
+
     //
     // State / sessions
     //

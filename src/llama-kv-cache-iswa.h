@@ -65,6 +65,8 @@ public:
 
     bool get_can_shift() const override;
 
+
+    int64_t n_cells_free() const override;
     bool seq_max_resize(uint32_t n_seq_max) override;
 
     bool n_ctx_resize(uint32_t n_ctx) override;

@@ -1208,6 +1208,16 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+int64_t llama_kv_cache::n_cells_free() const {
+    int64_t res = -1;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        const int64_t free = (int64_t) cells.size() - (int64_t) cells.get_used();
+        res = res < 0 ? free : std::min(res, free);
+    }
+    return res;
+}
+
 // [seq-max] under a unified layout every id lives on stream 0 and seq_to_stream is sized LLAMA_MAX_SEQ,
 // so the ceiling is a number and nothing has to move. One stream per id would need every K/V tensor
 // reallocated, which this does not do.

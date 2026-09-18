@@ -152,6 +152,7 @@ llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-memory-can-shift.cpp)
 llama_build(test-save-load-state.cpp)
 llama_build(test-seq-max-resize.cpp)
+llama_build(test-memory-cells-free.cpp)
     llama_build(test-n-ctx-resize.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -261,6 +262,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         )
         set_tests_properties(test-memory-can-shift-${can_shift_model} PROPERTIES
             FIXTURES_REQUIRED generate-models
+        )
+    endforeach()
+
+    # [pool] llama_memory_n_cells_free: the KV cache's own free-cell count (hybrid: the composite; mamba: -1)
+    foreach(cells_model mamba-dense qwen35-dense)
+        llama_test(
+            test-memory-cells-free
+            NAME test-memory-cells-free-${cells_model}
+            LABEL main
+            ARGS "${MODEL_DIR}/${cells_model}.gguf"
         )
     endforeach()
 

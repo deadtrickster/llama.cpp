@@ -4,6 +4,8 @@
 #include "llama-graph.h"
 
 #include <map>
+#include <initializer_list>
+#include <algorithm>
 #include <memory>
 #include <functional>
 
@@ -70,6 +72,18 @@ using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;
 
 // general concept of LLM memory
 // the KV cache is a type of LLM memory, but there can be other types
+// [pool] the free cells of a composite memory: the minimum over its parts that know (-1 = unknown)
+static inline int64_t llama_memory_min_cells_free(std::initializer_list<int64_t> parts) {
+    int64_t res = -1;
+    for (const int64_t p : parts) {
+        if (p < 0) {
+            continue;
+        }
+        res = res < 0 ? p : std::min(res, p);
+    }
+    return res;
+}
+
 struct llama_memory_i {
     // this callback is used to filter out layers that should not be included in the cache
     using layer_filter_cb = std::function<bool(int32_t il)>;
@@ -122,6 +136,13 @@ struct llama_memory_i {
     // [pool] bytes, per buffer type, that n_ctx_resize(n_ctx) would ADD: the KV rows of the new
     // cells, exact. Growth only - a shrink frees and reports nothing.
     virtual std::map<ggml_backend_buffer_type_t, size_t> n_ctx_cost(uint32_t n_ctx) const { GGML_UNUSED(n_ctx); return {}; }
+
+    // [pool] KV cells this memory can still place, as the memory itself counts them: size minus used, the
+    // minimum over every cell-backed cache it is made of (a composite is only as free as its fullest part).
+    // -1: this memory has no token cells to speak of (recurrent state) - the caller keeps its own count.
+    // This is the truth the server's pool accounting must derive from, not compute beside: every pool
+    // failure of 2026-09-17/18 was two bookkeepings disagreeing (see tools/server/POOL-SCHEDULER.md).
+    virtual int64_t n_cells_free() const { return -1; }
 
     // [pool] for a dry run of the compute graph only: the full-memory context reports at most n_kv
     // cells (0 = every cell), so the compute buffers can be sized as if the pool were smaller without

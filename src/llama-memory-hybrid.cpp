@@ -431,3 +431,7 @@ const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() c
 const llama_kv_cache_context * llama_memory_hybrid_context::get_idx() const {
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
 }
+
+int64_t llama_memory_hybrid::n_cells_free() const {
+    return llama_memory_min_cells_free({(mem_attn ? mem_attn->n_cells_free() : -1), (mem_idx ? mem_idx->n_cells_free() : -1)});
+}

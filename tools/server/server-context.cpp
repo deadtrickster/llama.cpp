@@ -1970,6 +1970,14 @@ private:
             }
             SRV_INF("[pool] elastic: starts at %u cells, one conversation always has room for one id and %u cells (%s)\n",
                     pool_size(), pool_min_ctx(), params_base.pool_min_ctx > 0 ? "--pool-min-ctx" : "derived from n_batch");
+            {
+                // [pool] say where the cell count comes from: the memory itself (the truth), or the server's
+                // held-count when the memory has no token cells to report
+                const int64_t f = llama_memory_n_cells_free(llama_get_memory(ctx_tgt));
+                SRV_INF("[pool] free cells are counted by %s (%lld free now)\n",
+                        f >= 0 ? "the KV memory (size - used, min over its parts)" : "the server's held-count (the memory reports no token cells)",
+                        (long long) (f >= 0 ? f : (int64_t) pool_cells_free()));
+            }
             if (pool_selftest().on) {
                 SRV_WRN("[pool] SELF-TEST: buffer types without a device are priced at %.2f MiB with %.2f MiB per id (LLAMA_SERVER_POOL_SELFTEST) - never in production\n",
                         pool_selftest().budget / 1048576.0, pool_selftest().id_bytes / 1048576.0);
@@ -2787,7 +2795,21 @@ private:
     }
 
 
+    // [pool] free cells as the MEMORY counts them (size - used, min over target and a lockstep draft),
+    // falling back to the server's held-count only when the memory has no token cells to report (-1).
+    // The server's count and the KV cache's placement disagreed in every pool failure of 2026-09-17/18;
+    // this is the first step of tools/server/POOL-SCHEDULER.md: one truth for cells.
     size_t pool_cells_free() const {
+        int64_t free = llama_memory_n_cells_free(llama_get_memory(ctx_tgt));
+        if (ctx_dft != nullptr && llama_n_ctx(ctx_dft) == llama_n_ctx(ctx_tgt)) {
+            const int64_t f_dft = llama_memory_n_cells_free(llama_get_memory(ctx_dft));
+            if (f_dft >= 0) {
+                free = free < 0 ? f_dft : std::min(free, f_dft);
+            }
+        }
+        if (free >= 0) {
+            return (size_t) free;
+        }
         const size_t held = pool_cells_held();
         const size_t n    = pool_size();
         return held >= n ? 0 : n - held;

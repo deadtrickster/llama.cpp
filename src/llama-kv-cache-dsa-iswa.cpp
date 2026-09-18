@@ -339,3 +339,7 @@ const llama_kv_cache_context * llama_kv_cache_dsa_iswa_context::get_swa() const 
 
     return static_cast<const llama_kv_cache_context *>(ctx_swa.get());
 }
+
+int64_t llama_kv_cache_dsa_iswa::n_cells_free() const {
+    return llama_memory_min_cells_free({(kv_dsa ? kv_dsa->n_cells_free() : -1), (kv_swa ? kv_swa->n_cells_free() : -1)});
+}

@@ -2251,3 +2251,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
 
     return reserve_plan_lid;
 }
+
+int64_t llama_kv_cache_dsv4::n_cells_free() const {
+    return llama_memory_min_cells_free({(kv_raw ? kv_raw->n_cells_free() : -1), (kv_csa ? kv_csa->n_cells_free() : -1), (kv_hca ? kv_hca->n_cells_free() : -1), (kv_lid ? kv_lid->n_cells_free() : -1)});
+}

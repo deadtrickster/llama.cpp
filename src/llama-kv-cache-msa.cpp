@@ -393,3 +393,7 @@ void llama_kv_cache_msa_context::set_input_pos_mask(ggml_tensor * dst, const lla
         }
     }
 }
+
+int64_t llama_kv_cache_msa::n_cells_free() const {
+    return llama_memory_min_cells_free({(kv_base ? kv_base->n_cells_free() : -1), (kv_idx ? kv_idx->n_cells_free() : -1)});
+}
