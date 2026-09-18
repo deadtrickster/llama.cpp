@@ -2700,9 +2700,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         add_opt(common_arg(
             {"--pool-min-grow"}, "N",
             string_format(
-                "[pool] the fewest cells a grow may add while another sequence holds cells (default: %d, 0 = n_batch)\n"
+                "[pool] the fewest cells a grow may add while another sequence holds cells (default: %d, 0 = disabled)\n"
                 "a grow re-stages every live cell; at the device's wall the cells that still fit are not worth that,\n"
-                "and the ladder moves a sequence instead", params.pool_min_grow),
+                "and the ladder moves a sequence instead. OFF by default: enabling it aborted the server via the\n"
+                "batch-halving path (see server-context.cpp) - do not set until that is fixed with a red test", params.pool_min_grow),
             [](common_params & params, int value) {
                 if (value < 0) {
                     throw std::invalid_argument("error: invalid value for --pool-min-grow\n");

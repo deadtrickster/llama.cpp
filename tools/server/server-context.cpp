@@ -2965,7 +2965,12 @@ private:
         // each, while the ladder had a move that would have ended it. Below --pool-min-grow (n_batch) a
         // fallback grow is refused when another sequence holds cells the ladder could move; a lone
         // conversation still gets its crumbs - for it the alternative is rung 3
-        const uint32_t min_grow = params_base.pool_min_grow > 0 ? (uint32_t) params_base.pool_min_grow : llama_n_batch(ctx_tgt);
+        // [pool] crumb rule, OPT-IN (0 = disabled). It defaulted to n_batch and aborted the production server
+        // 2026-09-18: refusing a 256-cell grow at the wall left the decode loop to halve n_batch, and a slot's
+        // logit token fell outside the decoded sub-batch -> "get_logits_ith: invalid logits id" -> a
+        // GGML_ASSERT in sampling. The halving/sampling interaction under a refused grow needs a fix and a red
+        // test before this can default on again; until then it only runs when --pool-min-grow N (N>0) is set.
+        const uint32_t min_grow = (uint32_t) params_base.pool_min_grow;
         size_t n_holders = 0;
         for (const auto & s : seqs) {
             n_holders += s.seq_id >= 0 && !seq_prompt(s).tokens.empty();
@@ -2983,7 +2988,7 @@ private:
 
                 std::string str;
                 if (pool_fits(need, reserve, str)) {
-                    if (i > 0 && n_new - n_cur < min_grow && n_holders >= 2) {
+                    if (min_grow > 0 && i > 0 && n_new - n_cur < min_grow && n_holders >= 2) {
                         SRV_INF("[pool] stays at %u cells: only %u more fit, a crumb under --pool-min-grow %u with %zu sequences holding cells (%s)\n",
                                 n_cur, n_new - n_cur, min_grow, n_holders, why);
                         SRV_DBG("%s", "__TEST_TAG_POOL_CRUMB_REFUSED__\n");
