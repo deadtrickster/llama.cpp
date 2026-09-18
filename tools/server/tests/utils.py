@@ -124,6 +124,7 @@ class ServerProcess:
     n_ctx_checkpoints: int | None = None
     checkpoint_min_step: int | None = None
     cache_disk: int | None = None
+    cache_spill_seconds: int | None = None
     no_cache_idle_slots: bool = False
     pool_min_ctx: int | None = None   # [pool] --pool-min-ctx
     pool_static: bool = False         # [pool] --pool-static
@@ -315,6 +316,8 @@ class ServerProcess:
             server_args.extend(["--ctx-checkpoints", self.n_ctx_checkpoints])
         if self.checkpoint_min_step is not None:
             server_args.extend(["--checkpoint-min-step", self.checkpoint_min_step])
+        if self.cache_spill_seconds is not None:
+            server_args.extend(["--cache-spill-seconds", self.cache_spill_seconds])
         if self.cache_disk is not None:
             server_args.extend(["--cache-disk", self.cache_disk])
         if self.no_cache_idle_slots:

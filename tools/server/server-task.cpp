@@ -2111,6 +2111,20 @@ bool server_prompt_cache::degrade(server_prompt_cache_state & state) {
         return false;
     }
 
+    // [l2-mirror] the file on disk holds the entry as it was mirrored - with the checkpoints or draft state
+    // this rung just dropped. unspill() compares the file's checkpoint count with the entry's and refuses a
+    // mismatch, so a mirrored entry that is degraded and then released came back as "checkpoint count
+    // mismatch ... discarding it" and a full prefill (measured 2026-09-18: four 240k-token conversations).
+    // The mirror is stale now: forget it. The next mirror pass writes the degraded entry; a release before
+    // that spills it whole.
+    if (state.spilled() && state.resident) {
+        std::remove(state.spill_path.c_str());
+        state.spill_path.clear();
+        state.spill_bytes = 0;
+        SRV_INF(" - cache ladder: the mirror of the degraded entry (%d tokens) is stale, dropped; it is mirrored again on the next pass\n",
+                (int) state.prompt.n_tokens());
+    }
+
     std::string kept;
     for (const auto & c : state.prompt.checkpoints) {
         kept += kept.empty() ? "" : " ";

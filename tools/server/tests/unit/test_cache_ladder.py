@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import tempfile
 import pytest
 from utils import *
@@ -218,3 +219,52 @@ def test_spill_only_after_the_ladder_is_exhausted():
     for tok in spills:
         assert int(tok) in degraded_tokens, \
             f"entry of {tok} tokens was spilled without ever being degraded"
+
+
+def test_a_degraded_mirrored_entry_restores_from_disk():
+    """An entry mirrored to disk, then degraded by the ladder (checkpoints dropped), then released from
+    RAM: its next turn must come back from the file. Measured 2026-09-18 on the production Qwen: the
+    mirror held the entry's original checkpoints, degrade() dropped some from the RAM copy without
+    touching the file, the release kept only the file, and unspill refused it - "L2: checkpoint count
+    mismatch", "failed to read spilled entry back, discarding it" - four times, each a 240k-token
+    conversation prefilled from zero."""
+    global server
+    log = server_log_path()
+    # 90 MiB holds A alone at full fidelity (80 MiB): B's arrival saves A and the mirror pass writes it; the
+    # third conversation's save is what degrades A, and the byte ladder, out of rungs, then spills the LRU - A
+    server = _mk(log, cache_ram_mib=90, disk=take_tmpdir("llama-spill-"))
+    server.cache_spill_seconds = 1        # the mirror pass, normally every 60 s
+    server.start(timeout_seconds=120)
+    reader = LogReader(log)
+
+    a_text = _distinct(0, n_tokens=450)   # A is the only conversation of this size: the log lines name it
+    a = _turn(server, a_text)
+    assert a.status_code == 200
+    # the cached entry holds the prompt and the generated tokens but the last sampled one
+    n_a = a.body["timings"]["prompt_n"] + a.body["timings"]["predicted_n"] - 1
+
+    # B takes the only slot: A goes to the RAM tier, and the mirror pass writes it to disk
+    _turn(server, _distinct(1))
+    text = ""
+    deadline = time.time() + 15
+    while time.time() < deadline and f"L2: mirrored {n_a:>7} tokens" not in text:
+        time.sleep(0.5)
+        text += reader.drain()
+    assert f"L2: mirrored {n_a:>7} tokens" in text, f"precondition: A ({n_a} tokens) was never mirrored to disk"
+
+    # pressure: the ladder degrades A (drops checkpoints from the RAM copy), then releases it
+    for i in range(2, 14):
+        _turn(server, _distinct(i))
+    text += reader.drain()
+    assert re.search(rf"degraded entry \({n_a} tokens\)", text), (
+        f"precondition: A ({n_a} tokens) was never degraded; ladder events: {DEGRADED.findall(text)}")
+
+    # A comes back: from disk, whole
+    back = _turn(server, a_text + " w0y1 w0y2 w0y3")
+    text += reader.drain()
+    assert back.status_code == 200
+    assert "checkpoint count mismatch" not in text, "the stale mirror was refused and A was prefilled from zero"
+    assert "failed to read spilled entry back" not in text
+    assert f"L2: restored {n_a:>7} tokens" in text, "precondition: A did not come back through the disk tier"
+    assert back.body["timings"]["prompt_n"] < n_a // 2, (
+        f"A was prefilled ({back.body['timings']['prompt_n']} of {n_a} tokens) instead of restored")
