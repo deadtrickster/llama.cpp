@@ -127,6 +127,7 @@ class ServerProcess:
     no_cache_idle_slots: bool = False
     pool_min_ctx: int | None = None   # [pool] --pool-min-ctx
     pool_static: bool = False         # [pool] --pool-static
+    pool_min_grow: int | None = None  # [pool] --pool-min-grow
     env: dict[str, str] | None = None # extra environment for the server process (a self-test hook, say)
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -322,6 +323,8 @@ class ServerProcess:
             server_args.extend(["--pool-min-ctx", self.pool_min_ctx])
         if self.pool_static:
             server_args.append("--pool-static")
+        if self.pool_min_grow is not None:
+            server_args.extend(["--pool-min-grow", self.pool_min_grow])
         if self.ui_mcp_proxy:
             server_args.append("--ui-mcp-proxy")
         if self.server_tools:

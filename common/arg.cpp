@@ -2698,6 +2698,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         ).set_env("LLAMA_ARG_POOL_MIN_CTX").set_examples({LLAMA_EXAMPLE_SERVER}));
         add_opt(common_arg(
+            {"--pool-min-grow"}, "N",
+            string_format(
+                "[pool] the fewest cells a grow may add while another sequence holds cells (default: %d, 0 = n_batch)\n"
+                "a grow re-stages every live cell; at the device's wall the cells that still fit are not worth that,\n"
+                "and the ladder moves a sequence instead", params.pool_min_grow),
+            [](common_params & params, int value) {
+                if (value < 0) {
+                    throw std::invalid_argument("error: invalid value for --pool-min-grow\n");
+                }
+                params.pool_min_grow = value;
+            }
+        ).set_env("LLAMA_ARG_POOL_MIN_GROW").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
             {"--pool-static"},
             "[pool] pin the KV cell count to -c for the life of the server (default: the pool grows for tokens and shrinks for sequence ids under --kv-unified)",
             [](common_params & params) {

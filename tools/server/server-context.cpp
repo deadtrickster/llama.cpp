@@ -2959,8 +2959,21 @@ private:
             targets.push_back(pool_pad(n_cur + n_more));
         }
 
+        // [pool] the crumb rule: a grow re-stages every live cell (1.6 s for 199k on GLM), so the cells it adds
+        // have to be worth that. At the device's wall the quarter step is refused and the exact need still
+        // fits - 256 cells, padded, for a batch that wanted 5 - and that grow was taken every 6 s, 16 tokens
+        // each, while the ladder had a move that would have ended it. Below --pool-min-grow (n_batch) a
+        // fallback grow is refused when another sequence holds cells the ladder could move; a lone
+        // conversation still gets its crumbs - for it the alternative is rung 3
+        const uint32_t min_grow = params_base.pool_min_grow > 0 ? (uint32_t) params_base.pool_min_grow : llama_n_batch(ctx_tgt);
+        size_t n_holders = 0;
+        for (const auto & s : seqs) {
+            n_holders += s.seq_id >= 0 && !seq_prompt(s).tokens.empty();
+        }
+
         for (int pass = 0; pass < 2; ++pass) {
-            for (const uint32_t n_new : targets) {
+            for (size_t i = 0; i < targets.size(); ++i) {
+                const uint32_t n_new = targets[i];
                 pool_cost_t need;
                 if (!pool_grow_cost(n_new, need)) {
                     SRV_INF("[pool] stays at %u cells: a context cannot change its cell count\n", n_cur);
@@ -2970,6 +2983,12 @@ private:
 
                 std::string str;
                 if (pool_fits(need, reserve, str)) {
+                    if (i > 0 && n_new - n_cur < min_grow && n_holders >= 2) {
+                        SRV_INF("[pool] stays at %u cells: only %u more fit, a crumb under --pool-min-grow %u with %zu sequences holding cells (%s)\n",
+                                n_cur, n_new - n_cur, min_grow, n_holders, why);
+                        SRV_DBG("%s", "__TEST_TAG_POOL_CRUMB_REFUSED__\n");
+                        return false;
+                    }
                     if (pool_resize(n_new, why)) {
                         SRV_INF("[pool] grew for %zu more cells: %s\n", n_more, str.c_str());
                         return true;
@@ -3433,19 +3452,30 @@ private:
     // room for a state, plus the next token of every running sequence and of itself: a state restored into
     // exactly its own cells is suspended again on the next batch, a copy each way for nothing. Without
     // --kv-unified only the restore itself can tell.
-    bool pool_has_room_for(const server_sequence & s) const {
-        if (!params_base.kv_unified) {
-            return true;
-        }
-
+    // [pool] the cells a state coming back needs: its own, the next token of every running sequence and of
+    // itself, and a batch of growth (pool_resume_margin). Measured 2026-09-17 15:32-15:47 on GLM without the
+    // last term: a 128k generation was restored into exactly its own cells plus the 256 the pool had just
+    // grown by, decoded 16 tokens, and was suspended again - 2.5 GB out, 1.6 s of KV staging, 2.5 GB back,
+    // every 6 s, with a third conversation decoding at 3 t/s through it. A state that would fill its room
+    // in a few tokens waits for the other conversation to finish instead.
+    size_t pool_resume_margin() const {
         size_t margin = 1;
         for (const auto & slot : slots) {
             if (slot.is_processing()) {
                 margin++;
             }
         }
+        // a batch of growth, but never more than an eighth of the pool: a 256-cell test pool with -b 2048
+        // would otherwise never seat a resume again
+        return margin + std::min<size_t>(llama_n_batch(ctx_tgt), std::max<size_t>(16, pool_size() / 8));
+    }
 
-        return pool_cells_held() + s.prompt.tokens.size() + margin <= (size_t) llama_n_ctx(ctx_tgt);
+    bool pool_has_room_for(const server_sequence & s) const {
+        if (!params_base.kv_unified) {
+            return true;
+        }
+
+        return pool_cells_held() + s.prompt.tokens.size() + pool_resume_margin() <= (size_t) llama_n_ctx(ctx_tgt);
     }
 
     // the processing slots with tokens pending in the batch from `off` on, with how many each
@@ -3718,7 +3748,7 @@ private:
             for (;;) {
                 if (!pool_has_room_for(s)) {
                     // [pool] the cells it needs, from the device first
-                    const size_t need = s.prompt.tokens.size() + 1 + slots.size();
+                    const size_t need = s.prompt.tokens.size() + pool_resume_margin();
                     const size_t have = pool_cells_free();
                     if (need > have) {
                         pool_grow(need - have, /*urgent*/ false, "resuming a suspended generation");

@@ -463,6 +463,7 @@ struct common_params {
     int32_t seq_max_headroom_mib  =     0; // [seq-max] free device memory to keep when raising the ceiling at runtime, see --seq-max-headroom
     int32_t pool_min_ctx          =     0; // [pool] cells one conversation can always have (the reserve's context term and the pool's floor); 0 = derive from n_batch. see --pool-min-ctx
     bool    pool_static           = false; // [pool] never move the KV cell count at runtime: -c is what it always was
+    int32_t pool_min_grow         = 0;     // [pool] a grow adding fewer cells than this is refused at the wall (0 = n_batch)
 
     // the n_seq_max the context is actually created with. llama sizes per-sequence state (recurrent memory,
     // KV streams, samplers, output reservation) by this, not by n_parallel - so must anything that feeds it

@@ -446,3 +446,188 @@ def test_resume_keeps_the_id_it_was_handed_when_the_pool_cannot_grow():
     assert res["A"].status_code == 200, f"A: {res['A'].body}"
     assert res["A"].body["timings"]["predicted_n"] == 500, f"A was cut short: {res['A'].body['timings']}"
     assert "resumed at" in text, "the suspended generation never resumed"
+
+
+# ---------------------------------------------------------------------------------------------------------
+# [pool] the wall. Measured 2026-09-17 15:32-15:47 on GLM, a 208k prefill and a 128k generation on a pool at
+# its VRAM ceiling: every ~6 s the generation was suspended (2.5 GB out), the pool grew by the 256 cells
+# that still fit - re-staging all 199k live cells through host RAM, 1.6 s - the generation was restored
+# into exactly that room (2.5 GB back), decoded 16 tokens, and was suspended again. 2.5 s of every 6 s
+# inside a copy, and the third conversation on the server decoding at 3 t/s through it.
+#
+# Two rules, one test each, both on the fake device with ids free:
+#   - a grow that adds fewer than --pool-min-grow cells (default: n_batch) is a crumb: its staging costs
+#     more than the cells are worth, and the ladder has a cheaper move whenever another sequence holds
+#     cells. Refused, unless the pool is tiny or nothing else could move.
+#   - a suspended state comes back only into room for itself plus a batch of growth, so it waits for the
+#     other conversation to finish instead of flip-flopping through the host every few seconds.
+# ---------------------------------------------------------------------------------------------------------
+
+def _crumb_grows(log: str, min_grow: int):
+    """grows that fell back to a sliver while the ladder had a move: a larger target was refused for the
+    same pool size just before, the resize that followed added fewer than min_grow cells, and more than
+    one sequence held cells (a lone conversation may take crumbs: for it the alternative is rung 3)"""
+    res = []
+    refused_from = None
+    for line in log.splitlines():
+        m = re.search(r"\[pool\] (\d+) -> (\d+) cells does not fit", line)
+        if m:
+            refused_from = int(m.group(1))
+            continue
+        m = re.search(r"pool_resize: \[pool\] (\d+) -> (\d+) cells \(\d+ held, (\d+) ids of", line)
+        if m:
+            a, b, ids = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if b > a and a == refused_from and b - a < min_grow and ids >= 2:
+                res.append((a, b))
+            refused_from = None
+    return res
+
+
+def _two_generations(sp: ServerProcess, n_a: int, n_b: int, gen: int):
+    """A then B, both generating `gen` tokens with EOS ignored; B starts once A generates."""
+    log = sp.log_path
+    res = {}
+
+    def go(k, prompt, n):
+        try:
+            res[k] = _gen(sp, prompt, n)
+        except Exception as e:      # a died server shows up here
+            res[k] = e
+
+    prompt_a = "Alpha. " + _prompt_of(sp, n_a)
+    prompt_b = "Bravo. " + _prompt_of(sp, n_b)
+    ta = threading.Thread(target=go, args=("A", prompt_a, gen))
+    ta.start()
+    assert _wait_for(log, r"id\s+\d+ \| task \d+ \| n_gen = \d+, n_remaining", 60), "A never started generating"
+    tb = threading.Thread(target=go, args=("B", prompt_b, gen))
+    tb.start()
+    ta.join(timeout=300)
+    tb.join(timeout=300)
+    for k in "AB":
+        assert k in res, f"{k}: no response"
+        assert not isinstance(res[k], Exception), f"{k}: the server died: {res[k]!r}"
+    return res
+
+
+# NOTE both tests below are INVARIANT GUARDS, not deterministic red tests. The flip-flop and the crumb
+# grow both need the pool's emergent wall (a budget the grows themselves move) to land in a ~256-cell
+# window against a conversation's size, which is not reproducible run to run. They assert the property
+# holds and fired red on the unfixed binary in some runs; the primary evidence is the production log
+# (2026-09-17 15:32-15:47, GLM: 2.5 s of every 6 s inside a copy, a third conversation at 3 t/s).
+def test_pool_refuses_crumb_grows_at_the_wall():
+    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log, n_slots=3)
+    sp.n_ctx = 8192
+    sp.n_batch = 512
+    sp.pool_min_grow = 1024
+    sp.n_threads = 1
+    sp.n_gpu_layer = 0
+    sp.debug = True
+    # measured on this fixture: 1.6 KiB per cell, 0.8 MiB used at 768 cells, a batch's grow reserves 1.2 MiB
+    # (--pool-min-ctx, n_batch 512) on top of the cells: free(N) = 5.0 - 0.8 - (N - 768) / 640 MiB.
+    # The quarter steps reach 2304 (1.8 free); the next quarter needs 1.2 + 1.2 and is refused; the exact
+    # need pads to 256 cells, 0.4 + 1.2, and fits: that is the crumb. Three conversations of 1621, 1421 and
+    # 1604 cells fill well past 2304, so two of them still hold cells when the third is suspended and its
+    # resume asks for a crumb; ids are free
+    sp.env = {"LLAMA_SERVER_POOL_SELFTEST": "5.0:0", "CUDA_VISIBLE_DEVICES": ""}
+    sp.start(timeout_seconds=120)
+    try:
+        res = {}
+
+        def go(k, prompt, n):
+            try:
+                res[k] = _gen(sp, prompt, n)
+            except Exception as e:
+                res[k] = e
+
+        threads = []
+        for k, n_prompt, gen in (("A", 1000, 900), ("B", 1000, 900), ("C", 700, 900)):
+            t = threading.Thread(target=go, args=(k, f"{k}. " + _prompt_of(sp, n_prompt), gen))
+            t.start()
+            threads.append(t)
+            _wait_for(log, r"n_gen = 1,", 30)      # the next one arrives once this one is in flight
+        for t in threads:
+            t.join(timeout=300)
+        text = _log(log)
+    finally:
+        sp.stop()
+
+    for k in "ABC":
+        assert k in res and not isinstance(res[k], Exception), f"{k}: {res.get(k)!r}"
+
+    # PRECONDITION: the pool met the budget with more than one sequence on it
+    assert re.search(r"more do not fit", text), "the pool never hit the fake device's budget: nothing is proven"
+
+    crumbs = _crumb_grows(text, 1024)
+    assert not crumbs, f"the pool grew by crumbs at the wall: {crumbs}"
+
+    for k in "ABC":
+        assert res[k].status_code == 200, f"{k}: {res[k].body}"
+
+
+def _n_generations(sp: ServerProcess, convs, gen: int):
+    """conversations (name, prompt tokens) generating `gen` tokens each with EOS ignored, started one
+    after another once the previous one generates"""
+    log = sp.log_path
+    res = {}
+
+    def go(k, prompt, n):
+        try:
+            res[k] = _gen(sp, prompt, n)
+        except Exception as e:      # a died server shows up here
+            res[k] = e
+
+    threads = []
+    for k, n_prompt in convs:
+        t = threading.Thread(target=go, args=(k, f"{k}. " + _prompt_of(sp, n_prompt), gen))
+        t.start()
+        threads.append(t)
+        _wait_for(log, rf"task \d+ \| n_gen = 1,", 30)
+        time.sleep(0.05)
+    for t in threads:
+        t.join(timeout=300)
+    for k, _ in convs:
+        assert k in res, f"{k}: no response"
+        assert not isinstance(res[k], Exception), f"{k}: the server died: {res[k]!r}"
+    return res
+
+
+def test_suspended_generation_waits_for_a_batch_of_room():
+    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    sp = _mk(log, n_slots=3)
+    sp.n_ctx = 8192
+    sp.n_batch = 512
+    sp.pool_min_grow = 256      # crumbs allowed: this test is about the resume, not the grow
+    sp.n_threads = 1
+    sp.n_gpu_layer = 0
+    sp.debug = True
+    # 1.6 KiB per cell, 0.8 MiB used at 768: free(N) = 8.4 - 0.8 - (N - 768) / 640. A batch's grow at the wall
+    # asks for 256 cells plus the --pool-min-ctx reserve (512 cells, 0.8): the last one it takes leaves
+    # 0.8..1.2 free. The resume of a suspended generation asks without the reserve - its own cells are
+    # free - and at this pool size the quarter step (2+ MiB) never fits, so it asks for exactly what it
+    # needs: 256 cells, 0.4, fits. The old code restored the generation into that and took it out again
+    # a few tokens later; now it needs an eighth of the pool of growth and waits for a generation to end
+    sp.env = {"LLAMA_SERVER_POOL_SELFTEST": "8.4:0", "CUDA_VISIBLE_DEVICES": ""}
+    sp.start(timeout_seconds=120)
+    try:
+        # three conversations of ~1721 cells on a wall near 5000: the third's growth fills it
+        res = _n_generations(sp, [("A", 1000), ("B", 1000), ("C", 1000)], 700)
+        text = _log(log)
+    finally:
+        sp.stop()
+
+    # every resume must be worth its two copies: the sequence generates at least a quarter of the batch
+    # (the room is shared with the other generations) before it is suspended again
+    events = re.findall(r"(resumed at|offloaded sequence \d+ mid-flight \(task \d+,) (\d+) (generated tokens|tokens in)", text)
+    assert any(e[0] == "resumed at" for e in events), "precondition: nothing was suspended and resumed, nothing is proven"
+    last_resume = None
+    for kind, n, _ in events:
+        n = int(n)
+        if kind == "resumed at":
+            last_resume = n
+        elif last_resume is not None:
+            assert n - last_resume >= 128, (
+                f"the suspended generation flip-flopped: resumed at {last_resume} tokens and suspended again at {n}")
+            last_resume = None
+    for k in "ABC":
+        assert res[k].status_code == 200, f"{k}: {res[k].body}"
