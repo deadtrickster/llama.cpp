@@ -87,7 +87,7 @@ def test_yielded_generation_is_counted_once_in_metrics(backend_sampling):
     fell back to the CPU is NOT observable from outside - the output is the
     same either way - so that arm proves the path runs, not which sampler it
     used."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, quantum=8, n_slots=1, metrics=True, backend_sampling=backend_sampling)
     sp.start(timeout_seconds=120)
     try:
@@ -128,7 +128,7 @@ def test_flush_does_not_warn_about_an_already_cached_slot():
     warned on any false, so the normal case - an idle slot whose conversation
     the idle-slot purge already copied into the cache - was reported as a
     refusal on every shutdown."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1)
     sp.start(timeout_seconds=120)
     try:

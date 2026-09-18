@@ -138,7 +138,7 @@ def test_cancel_reaches_a_suspended_task(kv_unified):
 
     -t 1 so that B (a full 2048-token context, ~2.4 s) outlives the server's
     1 s socket poll: the CANCEL has to land while A is still suspended."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, quantum=8, n_slots=1, n_threads=1, kv_unified=kv_unified)
     sp.start(timeout_seconds=120)
     try:
@@ -295,7 +295,7 @@ def test_failed_resume_answers_the_client_and_clears_the_slot():
 
     Before the fix that failure was logged and the entry destroyed: A's client
     waited forever, and slot 0 kept C's prompt with none of its cells in KV."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, quantum=320, n_slots=2, n_ctx=1024)
     sp.kv_unified = True
     sp.n_batch = 2

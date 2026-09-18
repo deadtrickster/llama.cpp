@@ -804,3 +804,40 @@ def download_file(url: str, output_file_path: str | None = None) -> str:
 
 def is_slow_test_allowed():
     return os.environ.get("SLOW_TESTS") == "1" or os.environ.get("SLOW_TESTS") == "ON"
+
+
+# --- per-test server logs -------------------------------------------------------------------------------
+# A test that reads the server log gets a fresh temp dir from server_log_path(); conftest removes every
+# dir after the test (LLAMA_TESTS_KEEP_LOGS=1 keeps them) and fails the test if a log passed SERVER_LOG_CAP.
+# Why: /tmp on the lab box is a 93 GB tmpfs, one spinning server wrote 49 GB into it in one test and 83
+# leftover dirs held 4 GB of RAM (2026-09-18).
+SERVER_LOG_CAP = 512 << 20
+_TEST_TMP_DIRS: list = []
+
+
+def take_tmpdir(prefix: str = "llama-test-") -> str:
+    import tempfile
+    d = tempfile.mkdtemp(prefix=prefix)
+    _TEST_TMP_DIRS.append(d)
+    return d
+
+
+def server_log_path() -> str:
+    return os.path.join(take_tmpdir("llama-srvlog-"), "srv.log")
+
+
+def cleanup_test_tmpdirs() -> list:
+    """remove the registered dirs; returns the logs that passed SERVER_LOG_CAP (checked before removal)"""
+    import shutil
+    oversized = []
+    while _TEST_TMP_DIRS:
+        d = _TEST_TMP_DIRS.pop()
+        log = os.path.join(d, "srv.log")
+        try:
+            if os.path.getsize(log) > SERVER_LOG_CAP:
+                oversized.append((log, os.path.getsize(log)))
+        except OSError:
+            pass
+        if not os.environ.get("LLAMA_TESTS_KEEP_LOGS"):
+            shutil.rmtree(d, ignore_errors=True)
+    return oversized

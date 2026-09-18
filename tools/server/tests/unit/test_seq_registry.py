@@ -100,7 +100,7 @@ def test_resident_sequence_resumes_without_reprocessing():
     generation would have. Before the registry the seat was the sequence: B's
     launch cleared A (no cache to save it to), and A's next turn paid a full
     re-prefill."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=2)
     sp.start(timeout_seconds=120)
     try:
@@ -140,7 +140,7 @@ def test_id_pressure_evicts_lru_and_keeps_the_rest_resident():
     is a full re-prefill (no cache to bring it back from) and, needing an id
     of its own, evicts the LRU resident of that moment (C) - which is why B is
     asked first. Before the registry both paid the full re-prefill."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=2)
     sp.start(timeout_seconds=120)
     try:
@@ -210,7 +210,7 @@ def test_ceiling_grows_on_demand_without_seq_max():
     needs an id and A holds the only one, the server asks the model what one
     more costs, finds the device has it, and raises the ceiling by one instead
     of evicting A. A's second turn is then served from its cells."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=None)
     sp.start(timeout_seconds=120)
     try:
@@ -228,7 +228,7 @@ def test_ceiling_grows_on_a_recurrent_model():
     """The same on Mamba, where the raise reallocates the recurrent state rows
     under a live sequence (the log line comes from llama_memory_recurrent).
     A's cells - its state row - must survive the move: second turn resident."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk_mamba(log)
     sp.start(timeout_seconds=300)
     try:
@@ -250,7 +250,7 @@ def test_ceiling_shrinks_when_idle_and_grows_back():
     server is idle with one conversation live the ceiling comes down to what is
     used (1, never below the seat count); the next conversation raises it again,
     up to the cap. Both moves are logged by the server."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=3)
     sp.start(timeout_seconds=120)
     try:
@@ -291,7 +291,7 @@ def _contend(sp: ServerProcess, prompt_a: str, prompt_b: str):
 
 
 def _yield_run(seq_max, prompt_b=PROMPT_B, kv_unified=True, n_ctx=2048):
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=seq_max, quantum=8, kv_unified=kv_unified, n_ctx=n_ctx, parallel_max=1)
     sp.start(timeout_seconds=120)
     try:
@@ -335,8 +335,8 @@ def test_seat_move_is_exact():
     else in the pool. 1500 tokens through ~30 moves must equal a server that
     never moved - the field list moved by seat_release()/seat_acquire()
     mirrors reset() exactly, or this shows the difference."""
-    plain = _generate_1500(_mk(os.path.join(tempfile.mkdtemp(), "srv.log"), n_slots=1, seq_max=2))
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    plain = _generate_1500(_mk(server_log_path(), n_slots=1, seq_max=2))
+    log = server_log_path()
     moved = _generate_1500(_mk(log, n_slots=1, seq_max=2), env={"LLAMA_SERVER_PREEMPT_SELFTEST": "50"})
     n_moves = _log(log).count("resumed at")
     assert n_moves >= 25, f"precondition: only {n_moves} seat moves happened"
@@ -398,7 +398,7 @@ def test_resume_saves_the_finished_conversation_it_displaces():
     must evict B through the cache, so B's next turn is a cache hit. --seq-max 1
     holds the ceiling at one id; with room to grow B would simply get a second
     id and nothing would be displaced."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=1, cache_ram=100, quantum=8)
     sp.start(timeout_seconds=120)
     try:
@@ -536,7 +536,7 @@ def test_pool_holds_n_so_n_run_concurrently():
     """Four conversations that the pool can hold, --parallel 1, no --seq-max: all four must be
     generating at the same instant. Before pool-driven seats --parallel was the batch width and the
     three others waited their turn on the one seat, however much room the pool had."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=None, n_ctx=8192)
     sp.start(timeout_seconds=120)
     try:
@@ -560,7 +560,7 @@ def test_pool_bound_admits_exactly_what_fits():
     for the cost query refusing a third id (that is the GLM situation at ceiling 5). Four requests,
     --parallel 1: exactly two generate at once, never three, the seat count never exceeds the ceiling,
     and all four complete."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=2, n_ctx=8192)
     sp.start(timeout_seconds=120)
     try:
@@ -581,7 +581,7 @@ def test_suspended_generation_gets_compute_within_the_deadline():
     for A's benefit. --slot-resume-after is the bound. Before this A waited for B to finish - the
     resume pass could win a free seat but nothing ever freed one."""
     bound_ms = 300
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, seq_max=1, quantum=8, n_ctx=4096)
     sp.slot_resume_after = bound_ms
     sp.slot_deadline_preempt = True   # the teeth, default off: without it A only wins a seat that frees on its own
@@ -618,7 +618,7 @@ def test_suspended_generation_gets_compute_within_the_deadline():
 def _decode_during_prefill(ratio) -> tuple:
     """A generates 2000 tokens; 0.3 s in, B arrives with a ~1500-token prompt that takes ~47 batches of 32 to
     prefill. Returns (A tokens that arrived between B's send and B's first token, B's prompt_n)."""
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(log, n_slots=1, n_ctx=8192)
     sp.n_batch = 32
     sp.n_threads = 1

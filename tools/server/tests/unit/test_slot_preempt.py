@@ -120,7 +120,7 @@ def _contend(sp: ServerProcess):
 
 
 def _run(spec, quantum=8, draft_n_max=8):
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     sp = _mk(quantum, spec, log, draft_n_max)
     sp.start(timeout_seconds=120)
     try:

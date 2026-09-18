@@ -98,7 +98,7 @@ def test_degrades_before_it_spills():
     """Pressure must shed fidelity first. A spill before any degrade means the
     ladder was skipped and eviction is still a cliff."""
     global server
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     server = _mk(log, cache_ram_mib=RAM_MIB)
     server.start(timeout_seconds=120)
     reader = LogReader(log)
@@ -124,7 +124,7 @@ def test_degradation_is_spread_not_concentrated():
     entry should reach level 1 before any entry reaches level 2, so no single
     conversation is stripped bare while its neighbour keeps everything."""
     global server
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     server = _mk(log, cache_ram_mib=RAM_MIB)
     server.start(timeout_seconds=120)
     reader = LogReader(log)
@@ -152,7 +152,7 @@ def test_lru_order_within_a_rung():
     """LRU still decides who goes first among equally-degraded entries. The entry
     touched most recently must not be the first to lose fidelity."""
     global server
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     server = _mk(log, cache_ram_mib=RAM_MIB)
     server.start(timeout_seconds=120)
 
@@ -177,7 +177,7 @@ def test_a_degraded_entry_still_restores():
     """Every rung costs time, never correctness. A conversation whose entry was
     degraded must still come back from cache rather than reprocessing whole."""
     global server
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log = server_log_path()
     server = _mk(log, cache_ram_mib=RAM_MIB)
     server.start(timeout_seconds=120)
 
@@ -198,8 +198,8 @@ def test_spill_only_after_the_ladder_is_exhausted():
     """Disk is the last rung. An entry may only be spilled once it has nothing
     left to shed, otherwise the ladder is being short-circuited."""
     global server
-    disk = tempfile.mkdtemp()
-    log = os.path.join(tempfile.mkdtemp(), "srv.log")
+    disk = take_tmpdir("llama-spill-")
+    log = server_log_path()
     server = _mk(log, cache_ram_mib=RAM_MIB, disk=disk)
     server.start(timeout_seconds=120)
     reader = LogReader(log)

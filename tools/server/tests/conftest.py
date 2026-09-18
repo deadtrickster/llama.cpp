@@ -42,3 +42,13 @@ def load_server_presets(configure_worker_port, tmp_path_factory):
     root_tmp_dir = tmp_path_factory.getbasetemp().parent
     with FileLock(str(root_tmp_dir / "load_all.lock")):
         ServerPreset.load_all()
+
+
+@pytest.fixture(autouse=True)
+def remove_test_tmpdirs():
+    """server logs and other temp dirs a test took through utils.take_tmpdir()/server_log_path() go after
+    the test; a log past SERVER_LOG_CAP fails it - a server that wrote that much was spinning"""
+    yield
+    from utils import cleanup_test_tmpdirs, SERVER_LOG_CAP
+    oversized = cleanup_test_tmpdirs()
+    assert not oversized, f"server log(s) past {SERVER_LOG_CAP >> 20} MiB - a spinning server: {oversized}"

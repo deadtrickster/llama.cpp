@@ -49,7 +49,7 @@ def _log(path: str) -> str:
 
 
 def test_seq_max_unset_equals_parallel():
-    log_path = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log_path = server_log_path()
     sp = _mk(log_path)
     sp.start(timeout_seconds=120)
     try:
@@ -62,7 +62,7 @@ def test_seq_max_unset_equals_parallel():
 
 
 def test_seq_max_above_parallel_starts_and_serves():
-    log_path = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log_path = server_log_path()
     sp = _mk(log_path)
     sp.seq_max = 4
     sp.kv_unified = True  # one KV stream, so the extra ids cost no per-slot context
@@ -99,7 +99,7 @@ def test_seq_max_above_parallel_starts_and_serves():
 
 
 def test_seq_max_below_parallel_is_refused():
-    log_path = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log_path = server_log_path()
     sp = _mk(log_path)
     sp.seq_max = 1
     with pytest.raises(RuntimeError, match="Server process died"):
@@ -113,7 +113,7 @@ def test_seq_max_without_kv_unified_splits_the_context():
     """Without --kv-unified the attention cache is one stream per sequence id,
     so n_ctx is divided by n_seq_max, not by n_parallel: raising --seq-max
     shrinks every slot's context. Recorded here so the cost is visible."""
-    log_path = os.path.join(tempfile.mkdtemp(), "srv.log")
+    log_path = server_log_path()
     sp = _mk(log_path)
     sp.seq_max = 4
     sp.start(timeout_seconds=120)
