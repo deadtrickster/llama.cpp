@@ -2674,6 +2674,16 @@ size_t server_prompt_cache::size() const {
     return res;
 }
 
+size_t server_prompt_cache::mapped() const {
+    size_t res = 0;
+
+    for (const auto & state : states) {
+        res += state.mapped();
+    }
+
+    return res;
+}
+
 size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 

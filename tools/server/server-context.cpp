@@ -4164,10 +4164,11 @@ private:
             // absence of a line. That made a regression costing 72% of all prefill
             // indistinguishable from the cache simply not being there.
             if (cache_usable) {
-                SLT_INF(*ret, "prompt cache: save = %d, load = %d, f_keep = %.3f, f_sim = %.3f, %zu entries / %.1f MiB\n",
+                SLT_INF(*ret, "prompt cache: save = %d, load = %d, f_keep = %.3f, f_sim = %.3f, %zu entries / %.1f MiB (%.1f MiB mapped)\n",
                         do_save, do_load, f_keep_sel, f_sim_sel,
                         prompt_cache->states.size(),
-                        prompt_cache->size() / 1048576.0);
+                        prompt_cache->size() / 1048576.0,
+                        prompt_cache->mapped() / 1048576.0);
             }
 
             if (do_save || do_load) {

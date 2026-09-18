@@ -2398,11 +2398,13 @@ struct state_buf_pool {
         return 32ull<<30;
     }
 
-    // Best fit, and never a slab far bigger than the request: first fit handed a 300 MB checkpoint a 24 GB
-    // slab, which then sat resident behind a 300 MB size() for the checkpoint's whole life.
+    // Best fit, and never a slab much bigger than the request: first fit handed a 300 MB checkpoint a 24 GB
+    // slab, which then sat resident behind a 300 MB size() for the checkpoint's whole life. The bound is an
+    // eighth (a conversation re-saved a turn later fits its old slab): at 2x the lab box held 146 GB of RSS
+    // behind a 55.5 GB cache and a 32 GiB pool - the slack was the slabs' capacity over their size().
     uint8_t * take(size_t need, size_t & cap_out) {
         std::lock_guard<std::mutex> lk(mtx);
-        const size_t waste_bound = std::max<size_t>(need * 2, need + (64ull<<20));
+        const size_t waste_bound = need + std::max<size_t>(need / 8, 256ull<<20);
         auto best = slabs.end();
         for (auto it = slabs.begin(); it != slabs.end(); ++it) {
             if (it->cap >= need && it->cap <= waste_bound && (best == slabs.end() || it->cap < best->cap)) {

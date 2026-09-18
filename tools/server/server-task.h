@@ -652,6 +652,20 @@ struct server_prompt_cache_state {
 
     bool can_degrade() const { return resident && degrade_level < DEGRADE_MAX; }
 
+    // bytes the entry's state buffers MAP (slab capacity, resident pages): what RSS sees. size() is what the
+    // entry uses; the gap is the slab pool's rounding and reuse slack (measured 2026-09-18: 146 GB of RSS
+    // behind a 55.5 GB size() total, with the reuse bound at 2x)
+    size_t mapped() const {
+        if (!resident) {
+            return 0;
+        }
+        size_t res = data.main.capacity() + data.drft.capacity();
+        for (const auto & c : prompt.checkpoints) {
+            res += c.data_tgt.capacity() + c.data_dft.capacity() + c.data_spec.capacity();
+        }
+        return res;
+    }
+
     // RAM footprint. A non-resident entry costs only its token list + metadata.
     size_t size() const {
         if (!resident) {
@@ -766,6 +780,7 @@ struct server_prompt_cache {
     size_t limit_tokens = 0;
 
     size_t size() const;
+    size_t mapped() const;   // slab capacity behind size(): the RSS the resident entries cost
 
     // [sleep-pressure] whether the RAM tier holds enough of its limit that an idle
     // sleep would actually reclaim something worth the reload it costs. The

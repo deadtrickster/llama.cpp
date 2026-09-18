@@ -43,10 +43,24 @@ int main() {
         common_state_buf small;
         small.resize(1 * MIB);
         CHECK(small.capacity() < 1024 * MIB, "a 1 MiB request took a %zu MiB slab", small.capacity() / MIB);
-        // ... and one that fits the bound does reuse it
+        // a 600 MiB request must not take it either: 1.7x over-allocation is 40 GB of RSS behind a 55 GB
+        // cache on the lab box (measured 2026-09-18: RSS 146 GB, cache 55.5 GB, pool capped at 32 GiB)
         common_state_buf mid;
         mid.resize(600 * MIB);
-        CHECK(mid.capacity() == 1024 * MIB, "a 600 MiB request did not reuse the pooled 1 GiB slab (got %zu MiB)", mid.capacity() / MIB);
+        CHECK(mid.capacity() < 1024 * MIB, "a 600 MiB request took a %zu MiB slab", mid.capacity() / MIB);
+    }
+    common_state_buf_pool_set_cap(0);
+    common_state_buf_pool_set_cap(4096 * MIB);
+    {
+        common_state_buf big;
+        big.resize(1024 * MIB);
+        big.data()[0] = 1;
+    }
+    {
+        // ... while one within an eighth of the slab does reuse it (a conversation re-saved a turn later)
+        common_state_buf near;
+        near.resize(960 * MIB);
+        CHECK(near.capacity() == 1024 * MIB, "a 960 MiB request did not reuse the pooled 1 GiB slab (got %zu MiB)", near.capacity() / MIB);
     }
 
     // 3. a cap of zero keeps nothing
