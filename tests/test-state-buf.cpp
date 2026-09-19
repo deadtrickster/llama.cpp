@@ -81,7 +81,18 @@ int main() {
         CHECK(live == live0, "buffers freed, live is %zu MiB over the baseline", (live - live0) / MIB);
     }
 
-    // 4. a cap of zero keeps nothing
+    // 4. a small buffer maps a small slab: a 1 MiB checkpoint blob used to map 64 MiB (fresh() rounded every
+    // request up to 64 MiB); with 32 checkpoints x 3 buffers per conversation that was ~4 GB of rounding each
+    {
+        common_state_buf small;
+        small.resize(1 * MIB);
+        CHECK(small.capacity() <= 4 * MIB, "a 1 MiB request mapped %zu MiB", small.capacity() / MIB);
+        common_state_buf big;
+        big.resize(300 * MIB);
+        CHECK(big.capacity() % (64 * MIB) == 0 && big.capacity() >= 300 * MIB, "a 300 MiB request mapped %zu MiB (not a 64 MiB multiple)", big.capacity() / MIB);
+    }
+
+    // 5. a cap of zero keeps nothing
     common_state_buf_pool_set_cap(0);
     {
         common_state_buf b;

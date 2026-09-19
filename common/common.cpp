@@ -2546,7 +2546,10 @@ void common_state_buf::resize(size_t n) {
     size_t cap = 0;
     uint8_t * mem = pool().take(n, cap);
     if (!mem) {
-        cap = ((n + (64ull<<20) - 1) / (64ull<<20)) * (64ull<<20);
+        // round big states to 64 MiB (a conversation re-saved a turn later fits its old slab), small ones to
+        // 2 MiB: a checkpoint's draft/spec blobs are a few MB and mapped 64 MiB each, ~4 GB per conversation
+        const size_t unit = n >= (256ull<<20) ? (64ull<<20) : (2ull<<20);
+        cap = ((n + unit - 1) / unit) * unit;
         mem = pool().fresh(cap);
         if (!mem) { cap = n; mem = pool().fresh(cap); }
         if (!mem) { throw std::runtime_error("common_state_buf: mmap failed"); }

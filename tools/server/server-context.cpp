@@ -5561,21 +5561,30 @@ private:
                 common_state_buf_live_stats(n_live, live);
                 common_state_buf_pool_stats(n_pooled, pooled);
                 const size_t cache_mapped = prompt_cache ? prompt_cache->mapped() : 0;
-                size_t slot_ckpt = 0;
+                size_t slot_ckpt = 0, n_slot_ckpt = 0;
                 for (const auto & slot : slots) {
                     for (const auto & c : slot.prompt.checkpoints) {
                         slot_ckpt += c.data_tgt.capacity() + c.data_dft.capacity() + c.data_spec.capacity();
+                        n_slot_ckpt++;
                     }
                 }
-                size_t seq_copies = 0;
+                // the registry: conversations off their seat (yielded, waiting, finished and idle) keep their
+                // prompt - and its checkpoints - here, under no budget. Measured 2026-09-19: 12.9 GiB of
+                // "other" an hour into the day, ~180-330 MB per checkpoint, up to 32 per conversation.
+                size_t seq_copies = 0, seq_ckpt = 0, n_seq_ckpt = 0;
                 for (const auto & s : seqs) {
                     seq_copies += s.data_tgt.capacity() + s.data_dft.capacity();
+                    for (const auto & c : s.prompt.checkpoints) {
+                        seq_ckpt += c.data_tgt.capacity() + c.data_dft.capacity() + c.data_spec.capacity();
+                        n_seq_ckpt++;
+                    }
                 }
-                const size_t owned = cache_mapped + slot_ckpt; // may exceed live: a slot and the cache can share a checkpoint payload
+                const size_t owned = cache_mapped + slot_ckpt + seq_ckpt; // may exceed live: a slot and the cache can share a checkpoint payload
                 const struct mallinfo2 mi = mallinfo2();
                 const double G = 1024.0 * 1024.0 * 1024.0;
-                SRV_INF("[mem] rss %.1f GiB | state bufs in use %.1f GiB in %zu (cache %.1f, slot checkpoints %.1f, other %.1f), pooled %.1f GiB in %zu | sequence copies %.1f GiB | glibc heap in use %.1f, free %.1f, mmapped %.1f GiB\n",
-                        rss / G, live / G, n_live, cache_mapped / G, slot_ckpt / G, (live > owned ? live - owned : 0) / G, pooled / G, n_pooled,
+                SRV_INF("[mem] rss %.1f GiB | state bufs in use %.1f GiB in %zu (cache %.1f, slot checkpoints %.1f in %zu, registry checkpoints %.1f in %zu over %zu sequences, other %.1f), pooled %.1f GiB in %zu | sequence copies %.1f GiB | glibc heap in use %.1f, free %.1f, mmapped %.1f GiB\n",
+                        rss / G, live / G, n_live, cache_mapped / G, slot_ckpt / G, n_slot_ckpt, seq_ckpt / G, n_seq_ckpt, seqs.size(),
+                        (live > owned ? live - owned : 0) / G, pooled / G, n_pooled,
                         seq_copies / G, mi.uordblks / G, mi.fordblks / G, mi.hblkhd / G);
             }
         }
