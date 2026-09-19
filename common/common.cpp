@@ -2379,6 +2379,8 @@ struct state_buf_pool {
     std::vector<slab> slabs;
     size_t            locked_total = 0;
     size_t            pooled_total = 0;   // bytes held by the free slabs: resident (MAP_POPULATE), owned by nobody
+    size_t            live_total   = 0;   // bytes mapped by slabs a buffer owns right now
+    size_t            n_live       = 0;
     size_t            pool_cap     = default_pool_cap();
 
     // Cap on how much this process will keep locked. mlock competes with the
@@ -2416,12 +2418,16 @@ struct state_buf_pool {
         }
         uint8_t * p = best->ptr; cap_out = best->cap;
         pooled_total -= best->cap;
+        live_total   += best->cap;
+        n_live++;
         slabs.erase(best);
         return p;                        // already populated and locked
     }
 
     void give(uint8_t * p, size_t cap) {
         std::unique_lock<std::mutex> lk(mtx);
+        if (live_total >= cap) live_total -= cap; else live_total = 0;
+        if (n_live > 0) n_live--;
         if (slabs.size() >= MAX_SLABS || pooled_total + cap > pool_cap) {
             lk.unlock();
             unmap(p, cap);
@@ -2463,6 +2469,8 @@ struct state_buf_pool {
         }
         {
             std::lock_guard<std::mutex> lk(mtx);
+            live_total += need;
+            n_live++;
             if (locked_total + need <= LOCKED_CAP && mlock(p, need) == 0) {
                 locked_total += need;        // pinned: the 4x
             }
@@ -2485,6 +2493,13 @@ void common_state_buf_pool_stats(size_t & n_slabs, size_t & bytes) {
     for (const auto & s : p.slabs) {
         bytes += s.cap;
     }
+}
+
+void common_state_buf_live_stats(size_t & n_live, size_t & bytes) {
+    auto & p = pool();
+    std::lock_guard<std::mutex> lk(p.mtx);
+    n_live = p.n_live;
+    bytes  = p.live_total;
 }
 
 void common_state_buf_pool_set_cap(size_t bytes) {

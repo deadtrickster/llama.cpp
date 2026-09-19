@@ -63,7 +63,25 @@ int main() {
         CHECK(near.capacity() == 1024 * MIB, "a 960 MiB request did not reuse the pooled 1 GiB slab (got %zu MiB)", near.capacity() / MIB);
     }
 
-    // 3. a cap of zero keeps nothing
+    // 3. live accounting: what the slabs in use map, what RSS sees for them
+    common_state_buf_pool_set_cap(0);
+    {
+        size_t n_live = 0, live = 0;
+        common_state_buf_live_stats(n_live, live);
+        const size_t live0 = live;
+        {
+            common_state_buf a, b;
+            a.resize(64 * MIB); a.data()[0] = 1;
+            b.resize(64 * MIB); b.data()[0] = 1;
+            common_state_buf_live_stats(n_live, live);
+            CHECK(live >= live0 + 128 * MIB, "two 64 MiB buffers in use, live grew by %zu MiB", (live - live0) / MIB);
+            CHECK(n_live >= 2, "n_live is %zu with two buffers in use", n_live);
+        }
+        common_state_buf_live_stats(n_live, live);
+        CHECK(live == live0, "buffers freed, live is %zu MiB over the baseline", (live - live0) / MIB);
+    }
+
+    // 4. a cap of zero keeps nothing
     common_state_buf_pool_set_cap(0);
     {
         common_state_buf b;

@@ -243,11 +243,13 @@ def test_a_degraded_mirrored_entry_restores_from_disk():
     # the cached entry holds the prompt and the generated tokens but the last sampled one
     n_a = a.body["timings"]["prompt_n"] + a.body["timings"]["predicted_n"] - 1
 
-    # B takes the only slot: A goes to the RAM tier, and the mirror pass writes it to disk
+    # B takes the only slot: A goes to the RAM tier, and the mirror pass writes it to disk. The pass runs on
+    # the update loop, which only turns while there is work: keep it turning
     _turn(server, _distinct(1))
     text = ""
     deadline = time.time() + 15
     while time.time() < deadline and f"L2: mirrored {n_a:>7} tokens" not in text:
+        _turn(server, "tick", n_predict=1)
         time.sleep(0.5)
         text += reader.drain()
     assert f"L2: mirrored {n_a:>7} tokens" in text, f"precondition: A ({n_a} tokens) was never mirrored to disk"

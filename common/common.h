@@ -1237,6 +1237,8 @@ private:
 
 // the pool of freed slabs behind common_state_buf: bytes kept for reuse, and the cap on them
 void common_state_buf_pool_stats(size_t & n_slabs, size_t & bytes);
+// slabs currently owned by live buffers: their count and the bytes they map (what RSS sees for them)
+void common_state_buf_live_stats(size_t & n_live, size_t & bytes);
 void common_state_buf_pool_set_cap(size_t bytes);
 
 struct common_prompt_checkpoint {

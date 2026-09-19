@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
+#include <malloc.h>
+#include <unistd.h>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -1465,6 +1467,7 @@ private:
     // [l2-spill] periodic background spill: last time spill_all() ran. 0 until the
     // first one. --cache-spill-seconds drives how often; 0 keeps the old behaviour.
     int64_t t_last_cache_spill_ms = 0;
+    int64_t t_last_mem_log_ms     = 0; // [mem] the once-a-minute memory line
 
     void destroy() {
         // [l2-persist] this runs on the sleep path too, where the model is unloaded
@@ -5534,6 +5537,46 @@ private:
                     t_last_cache_spill_ms = now;
                     prompt_cache->mirror_resident();
                 }
+            }
+        }
+
+        // [mem] once a minute: where the process's memory is. Measured 2026-09-19: the server was OOM-killed
+        // at 163 GB while the prompt cache reported 36.2 GB used / 36.7 GB mapped - ~100 GB had no owner in any
+        // log line. RSS is split into the state-buffer slabs in use (the cache's, the slots' checkpoints, the
+        // rest), slabs pooled, sequence copies, and the glibc heap, so growth has a name before it has a kill.
+        {
+            const int64_t now = ggml_time_ms();
+            if (t_last_mem_log_ms == 0 || now - t_last_mem_log_ms >= 60000) {
+                t_last_mem_log_ms = now;
+
+                size_t rss = 0;
+                if (FILE * f = fopen("/proc/self/statm", "r")) {
+                    long pages = 0, res = 0;
+                    if (fscanf(f, "%ld %ld", &pages, &res) == 2) {
+                        rss = (size_t) res * (size_t) sysconf(_SC_PAGESIZE);
+                    }
+                    fclose(f);
+                }
+                size_t n_live = 0, live = 0, n_pooled = 0, pooled = 0;
+                common_state_buf_live_stats(n_live, live);
+                common_state_buf_pool_stats(n_pooled, pooled);
+                const size_t cache_mapped = prompt_cache ? prompt_cache->mapped() : 0;
+                size_t slot_ckpt = 0;
+                for (const auto & slot : slots) {
+                    for (const auto & c : slot.prompt.checkpoints) {
+                        slot_ckpt += c.data_tgt.capacity() + c.data_dft.capacity() + c.data_spec.capacity();
+                    }
+                }
+                size_t seq_copies = 0;
+                for (const auto & s : seqs) {
+                    seq_copies += s.data_tgt.capacity() + s.data_dft.capacity();
+                }
+                const size_t owned = cache_mapped + slot_ckpt; // may exceed live: a slot and the cache can share a checkpoint payload
+                const struct mallinfo2 mi = mallinfo2();
+                const double G = 1024.0 * 1024.0 * 1024.0;
+                SRV_INF("[mem] rss %.1f GiB | state bufs in use %.1f GiB in %zu (cache %.1f, slot checkpoints %.1f, other %.1f), pooled %.1f GiB in %zu | sequence copies %.1f GiB | glibc heap in use %.1f, free %.1f, mmapped %.1f GiB\n",
+                        rss / G, live / G, n_live, cache_mapped / G, slot_ckpt / G, (live > owned ? live - owned : 0) / G, pooled / G, n_pooled,
+                        seq_copies / G, mi.uordblks / G, mi.fordblks / G, mi.hblkhd / G);
             }
         }
 
