@@ -111,7 +111,32 @@ int main() {
         CHECK(b.size() == 1 * MIB && b.data() != nullptr, "the buffer is unusable after shrink_to_fit");
     }
 
-    // 6. a cap of zero keeps nothing
+    // 6. the count cap must not let tiny slabs crowd out big ones: with 2 MiB checkpoint blobs filling the
+    // twelve slots, every freed 13 GB conversation slab was unmapped and every save page-faulted a fresh one
+    // (measured 2026-09-19: "pooled 0.3 GiB in 12" beside a 9.5 s gap in a request's start)
+    common_state_buf_pool_set_cap(0);
+    common_state_buf_pool_set_cap(4096 * MIB);
+    {
+        std::vector<common_state_buf> tiny(16);
+        for (auto & b : tiny) { b.resize(1 * MIB); b.data()[0] = 1; }
+    }
+    {
+        size_t n_slabs = 0, bytes = 0;
+        common_state_buf_pool_stats(n_slabs, bytes);
+        CHECK(n_slabs <= 12, "the count cap let %zu slabs in", n_slabs);
+        common_state_buf big;
+        big.resize(256 * MIB); big.data()[0] = 1;
+    }
+    {
+        size_t n_slabs = 0, bytes = 0;
+        common_state_buf_pool_stats(n_slabs, bytes);
+        CHECK(bytes >= 256 * MIB, "a freed 256 MiB slab was not pooled behind %zu tiny ones (%zu MiB pooled)", n_slabs, bytes / MIB);
+        common_state_buf again;
+        again.resize(250 * MIB);
+        CHECK(again.capacity() == 256 * MIB, "the next 250 MiB request did not reuse the pooled 256 MiB slab (got %zu MiB)", again.capacity() / MIB);
+    }
+
+    // 7. a cap of zero keeps nothing
     common_state_buf_pool_set_cap(0);
     {
         common_state_buf b;

@@ -2428,9 +2428,28 @@ struct state_buf_pool {
         std::unique_lock<std::mutex> lk(mtx);
         if (live_total >= cap) live_total -= cap; else live_total = 0;
         if (n_live > 0) n_live--;
-        if (slabs.size() >= MAX_SLABS || pooled_total + cap > pool_cap) {
+        if (pooled_total + cap > pool_cap) {
             lk.unlock();
             unmap(p, cap);
+            return;
+        }
+        // the count cap keeps the free list short, not small: when it is full, the smallest slab goes, and
+        // only if the incoming one is bigger - twelve 2 MiB checkpoint blobs must not push a 13 GB
+        // conversation slab out (measured 2026-09-19: "pooled 0.3 GiB in 12", every save page-faulting afresh)
+        if (slabs.size() >= MAX_SLABS) {
+            auto smallest = std::min_element(slabs.begin(), slabs.end(), [](const slab & a, const slab & b) { return a.cap < b.cap; });
+            if (smallest->cap >= cap) {
+                lk.unlock();
+                unmap(p, cap);
+                return;
+            }
+            const slab out = *smallest;
+            pooled_total -= out.cap;
+            slabs.erase(smallest);
+            slabs.push_back({p, cap});
+            pooled_total += cap;
+            lk.unlock();
+            unmap(out.ptr, out.cap);
             return;
         }
         slabs.push_back({p, cap});
