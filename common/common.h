@@ -1223,8 +1223,12 @@ public:
     size_t capacity() const { return buf_ ? buf_->cap : 0; } // the mapping's bytes (resident: MAP_POPULATE)
     bool   empty() const { return size_ == 0; }
 
-    void clear() { size_ = 0; }     // keeps the mapping for reuse
-    void shrink_to_fit() {}         // deliberately a no-op: keep the pages
+    void clear() { size_ = 0; }     // keeps the mapping for reuse (a slot re-saved next turn fits its slab)
+    void shrink_to_fit() {          // on an emptied buffer: give the slab back (to the pool, or unmapped past its cap)
+        if (size_ == 0) {
+            buf_.reset();
+        }
+    }
 
     void resize(size_t n);
 

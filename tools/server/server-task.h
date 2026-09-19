@@ -656,9 +656,7 @@ struct server_prompt_cache_state {
     // entry uses; the gap is the slab pool's rounding and reuse slack (measured 2026-09-18: 146 GB of RSS
     // behind a 55.5 GB size() total, with the reuse bound at 2x)
     size_t mapped() const {
-        if (!resident) {
-            return 0;
-        }
+        // resident or not: a slab an entry still owns is mapped (a released entry used to keep its slab)
         size_t res = data.main.capacity() + data.drft.capacity();
         for (const auto & c : prompt.checkpoints) {
             res += c.data_tgt.capacity() + c.data_dft.capacity() + c.data_spec.capacity();

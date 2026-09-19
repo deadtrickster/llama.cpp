@@ -92,7 +92,26 @@ int main() {
         CHECK(big.capacity() % (64 * MIB) == 0 && big.capacity() >= 300 * MIB, "a 300 MiB request mapped %zu MiB (not a 64 MiB multiple)", big.capacity() / MIB);
     }
 
-    // 5. a cap of zero keeps nothing
+    // 5. clear() keeps the mapping for reuse; clear() + shrink_to_fit() gives it back. The cache's release paths
+    // (spill with release_ram, an entry loaded into a slot, an obsolete stub) all say clear(); shrink_to_fit()
+    // and meant "free it" - with shrink_to_fit a no-op every released entry kept its full slab, unattributed
+    // (2026-09-19: "other 15.5 GiB" in the [mem] line 28 minutes after a restart)
+    {
+        size_t n_live = 0, live0 = 0, live = 0;
+        common_state_buf_live_stats(n_live, live0);
+        common_state_buf b;
+        b.resize(64 * MIB); b.data()[0] = 1;
+        b.clear();
+        CHECK(b.capacity() >= 64 * MIB, "clear() alone released the mapping (capacity %zu MiB)", b.capacity() / MIB);
+        b.shrink_to_fit();
+        CHECK(b.capacity() == 0, "clear() + shrink_to_fit() kept %zu MiB mapped", b.capacity() / MIB);
+        common_state_buf_live_stats(n_live, live);
+        CHECK(live == live0, "the released slab still counts as live (%zu MiB over the baseline)", (live - live0) / MIB);
+        b.resize(1 * MIB);
+        CHECK(b.size() == 1 * MIB && b.data() != nullptr, "the buffer is unusable after shrink_to_fit");
+    }
+
+    // 6. a cap of zero keeps nothing
     common_state_buf_pool_set_cap(0);
     {
         common_state_buf b;
