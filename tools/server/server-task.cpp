@@ -2975,7 +2975,8 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_it(cons
         }
     }
 
-    if (it_best == states.end() && tokens_new.size() >= 4096) {
+    // a prompt served from its own seat is not a miss: the seat's prefix is at least as long as any entry's
+    if (it_best == states.end() && tokens_new.size() >= 4096 && lcp_best < lcp_closest) {
         if (lcp_closest < 0) {
             SRV_INF("prompt cache: no entry for a %zu-token prompt (%zu entries, none shares a prefix)\n",
                     tokens_new.size(), states.size());
@@ -2983,7 +2984,7 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_it(cons
             const float f_keep_c = n_closest > 0 ? float(lcp_closest) / n_closest : 0.0f;
             SRV_INF("prompt cache: no entry taken for a %zu-token prompt: closest of %zu entries has %zu tokens, lcp %d (f_keep %.3f, f_sim %.3f)%s\n",
                     tokens_new.size(), states.size(), n_closest, lcp_closest, f_keep_c, float(lcp_closest) / tokens_new.size(),
-                    f_keep_c < 0.25f ? " - below the 0.25 f_keep floor" : (lcp_best >= lcp_closest ? " - the seat's own prompt is as good" : ""));
+                    f_keep_c < 0.25f ? " - below the 0.25 f_keep floor" : "");
         }
     }
 
