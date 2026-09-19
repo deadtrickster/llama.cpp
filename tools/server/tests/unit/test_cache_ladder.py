@@ -268,3 +268,61 @@ def test_a_degraded_mirrored_entry_restores_from_disk():
     assert f"L2: restored {n_a:>7} tokens" in text, "precondition: A did not come back through the disk tier"
     assert back.body["timings"]["prompt_n"] < n_a // 2, (
         f"A was prefilled ({back.body['timings']['prompt_n']} of {n_a} tokens) instead of restored")
+
+
+def test_an_older_transcript_restores_from_its_superseded_file():
+    """A conversation's mirrored snapshot is loaded into a slot for its next turn; the file stays as the
+    conversation's only disk copy until a longer snapshot lands, and the cache keeps a token-only index
+    stub for it - checkpoints cleared on load, and cleared again when the longer save supersedes it in
+    update(). A request for that OLDER transcript - a client restarted from a store that lacks the latest
+    turn does exactly this - matches the stub (f_keep 1.0 beats the longer entry's), unspills the file,
+    and unspill compared the file's N checkpoints with the stub's 0: "checkpoint count mismatch", "failed
+    to read spilled entry back, discarding it", and the whole conversation prefilled from zero. Measured
+    2026-09-19 08:15 on the production Qwen: a 197,942-token snapshot, restored at 08:13, refused at
+    08:15, ~8 minutes of prefill.
+
+    Required: the older transcript comes back from its file, whole."""
+    global server
+    log = server_log_path()
+    server = _mk(log, cache_ram_mib=RAM_MIB, disk=take_tmpdir("llama-spill-"))
+    server.n_slots = 2
+    server.n_ctx = 4096                   # two seats of 2048; A is ~1810 tokens
+    server.cache_spill_seconds = 20       # slow enough that the longer snapshot is NOT on disk yet when the old one is asked for
+    server.start(timeout_seconds=120)
+    reader = LogReader(log)
+
+    p1 = _distinct(0, n_tokens=450)   # A is the only conversation of this size: the log lines name it
+    a1 = _turn(server, p1, n_predict=8)
+    assert a1.status_code == 200
+    n_a1 = a1.body["timings"]["prompt_n"] + a1.body["timings"]["predicted_n"] - 1
+
+    # two newcomers take both seats: A's snapshot goes to the RAM tier and the mirror pass writes it
+    _turn(server, _distinct(1))
+    _turn(server, _distinct(2))
+    # the mirror pass runs on the update loop, which only turns while there is work: keep it turning
+    text = ""
+    deadline = time.time() + 45
+    while time.time() < deadline and f"L2: mirrored {n_a1:>7} tokens" not in text:
+        _turn(server, "tick", n_predict=1)
+        time.sleep(0.5)
+        text += reader.drain()
+    assert f"L2: mirrored {n_a1:>7} tokens" in text, f"precondition: A ({n_a1} tokens) was never mirrored"
+
+    # A's next turn loads the snapshot into a slot (the file stays, a token-only stub indexes it) ...
+    p2 = p1 + a1.body["content"] + " and then some more words about topic 0"
+    a2 = _turn(server, p2, n_predict=8)
+    assert a2.status_code == 200
+    # ... and two more newcomers push the longer A off its seat into the RAM tier, superseding the stub
+    _turn(server, _distinct(3))
+    _turn(server, _distinct(4))
+
+    # a client sends the OLDER transcript, exactly A's first turn, before the longer one reaches disk
+    back = _turn(server, p1, n_predict=4)
+    text += reader.drain()
+
+    assert back.status_code == 200
+    assert "checkpoint count mismatch" not in text, "the superseded file was refused and the older transcript prefilled from zero"
+    assert "failed to read spilled entry back" not in text
+    assert f"L2: restored {n_a1:>7} tokens" in text, "precondition: the older transcript did not come back through the disk tier"
+    assert back.body["timings"]["prompt_n"] < n_a1 // 2, (
+        f"the older transcript was prefilled ({back.body['timings']['prompt_n']} of {n_a1} tokens) instead of restored")

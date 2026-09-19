@@ -2283,8 +2283,11 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
         return false;
     }
 
-    // [l2-header] the identifying header is already in RAM - skip straight to the bulk
-    if (!l2_read_header(f, state.spill_path, has_mtmd, nullptr)) {
+    // [l2-header] the identifying header is already in RAM, but it also carries the file's OWN
+    // checkpoint descriptors, and those are the ground truth for the checkpoint data that follows in
+    // the bulk. Read them rather than skip them - see [l2-ckpt-list] below for why.
+    l2_spill_index_entry idx;
+    if (!l2_read_header(f, state.spill_path, has_mtmd, &idx)) {
         return false;
     }
 
@@ -2295,10 +2298,48 @@ bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
 
     uint32_t n_ckpt = 0;
     if (!f.read(reinterpret_cast<char *>(&n_ckpt), sizeof(n_ckpt)) ||
-        n_ckpt != (uint32_t) state.prompt.checkpoints.size()) {
-        SRV_WRN(" - L2: checkpoint count mismatch in %s\n", state.spill_path.c_str());
+        n_ckpt != (uint32_t) idx.checkpoints.size()) {
+        // The header and the bulk were written from the same list in one go, so THIS disagreement is
+        // the file being inconsistent with itself - a truncated or interleaved write - and not ours to
+        // repair.
+        SRV_WRN(" - L2: checkpoint count in bulk (%u) disagrees with the header (%zu) in %s\n",
+                n_ckpt, idx.checkpoints.size(), state.spill_path.c_str());
         return false;
     }
+
+    // [l2-ckpt-list] the file's checkpoint list, not memory's.
+    //
+    // The bulk stores one data triple per checkpoint IN THE ORDER OF THE LIST AT SPILL TIME, and this
+    // used to read them back by position into whatever the in-memory list is NOW, refusing with
+    // "checkpoint count mismatch" when the two lengths differed. They differ routinely: the cache ladder
+    // thins the in-memory checkpoint list of an entry whose data is already on disk (freeing only
+    // metadata - a spilled entry's data_* vectors are empty), so the list in RAM shrinks while the file
+    // keeps the list it was written with. The refusal then discarded a payload that had just been read
+    // back intact. Measured 2026-09-18/19: five times in one day, a 197,942-token conversation among
+    // them, each one a cold re-prefill of the whole thing at ~440 tok/s - and ten gigabytes of pool had
+    // been grown to hold that entry a second before it was thrown away.
+    //
+    // The file describes the data that was just loaded, so the file's list is the right one. Memory
+    // contributes what the file does not carry: `pinned` and `turn_start` are not serialised, so they
+    // are kept from any in-memory checkpoint at the same position.
+    if (n_ckpt != (uint32_t) state.prompt.checkpoints.size()) {
+        std::list<common_prompt_checkpoint> rebuilt;
+        for (const auto & fc : idx.checkpoints) {
+            common_prompt_checkpoint c = fc;
+            for (const auto & mc : state.prompt.checkpoints) {
+                if (mc.n_tokens == fc.n_tokens && mc.pos_min == fc.pos_min && mc.pos_max == fc.pos_max) {
+                    c.pinned     = mc.pinned;
+                    c.turn_start = mc.turn_start;
+                    break;
+                }
+            }
+            rebuilt.push_back(std::move(c));
+        }
+        SRV_INF(" - L2: checkpoint list on disk (%u) differs from memory (%zu) for %s; taking the file's, which describes the data just loaded\n",
+                n_ckpt, state.prompt.checkpoints.size(), state.spill_path.c_str());
+        state.prompt.checkpoints = std::move(rebuilt);
+    }
+
     for (auto & c : state.prompt.checkpoints) {
         if (!l2_read_vec(f, c.data_tgt) ||
             !l2_read_vec(f, c.data_dft) ||
