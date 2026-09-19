@@ -12,6 +12,9 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <condition_variable>
+#include <mutex>
+#include <deque>
 #include <algorithm>
 #include <csignal>
 #include <unistd.h>
@@ -21,6 +24,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <chrono>
+#include <thread>
 
 //
 // task_params
@@ -1719,7 +1724,7 @@ static const uint32_t L2_SPILL_MAGIC   = 0x4C325350; // "L2SP"
 static const uint32_t L2_SPILL_VERSION = 3; // v3 adds the deep_reuse flag to the header
 
 template <typename V>
-static void l2_write_vec(std::ofstream & f, const V & v) {
+static void l2_write_vec(std::ostream & f, const V & v) {
     const uint64_t n = v.size();
     f.write(reinterpret_cast<const char *>(&n), sizeof(n));
     if (n > 0) {
@@ -1797,7 +1802,7 @@ struct l2_spill_index_entry {
 };
 
 // [l2-header] serialize the identifying part of an entry
-static void l2_write_header(std::ofstream & f, const server_prompt_cache_state & state, const std::vector<char> & packed) {
+static void l2_write_header(std::ostream & f, const server_prompt_cache_state & state, const std::vector<char> & packed) {
     l2_header_writer w;
 
     w.put_bytes(packed.data(), packed.size());
@@ -2010,7 +2015,7 @@ static std::list<server_prompt_cache_state>::iterator lru_find_inactive_first(
 
     // pass 1: the LRU resident entry that is already inactive
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (!it->resident) {
+        if (!it->resident || it->writing) {
             continue;
         }
         if (active_seconds > 0 && now - it->t_last_used <= threshold) {
@@ -2026,7 +2031,7 @@ static std::list<server_prompt_cache_state>::iterator lru_find_inactive_first(
 
     // pass 2: the LRU resident entry, active or not
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (!it->resident) {
+        if (!it->resident || it->writing) {
             continue;
         }
         if (best == states.end() || it->t_last_used < best->t_last_used) {
@@ -2138,6 +2143,190 @@ bool server_prompt_cache::degrade(server_prompt_cache_state & state) {
     return true;
 }
 
+// [l2-async] one write to disk: the header bytes built on the server thread, and the entry's buffers
+// shared with it (common_state_buf copies share their payload; a writer that changes its own copy
+// detaches first, so the job always sees the bytes it was given)
+struct server_prompt_cache::l2_write_job {
+    uint64_t    uid = 0;
+    std::string path;
+    std::string header;           // magic, version, identifying header
+    server_state_buf main;
+    server_state_buf drft;
+    std::vector<server_state_buf> ckpts; // data_tgt, data_dft, data_spec per checkpoint, in order
+    size_t      bytes = 0;
+    bool        release_ram = false;
+    int         n_tokens = 0;
+    int64_t     t_start = 0;
+    int         status = 0;       // 0 in flight, 1 written, -1 failed
+    std::string err;
+};
+
+void server_prompt_cache::l2_worker() {
+    for (;;) {
+        std::shared_ptr<l2_write_job> job;
+        {
+            std::unique_lock<std::mutex> lk(l2_mtx);
+            l2_cv.wait(lk, [&] { return l2_stop || !l2_queue.empty(); });
+            if (l2_queue.empty()) {
+                return; // stopping, nothing left
+            }
+            job = std::move(l2_queue.front());
+            l2_queue.pop_front();
+        }
+
+        std::ofstream f(job->path, std::ios::binary);
+        if (!f) {
+            job->status = -1;
+            job->err = "cannot open for writing";
+        } else {
+            f.write(job->header.data(), (std::streamsize) job->header.size());
+            l2_write_vec(f, job->main);
+            l2_write_vec(f, job->drft);
+            const uint32_t n_ckpt = (uint32_t) (job->ckpts.size() / 3);
+            f.write(reinterpret_cast<const char *>(&n_ckpt), sizeof(n_ckpt));
+            for (const auto & b : job->ckpts) {
+                l2_write_vec(f, b);
+            }
+            f.flush();
+            if (!f.good()) {
+                job->status = -1;
+                job->err = "write failed";
+                f.close();
+                std::remove(job->path.c_str());
+            } else {
+                f.close();
+
+                // test hook: a slow disk. LLAMA_SERVER_L2_WRITE_DELAY_MS sleeps after every write, so a
+                // test can see whether a write blocks the server thread
+                if (const char * d = std::getenv("LLAMA_SERVER_L2_WRITE_DELAY_MS")) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(d)));
+                }
+
+                // [l2-fadvise] the bytes are on NVMe now and will not be read again unless this entry is
+                // restored, so do not let them sit in the page cache
+                l2_drop_page_cache(job->path, /*flush_first*/ true);
+                job->status = 1;
+            }
+        }
+
+        // the buffers go back with the result: the server thread decides what stays resident
+        {
+            std::lock_guard<std::mutex> lk(l2_mtx);
+            l2_done.push_back(std::move(job));
+            l2_in_flight--;
+        }
+        l2_cv.notify_all();
+    }
+}
+
+void server_prompt_cache::l2_enqueue(std::shared_ptr<l2_write_job> job) {
+    {
+        std::lock_guard<std::mutex> lk(l2_mtx);
+        if (!l2_thread.joinable()) {
+            l2_thread = std::thread([this] { l2_worker(); });
+        }
+        l2_queue.push_back(std::move(job));
+        l2_in_flight++;
+    }
+    l2_cv.notify_all();
+}
+
+void server_prompt_cache::poll_writes() {
+    std::vector<std::shared_ptr<l2_write_job>> done;
+    {
+        std::lock_guard<std::mutex> lk(l2_mtx);
+        done.swap(l2_done);
+    }
+    for (auto & job : done) {
+        auto it = states.begin();
+        for (; it != states.end(); ++it) {
+            if (it->uid == job->uid) {
+                break;
+            }
+        }
+        if (it == states.end()) {
+            // the entry went while its write was in flight (loaded into a slot and superseded, dropped):
+            // the file is an orphan
+            std::remove(job->path.c_str());
+            continue;
+        }
+        auto & state = *it;
+        state.writing = false;
+        if (job->status != 1) {
+            SRV_WRN(" - L2: %s for %s, the entry stays in RAM\n", job->err.c_str(), job->path.c_str());
+            state.write_release = false;
+            continue;
+        }
+        state.spill_path  = job->path;
+        state.spill_bytes = job->bytes;
+        if (state.write_release) {
+            // release the RAM - the mapping goes back to common_state_buf's pool
+            state.data.main.clear(); state.data.main.shrink_to_fit();
+            state.data.drft.clear(); state.data.drft.shrink_to_fit();
+            for (auto & c : state.prompt.checkpoints) {
+                c.data_tgt.clear();  c.data_tgt.shrink_to_fit();
+                c.data_dft.clear();  c.data_dft.shrink_to_fit();
+                c.data_spec.clear(); c.data_spec.shrink_to_fit();
+            }
+            state.resident = false;
+        }
+        const double t_ms = (ggml_time_us() - job->t_start) / 1000.0;
+        SRV_INF(" - L2: %s %7d tokens (%.3f MiB) in %.0f ms (%.2f GB/s) to %s\n",
+                state.write_release ? "spilled" : "mirrored",
+                job->n_tokens, job->bytes / (1024.0 * 1024.0), t_ms,
+                (job->bytes / 1e9) / (t_ms / 1000.0), job->path.c_str());
+        state.write_release = false;
+
+        // [l2-copy] the longer snapshot of this conversation has landed: the older file it supersedes
+        // goes now, never before
+        release_superseded(state);
+    }
+}
+
+void server_prompt_cache::wait_write(server_prompt_cache_state & state) {
+    while (state.writing) {
+        {
+            std::unique_lock<std::mutex> lk(l2_mtx);
+            l2_cv.wait(lk, [&] { return !l2_done.empty() || (l2_queue.empty() && l2_in_flight == 0); });
+        }
+        poll_writes();
+    }
+}
+
+void server_prompt_cache::wait_writes() {
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(l2_mtx);
+            l2_cv.wait(lk, [&] { return !l2_done.empty() || (l2_queue.empty() && l2_in_flight == 0); });
+        }
+        poll_writes();
+        std::lock_guard<std::mutex> lk(l2_mtx);
+        if (l2_queue.empty() && l2_in_flight == 0 && l2_done.empty()) {
+            return;
+        }
+    }
+}
+
+size_t server_prompt_cache::pending_release_bytes() const {
+    size_t res = 0;
+    for (const auto & state : states) {
+        if (state.writing && state.write_release) {
+            res += state.size();
+        }
+    }
+    return res;
+}
+
+size_t server_prompt_cache::pending_release_tokens() const {
+    size_t res = 0;
+    for (const auto & state : states) {
+        if (state.writing && state.write_release) {
+            res += state.prompt.n_tokens();
+        }
+    }
+    return res;
+}
+
 bool server_prompt_cache::spill(server_prompt_cache_state & state, bool release_ram) {
     if (disk_dir.empty()) {
         return false;
@@ -2160,12 +2349,14 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state, bool release_
         return false;
     }
 
+    if (state.writing) {
+        return false; // a write is already in flight: the result arrives in poll_writes()
+    }
+
     const size_t bytes = state.size();
     if (bytes == 0) {
         return false;
     }
-
-    const int64_t t_start = ggml_time_us();
 
     // [l2-name] the tokens are needed twice: to name the file and to write its
     // header. Serializing once also means an entry that cannot be serialized
@@ -2178,68 +2369,37 @@ bool server_prompt_cache::spill(server_prompt_cache_state & state, bool release_
         return false;
     }
 
-    const std::string path = disk_dir + l2_spill_name(model_key, state.prompt.n_tokens(), packed);
+    auto job = std::make_shared<l2_write_job>();
+    job->path = disk_dir + l2_spill_name(model_key, state.prompt.n_tokens(), packed);
 
-    std::ofstream f(path, std::ios::binary);
-    if (!f) {
-        SRV_WRN(" - L2: cannot open %s for writing, dropping entry instead\n", path.c_str());
-        return false;
+    // [l2-header] identify the entry before the bulk, so a reader never has to touch the KV state to find
+    // out what prompt this file holds. Built here, on the server thread, from the entry as it is now.
+    {
+        std::ostringstream hdr(std::ios::binary);
+        hdr.write(reinterpret_cast<const char *>(&L2_SPILL_MAGIC),   sizeof(L2_SPILL_MAGIC));
+        hdr.write(reinterpret_cast<const char *>(&L2_SPILL_VERSION), sizeof(L2_SPILL_VERSION));
+        l2_write_header(hdr, state, packed);
+        job->header = hdr.str();
     }
-
-    f.write(reinterpret_cast<const char *>(&L2_SPILL_MAGIC),   sizeof(L2_SPILL_MAGIC));
-    f.write(reinterpret_cast<const char *>(&L2_SPILL_VERSION), sizeof(L2_SPILL_VERSION));
-
-    // [l2-header] identify the entry before the bulk, so a reader never has to
-    // touch the KV state to find out what prompt this file holds
-    l2_write_header(f, state, packed);
-
-    l2_write_vec(f, state.data.main);
-    l2_write_vec(f, state.data.drft);
-
-    const uint32_t n_ckpt = (uint32_t) state.prompt.checkpoints.size();
-    f.write(reinterpret_cast<const char *>(&n_ckpt), sizeof(n_ckpt));
+    job->main = state.data.main;
+    job->drft = state.data.drft;
     for (const auto & c : state.prompt.checkpoints) {
-        l2_write_vec(f, c.data_tgt);
-        l2_write_vec(f, c.data_dft);
-        l2_write_vec(f, c.data_spec);
+        job->ckpts.push_back(c.data_tgt);
+        job->ckpts.push_back(c.data_dft);
+        job->ckpts.push_back(c.data_spec);
     }
-
-    f.flush();
-    if (!f.good()) {
-        SRV_WRN(" - L2: write failed for %s, dropping entry instead\n", path.c_str());
-        f.close();
-        std::remove(path.c_str());
-        return false;
+    if (state.uid == 0) {
+        state.uid = uid_next++;
     }
-    f.close();
+    job->uid         = state.uid;
+    job->bytes       = bytes;
+    job->release_ram = release_ram;
+    job->n_tokens    = state.prompt.n_tokens();
+    job->t_start     = ggml_time_us();
 
-    // [l2-fadvise] the bytes are on NVMe now and will not be read again unless
-    // this entry is restored, so do not let them sit in the page cache.
-    l2_drop_page_cache(path, /*flush_first*/ true);
-
-    state.spill_path  = path;
-    state.spill_bytes = bytes;
-
-    if (release_ram) {
-        // release the RAM - the mapping goes back to common_state_buf's pool
-        state.data.main.clear(); state.data.main.shrink_to_fit();
-        state.data.drft.clear(); state.data.drft.shrink_to_fit();
-        for (auto & c : state.prompt.checkpoints) {
-            c.data_tgt.clear();  c.data_tgt.shrink_to_fit();
-            c.data_dft.clear();  c.data_dft.shrink_to_fit();
-            c.data_spec.clear(); c.data_spec.shrink_to_fit();
-        }
-        state.resident = false;
-    }
-
-    const double t_ms = (ggml_time_us() - t_start) / 1000.0;
-    SRV_INF(" - L2: %s %7d tokens (%.3f MiB) in %.0f ms (%.2f GB/s) to %s\n",
-            release_ram ? "spilled" : "mirrored",
-            state.prompt.n_tokens(), bytes / (1024.0 * 1024.0), t_ms,
-            (bytes / 1e9) / (t_ms / 1000.0), path.c_str());
-
-    release_superseded(state);
-
+    state.writing       = true;
+    state.write_release = release_ram;
+    l2_enqueue(std::move(job));
     return true;
 }
 
@@ -2271,6 +2431,9 @@ void server_prompt_cache::release_superseded(const server_prompt_cache_state & s
 }
 
 bool server_prompt_cache::unspill(server_prompt_cache_state & state) {
+    if (state.writing) {
+        wait_write(state); // its file is being written right now: let it land
+    }
     if (state.resident) {
         return true; // already in RAM (resident or mirrored), nothing to read
     }
@@ -2469,12 +2632,17 @@ void server_prompt_cache::spill_all() {
     size_t n_bytes   = 0;
 
     for (auto & state : states) {
-        if (state.spilled()) {
+        if (state.spilled() || state.writing) {
             continue;
         }
 
         if (spill(state)) {
             n_spilled++;
+        }
+    }
+    wait_writes(); // shutdown and idle sleep: the files must be on disk before the process or the model goes
+    for (const auto & state : states) {
+        if (state.spilled() && !state.resident) {
             n_bytes += state.spill_bytes;
         }
     }
@@ -2495,9 +2663,10 @@ void server_prompt_cache::mirror_resident() {
     size_t n_mirrored = 0;
     size_t n_bytes    = 0;
 
+    poll_writes();
     for (auto & state : states) {
-        if (state.spilled()) {
-            continue; // already on disk (mirrored or spilled)
+        if (state.spilled() || state.writing) {
+            continue; // already on disk (mirrored or spilled), or on its way
         }
         if (mirror(state)) {
             n_mirrored++;
@@ -2699,6 +2868,16 @@ void server_prompt_cache::index_disk() {
 }
 
 server_prompt_cache::~server_prompt_cache() {
+    // [l2-async] let the writes in flight land, then stop the writer
+    if (l2_thread.joinable()) {
+        wait_writes();
+        {
+            std::lock_guard<std::mutex> lk(l2_mtx);
+            l2_stop = true;
+        }
+        l2_cv.notify_all();
+        l2_thread.join();
+    }
     // [l2-persist] spill files deliberately survive. They are named after the model
     // and the prompt, so the next server on this disk_dir can find and reuse them.
     // Entries dropped during normal operation still unlink their file at the point
@@ -3087,8 +3266,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    poll_writes();
+
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
+        while (!states.empty() && size() > limit_size + pending_release_bytes()) {
             // [l2-spill] move the oldest resident entry to disk rather than
             // destroying it. Spilled entries stay in `states` (their token list
             // is the index) but no longer count toward the RAM limit.
@@ -3141,7 +3322,7 @@ void server_prompt_cache::update() {
     // both tiers. And an entry the RAM tier cannot keep goes to disk, as everywhere else in this cache;
     // it is destroyed only when it cannot be spilled.
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens_resident() > limit_tokens_cur) {
+        while (!states.empty() && n_tokens_resident() > limit_tokens_cur + pending_release_tokens()) {
             auto it = lru_find_inactive_first(states, active_seconds);
             if (it == states.end()) {
                 break;

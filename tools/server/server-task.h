@@ -8,6 +8,10 @@
 #include <string>
 #include <unordered_set>
 #include <list>
+#include <deque>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <map>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -618,6 +622,7 @@ struct server_prompt_cache_state {
     std::string spill_path;
     size_t      spill_bytes = 0;
 
+
     // [l2-mirror] true while the bulk buffers are held in RAM. A mirrored entry
     // (spill_path set AND resident) has its disk copy as a power-loss safety net,
     // not an eviction; it still counts toward the RAM limit and can still be
@@ -647,6 +652,14 @@ struct server_prompt_cache_state {
     //                      can_degrade() and degrade() refused, and the ladder removed a whole entry while
     //                      its neighbours were still at 0.)
     int degrade_level = 0;
+
+    // [l2-async] a write to disk in flight on the writer thread: the entry's buffers are shared with the
+    // job, nothing here changes until poll_writes() applies the result on the server thread. After the
+    // positionally-initialized fields on purpose: save() and index_disk() build a state with a positional
+    // aggregate initializer, and a field slipped in above t_last_used takes the timestamp for `writing`.
+    uint64_t uid           = 0;
+    bool     writing       = false;
+    bool     write_release = false; // release the RAM copy once the file has landed
 
     static constexpr int DEGRADE_MAX = 3;
 
@@ -696,6 +709,27 @@ struct server_prompt_cache {
     ~server_prompt_cache();
 
     std::list<server_prompt_cache_state> states;
+
+    // [l2-async] writes to disk run on one writer thread. spill()/mirror() snapshot the entry's buffers
+    // (shared payloads, no copy), enqueue, and return; the server thread applies finished writes in
+    // poll_writes(): the path and size, the RAM release, the log line. A 17 GB spill took 4.5 s of the
+    // server thread before, and every generation stood still for it (measured 2026-09-19).
+    struct l2_write_job;
+    std::thread                                 l2_thread;
+    std::mutex                                  l2_mtx;
+    std::condition_variable                     l2_cv;
+    std::deque<std::shared_ptr<l2_write_job>>   l2_queue;
+    std::vector<std::shared_ptr<l2_write_job>>  l2_done;
+    size_t                                      l2_in_flight = 0;
+    bool                                        l2_stop      = false;
+    uint64_t                                    uid_next     = 1;
+    void l2_worker();
+    void l2_enqueue(std::shared_ptr<l2_write_job> job);
+    void poll_writes();                                   // apply finished writes (server thread)
+    void wait_write(server_prompt_cache_state & state);   // block until this entry's write has landed
+    void wait_writes();                                   // block until nothing is in flight
+    size_t pending_release_bytes()  const;                // RAM that in-flight spills will release
+    size_t pending_release_tokens() const;
 
     // [l2-spill] directory for the level-2 (disk) tier. Empty = disabled, in
     // which case update() drops evicted entries as before.

@@ -5511,6 +5511,11 @@ private:
 #endif
 
     void update_slots() {
+        // [l2-async] apply the disk writes that landed since the last tick (paths, RAM releases, log lines)
+        if (prompt_cache) {
+            prompt_cache->poll_writes();
+        }
+
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();

@@ -328,3 +328,45 @@ def test_an_older_transcript_restores_from_its_superseded_file():
     assert f"L2: restored {n_a1:>7} tokens" in text, "precondition: the older transcript did not come back through the disk tier"
     assert back.body["timings"]["prompt_n"] < n_a1 // 2, (
         f"the older transcript was prefilled ({back.body['timings']['prompt_n']} of {n_a1} tokens) instead of restored")
+
+
+def test_a_spill_does_not_stall_a_running_generation():
+    """Writing an entry to disk must not stop the server thread: a 17 GB spill took 4.5 s of it on the
+    production Qwen and every other generation stood still (2026-09-19 21:53, "letibot reported
+    non-responding"). LLAMA_SERVER_L2_WRITE_DELAY_MS makes each write slow on purpose; a generation
+    streaming on the other seat must keep producing tokens through the neighbour's spills."""
+    global server
+    log = server_log_path()
+    server = _mk(log, cache_ram_mib=RAM_MIB, disk=take_tmpdir("llama-spill-"))
+    server.n_slots = 2
+    server.n_ctx = 4096
+    server.cache_spill_seconds = 1        # the mirror pass writes every new entry within a second: the same write path
+    server.env = {"LLAMA_SERVER_L2_WRITE_DELAY_MS": "2000", "CUDA_VISIBLE_DEVICES": ""}
+    server.start(timeout_seconds=120)
+    reader = LogReader(log)
+
+    import threading
+    gaps, tokens = [], []
+    def stream_a():
+        last = time.time()
+        for chunk in server.make_stream_request("POST", "/completion", data={
+                "prompt": "Once upon a time, in a land far away,", "n_predict": 1200, "stream": True,
+                "temperature": 0.0, "cache_prompt": False, "id_slot": 0}):
+            now = time.time()
+            gaps.append(now - last)
+            last = now
+            tokens.append(chunk.get("content", ""))
+    th = threading.Thread(target=stream_a)
+    th.start()
+    time.sleep(0.3)
+
+    # the neighbour seat pushes conversations into the RAM tier; the mirror pass writes each within a second
+    for i in range(1, 6):
+        _turn(server, _distinct(i))
+    th.join(timeout=120)
+    text = reader.drain()
+
+    writes = re.findall(r"L2: (?:spilled|mirrored) +\d+ tokens", text)
+    assert writes, "precondition: nothing was written to disk while A generated"
+    assert len(tokens) >= 100, f"A produced only {len(tokens)} tokens"
+    assert max(gaps) < 1.0, f"A stood still for {max(gaps):.2f} s while the neighbour's entries were written ({len(writes)} writes, 2 s each)"
