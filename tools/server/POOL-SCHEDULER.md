@@ -110,6 +110,22 @@ the wrong strategy for this subsystem: they raced the device and went red/green 
 - The emergent-wall tests survive stage 2 with their budgets recalibrated (the KV's own free count is
   larger than the old held count, so a wall calibrated against the latter lands ~300 cells later).
 
+## The RAM side of an id (measured 2026-09-19)
+
+An id's cost is not only its KV cells. A conversation keeps up to `--ctx-checkpoints` (32) context
+checkpoints, ~180-330 MiB each on Qwen3.8-27B, wherever it sits: on its seat, in the sequence registry
+when it yields or finishes, and in the prompt cache until the ladder thins them. Only the cache has a
+ladder. The pool raises its id ceiling into free VRAM (`--seq-max-headroom`) and never asks what those
+ids cost in RAM: "5 ids of 5" at 22:xx was ~40 GiB of checkpoints beside a 56 GiB cache and a 32 GiB
+slab pool, on a 185 GB box - the term behind the second OOM kill after the slab fixes.
+
+Two consequences for the scheduler:
+- `C_j` has a RAM component (checkpoints + a pending offload copy), and feasibility of one more resident id
+  must be checked against RAM as well as cells - today the `[mem]` line only reports it.
+- The ladder's rungs (drop middle checkpoints, keep newest + pinned, drop the rest) belong to seats and
+  the registry as much as to the cache: a `--checkpoint-ram` budget across all three, LRU idle sequence
+  first. Until then `--ctx-checkpoints 8` in the launcher bounds the per-id cost.
+
 ## Order of work
 
 1. The table and `pool_fits()` asked of the KV cache - the truth. Small, mechanical, makes the rest
