@@ -2895,6 +2895,13 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_it(cons
 
     auto it_best = states.end();
 
+    // the closest entry by common prefix, thresholds aside: named in the log when a long prompt misses, so a
+    // re-prefill can be read for its cause (a head that changed, a prefix that is only a fraction of the entry,
+    // an entry that is not there) instead of guessed. Measured 2026-09-18: five re-prefills over 100k tokens in
+    // one evening and only one of them explained by a line in the log.
+    size_t n_closest = 0;
+    int    lcp_closest = -1;
+
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
@@ -2903,6 +2910,11 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_it(cons
         const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+
+        if (lcp_cur > lcp_closest) {
+            lcp_closest = lcp_cur;
+            n_closest   = it->prompt.tokens.size();
+        }
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
@@ -2919,6 +2931,18 @@ std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_it(cons
             f_sim_best  = f_sim_cur;
 
             it_best = it;
+        }
+    }
+
+    if (it_best == states.end() && tokens_new.size() >= 4096) {
+        if (lcp_closest < 0) {
+            SRV_INF("prompt cache: no entry for a %zu-token prompt (%zu entries, none shares a prefix)\n",
+                    tokens_new.size(), states.size());
+        } else {
+            const float f_keep_c = n_closest > 0 ? float(lcp_closest) / n_closest : 0.0f;
+            SRV_INF("prompt cache: no entry taken for a %zu-token prompt: closest of %zu entries has %zu tokens, lcp %d (f_keep %.3f, f_sim %.3f)%s\n",
+                    tokens_new.size(), states.size(), n_closest, lcp_closest, f_keep_c, float(lcp_closest) / tokens_new.size(),
+                    f_keep_c < 0.25f ? " - below the 0.25 f_keep floor" : (lcp_best >= lcp_closest ? " - the seat's own prompt is as good" : ""));
         }
     }
 
