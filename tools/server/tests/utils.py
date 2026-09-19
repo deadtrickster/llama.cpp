@@ -841,6 +841,8 @@ def cleanup_test_tmpdirs() -> list:
                 oversized.append((log, os.path.getsize(log)))
         except OSError:
             pass
-        if not os.environ.get("LLAMA_TESTS_KEEP_LOGS"):
+        # LLAMA_TESTS_KEEP_LOGS keeps the LOGS - a dir with a srv.log - not spill dirs: those hold the L2 files
+        # a test wrote (~1 GB each) and 198 of them held 11 GB of the lab box's tmpfs (2026-09-19)
+        if not (os.environ.get("LLAMA_TESTS_KEEP_LOGS") and os.path.exists(log)):
             shutil.rmtree(d, ignore_errors=True)
     return oversized
